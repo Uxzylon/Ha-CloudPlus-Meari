@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "CloudPlus Account",
+        "description": "Enter your CloudEdge / CloudPlus credentials. All battery cameras on the account will be added automatically.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to CloudEdge API.",
+      "invalid_auth": "Invalid email or password.",
+      "no_devices": "No battery cameras found on this account.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "motion": { "name": "Motion" },
+      "awake": { "name": "Camera Awake" },
+      "charging": { "name": "Charging" }
+    },
+    "button": {
+      "wake": { "name": "Wake Camera" }
+    },
+    "camera": {
+      "camera": { "name": "Camera" }
+    },
+    "number": {
+      "motion_timeout": { "name": "Motion Timeout" }
+    },
+    "sensor": {
+      "battery": { "name": "Battery" }
+    },
+    "switch": {
+      "motion_wake": { "name": "Wake on Motion" }
+    }
+  }
+}
