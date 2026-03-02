@@ -1,0 +1,9 @@
+__pycache__/
+jadx*/
+record*/
+*.h26*
+*.apk
+*.xapk
+fcm_credentials.json
+/*.py
+*_example/
