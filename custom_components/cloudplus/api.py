@@ -21,17 +21,13 @@ from Crypto.Cipher import AES, DES
 from Crypto.Util.Padding import pad, unpad
 
 from .const import (
-    APP_VER,
-    APP_VER_CODE,
     BATTERY_CODES,
     DEFAULT_CA_KEY,
     DEFAULT_CA_SECRET,
     DES_IV,
     DES_KEY,
-    PARTNER_ID,
     PHONE_TYPE,
     REDIRECT_URL,
-    SOURCE_APP,
     TTID,
 )
 
@@ -41,6 +37,25 @@ USER_AGENT = (
     "Mozilla/5.0 (Linux; U; Android 14; en-us; Pixel Build/UP1A.231105.001) "
     "AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1"
 )
+
+APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
+    "cloudplus": {
+        "source_app": "77",
+        "app_ver": "5.9.2",
+        "app_ver_code": "1024",
+        "redirect_url": REDIRECT_URL,
+        "partner_id": "77",
+        "ttid": TTID,
+    },
+    "cloudedge": {
+        "source_app": "8",
+        "app_ver": "6.1.4",
+        "app_ver_code": "616",
+        "redirect_url": REDIRECT_URL,
+        "partner_id": "8",
+        "ttid": TTID,
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +95,14 @@ def _aes_decrypt(ciphertext_b64: str, key_str: str) -> str:
     return unpad(cipher.decrypt(ct), AES.block_size).decode("utf-8")
 
 
-def _encode_user_account(email: str, api_path: str, timestamp_ms: int) -> str:
-    raw_key = f"{api_path}{PARTNER_ID}{TTID}{timestamp_ms}"
+def _encode_user_account(
+    email: str,
+    api_path: str,
+    timestamp_ms: int,
+    partner_id: str,
+    ttid: str,
+) -> str:
+    raw_key = f"{api_path}{partner_id}{ttid}{timestamp_ms}"
     key_b64 = base64.b64encode(raw_key.encode()).decode()
     key16 = key_b64[:16]
     return _aes_encrypt(email, key16)
@@ -110,11 +131,16 @@ class MeariApiClient:
         password: str,
         country_code: str = "FR",
         phone_code: str = "33",
+        app_profile: str = "auto",
     ) -> None:
         self.email = email
         self.password = password
-        self.country_code = country_code
-        self.phone_code = phone_code
+        self.country_code = (country_code or "FR").upper()
+        self.phone_code = str(phone_code or "33").lstrip("+")
+        self.app_profile = (app_profile or "cloudplus").lower()
+        if self.app_profile == "auto":
+            # Backward compatibility for existing config entries.
+            self.app_profile = "cloudplus"
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -132,7 +158,27 @@ class MeariApiClient:
         self.mqtt_signature: str = ""
 
         # Devices
-        self.devices: dict[int, dict] = {}
+        self.devices: dict[Any, dict] = {}
+
+        # Active app profile settings (selected during login)
+        default_profile = APP_PROFILE_CONFIG["cloudplus"]
+        self._source_app = default_profile["source_app"]
+        self._app_ver = default_profile["app_ver"]
+        self._app_ver_code = default_profile["app_ver_code"]
+        self._redirect_url = default_profile["redirect_url"]
+        self._partner_id = default_profile["partner_id"]
+        self._ttid = default_profile["ttid"]
+
+    def _select_profile(self, profile: str) -> None:
+        cfg = APP_PROFILE_CONFIG.get(profile)
+        if not cfg:
+            raise ValueError(f"Unknown app profile: {profile}")
+        self._source_app = cfg["source_app"]
+        self._app_ver = cfg["app_ver"]
+        self._app_ver_code = cfg["app_ver_code"]
+        self._redirect_url = cfg["redirect_url"]
+        self._partner_id = cfg["partner_id"]
+        self._ttid = cfg["ttid"]
 
     # ------------------------------------------------------------------
     # X-Ca-* header auth
@@ -176,9 +222,9 @@ class MeariApiClient:
         ts_str = dt.strftime(f"%Y-%m-%dT%H:%M:%S.{ts % 1000:03d}GMT{sign}")
         params = {
             "phoneType": PHONE_TYPE,
-            "sourceApp": SOURCE_APP,
-            "appVer": APP_VER,
-            "appVerCode": APP_VER_CODE,
+            "sourceApp": self._source_app,
+            "appVer": self._app_ver,
+            "appVerCode": self._app_ver_code,
             "lngType": "en",
             "t": str(ts),
             "countryCode": self.country_code,
@@ -240,6 +286,7 @@ class MeariApiClient:
 
     def login(self) -> None:
         """Full login: redirect → login → IoT config → device list."""
+        self._select_profile(self.app_profile)
         self._redirect()
         self._do_login()
         self._get_iot_config()
@@ -254,21 +301,25 @@ class MeariApiClient:
             "localTime": str(ts),
             "nonce": nonce,
             "sign": sign,
-            "partnerId": PARTNER_ID,
+            "partnerId": self._partner_id,
             "phoneType": PHONE_TYPE,
-            "sourceApp": SOURCE_APP,
-            "appVer": APP_VER,
-            "appVerCode": APP_VER_CODE,
+            "sourceApp": self._source_app,
+            "appVer": self._app_ver,
+            "appVerCode": self._app_ver_code,
             "countryCode": self.country_code,
             "phoneCode": self.phone_code,
             "lngType": "en",
             "userAccount": _encode_user_account(
-                self.email, "/ppstrongs/redirect", ts
+                self.email,
+                "/ppstrongs/redirect",
+                ts,
+                self._partner_id,
+                self._ttid,
             ),
         }
         path = "/ppstrongs/redirect"
         headers = self._ca_headers(path)
-        url = REDIRECT_URL + path
+        url = self._redirect_url + path
         r = self.session.get(url, params=params, headers=headers)
         r.raise_for_status()
         data = r.json()
@@ -283,19 +334,28 @@ class MeariApiClient:
         path = "/meari/app/login"
         params = {
             "phoneType": PHONE_TYPE,
-            "sourceApp": SOURCE_APP,
-            "appVer": APP_VER,
-            "appVerCode": APP_VER_CODE,
+            "sourceApp": self._source_app,
+            "appVer": self._app_ver,
+            "appVerCode": self._app_ver_code,
             "countryCode": self.country_code,
             "phoneCode": self.phone_code,
             "lngType": "en",
             "t": str(ts),
-            "userAccount": _encode_user_account(self.email, path, ts),
+            "userAccount": _encode_user_account(
+                self.email,
+                path,
+                ts,
+                self._partner_id,
+                self._ttid,
+            ),
             "localTime": str(ts),
             "password": _des_encrypt(self.password),
             "iotType": "4",
             "equipmentNo": " ",
         }
+        if self._source_app == "8":
+            # CloudEdge app sends this flag explicitly.
+            params["encryStatus"] = "1"
         headers = self._ca_headers(path)
         url = self.api_server + path
         r = self.session.post(url, data=params, headers=headers)
@@ -326,7 +386,7 @@ class MeariApiClient:
         plat_signature = platform.get("signature", "")
         expire_time = str(platform.get("expireTime", ""))
         if plat_signature and expire_time:
-            key_temp = f"{self.user_id}{PARTNER_ID}{TTID}{expire_time}"
+            key_temp = f"{self.user_id}{self._partner_id}{self._ttid}{expire_time}"
             key_b64 = base64.b64encode(key_temp.encode()).decode().rstrip("=")
             key16 = key_b64[:16]
             decrypted = _aes_decrypt(plat_signature, key16)
@@ -338,17 +398,100 @@ class MeariApiClient:
             self.access_id = info["accessid"]
             self.access_key = info["accesskey"]
 
-    def _get_devices(self) -> None:
-        data = self._post("/v1/app/device/info/get", {"funSwitch": "1"})
-        if data.get("resultCode") != "1001":
-            raise RuntimeError(f"Device list failed: {data}")
-        self.devices = {}
-        for category in ["ipc", "snap", "chime", "nvr"]:
-            for dev in data.get("result", {}).get(category, data.get(category, [])):
+    @staticmethod
+    def _collect_devices_from_payload(
+        payload: dict[str, Any],
+        target: dict[Any, dict],
+        home_id: Optional[str] = None,
+    ) -> None:
+        categories = ["ipc", "snap", "chime", "nvr", "doorbell"]
+
+        containers: list[dict[str, Any]] = []
+        result = payload.get("result")
+        if isinstance(result, dict):
+            containers.append(result)
+        containers.append(payload)
+
+        for container in containers:
+            for category in categories:
+                devs = container.get(category)
+                if not isinstance(devs, list):
+                    continue
+                for dev in devs:
+                    dev_id = dev.get("deviceID")
+                    if dev_id is None:
+                        continue
+                    normalized = dict(dev)
+                    normalized["_category"] = category
+                    if home_id:
+                        normalized["_home_id"] = home_id
+                    target[dev_id] = normalized
+
+            # Older payload shape fallback.
+            fallback = container.get("deviceList")
+            if not isinstance(fallback, list):
+                continue
+            for dev in fallback:
                 dev_id = dev.get("deviceID")
-                if dev_id:
-                    dev["_category"] = category
-                    self.devices[dev_id] = dev
+                if dev_id is None:
+                    continue
+                normalized = dict(dev)
+                normalized.setdefault("_category", "ipc")
+                if home_id:
+                    normalized["_home_id"] = home_id
+                target[dev_id] = normalized
+
+    def _get_homes(self) -> list[dict[str, Any]]:
+        data = self._get("/v1/app/home/list")
+        if data.get("resultCode") != "1001":
+            raise RuntimeError(f"Home list failed: {data}")
+        homes = data.get("result", {}).get("homes", [])
+        return homes if isinstance(homes, list) else []
+
+    def _get_home_devices(self, home_id: str) -> dict[Any, dict]:
+        data = self._get("/v1/app/home/join/device/list", {"homeID": home_id})
+        result_code = str(data.get("resultCode", ""))
+        if result_code not in {"1001", "1107"}:
+            raise RuntimeError(f"Home device list failed for home {home_id}: {data}")
+        devices: dict[Any, dict] = {}
+        self._collect_devices_from_payload(data, devices, home_id=home_id)
+        return devices
+
+    def _get_devices(self) -> None:
+        devices: dict[Any, dict] = {}
+
+        # Default/home API (works for owner accounts and some shared setups).
+        default_payload: Optional[dict[str, Any]] = None
+        try:
+            default_payload = self._post("/v1/app/device/info/get", {"funSwitch": "1"})
+        except Exception as err:
+            _LOGGER.debug("Default device list failed: %s", err)
+
+        if isinstance(default_payload, dict):
+            result_code = str(default_payload.get("resultCode", ""))
+            if result_code == "1001":
+                self._collect_devices_from_payload(default_payload, devices)
+            else:
+                _LOGGER.debug("Default device list returned %s", result_code)
+
+        # Multi-home fallback/augmentation for invited/family homes.
+        try:
+            homes = self._get_homes()
+        except Exception as err:
+            _LOGGER.debug("Home list discovery failed: %s", err)
+            homes = []
+
+        for home in homes:
+            home_id = home.get("homeID")
+            if not home_id:
+                continue
+            try:
+                home_devices = self._get_home_devices(str(home_id))
+                devices.update(home_devices)
+            except Exception as err:
+                _LOGGER.debug("Home device list failed for home %s: %s", home_id, err)
+
+        self.devices = devices
 
     # ------------------------------------------------------------------
     # Device queries
