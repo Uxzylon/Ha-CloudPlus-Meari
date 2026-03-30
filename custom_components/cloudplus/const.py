@@ -4,6 +4,9 @@ DOMAIN = "cloudplus"
 
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
+CONF_COUNTRY_CODE = "country_code"
+CONF_PHONE_CODE = "phone_code"
+CONF_APP_PROFILE = "app_profile"
 CONF_DEVICE_ID = "device_id"
 CONF_SN_NUM = "sn_num"
 CONF_DEVICE_NAME = "device_name"
@@ -11,6 +14,10 @@ CONF_HOST_KEY = "host_key"
 CONF_MOTION_TIMEOUT = "motion_timeout"
 
 DEFAULT_MOTION_TIMEOUT = 120
+DEFAULT_COUNTRY_CODE = "FR"
+DEFAULT_PHONE_CODE = "33"
+DEFAULT_APP_PROFILE = "cloudplus"
+APP_PROFILES = ["cloudplus", "cloudedge"]
 
 # CloudEdge / Meari API
 PARTNER_ID = "77"
