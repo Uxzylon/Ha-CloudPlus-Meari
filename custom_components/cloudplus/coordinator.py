@@ -25,7 +25,10 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     ALARM_TYPE_NAMES,
+    DEFAULT_APP_PROFILE,
+    DEFAULT_COUNTRY_CODE,
     DEFAULT_MOTION_TIMEOUT,
+    DEFAULT_PHONE_CODE,
     DOMAIN,
     MOTION_ALARM_TYPES,
 )
@@ -48,11 +51,21 @@ class CloudPlusCoordinator:
     _W_STREAMING = 2
 
     def __init__(
-        self, hass: HomeAssistant, email: str, password: str, device: dict[str, Any]
+        self,
+        hass: HomeAssistant,
+        email: str,
+        password: str,
+        device: dict[str, Any],
+        country_code: str = DEFAULT_COUNTRY_CODE,
+        phone_code: str = DEFAULT_PHONE_CODE,
+        app_profile: str = DEFAULT_APP_PROFILE,
     ) -> None:
         self.hass = hass
         self._email = email
         self._password = password
+        self._country_code = country_code
+        self._phone_code = phone_code
+        self._app_profile = app_profile
         self._device = device
         self._device_id = device["deviceID"]
         self._sn_num = device.get("snNum", "")
@@ -989,7 +1002,13 @@ class CloudPlusCoordinator:
     def _run_session(self) -> None:
         """Single session: login → MQTT → grab initial frame → event loop."""
         # Login
-        api = MeariApiClient(email=self._email, password=self._password)
+        api = MeariApiClient(
+            email=self._email,
+            password=self._password,
+            country_code=self._country_code,
+            phone_code=self._phone_code,
+            app_profile=self._app_profile,
+        )
         try:
             api.login()
         except PermissionError:
