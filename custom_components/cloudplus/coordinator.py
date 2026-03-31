@@ -10,7 +10,6 @@ Follows the same architecture as the home_v reference coordinator.
 from __future__ import annotations
 
 import fcntl
-import json
 import logging
 import os
 import queue
@@ -24,15 +23,14 @@ from typing import Any, Callable
 from homeassistant.core import HomeAssistant
 
 from .const import (
-    ALARM_TYPE_NAMES,
     DEFAULT_APP_PROFILE,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_MOTION_TIMEOUT,
     DEFAULT_PHONE_CODE,
     DOMAIN,
-    MOTION_ALARM_TYPES,
 )
 from .api import MeariApiClient, format_sn
+from .motion_event import parse_motion_event
 from .p2p_streamer import P2PStreamer
 
 _LOGGER = logging.getLogger(__name__)
@@ -789,36 +787,29 @@ class CloudPlusCoordinator:
 
     def _handle_mqtt_message(self, topic: str, payload: bytes) -> None:
         """Parse and dispatch an MQTT motion event."""
-        try:
-            raw = json.loads(payload.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        parsed = parse_motion_event(payload)
+        if not parsed:
             return
 
-        data = raw
-        if "params" in data:
-            data = data["params"]
-        if "data" in data:
-            data = data["data"]
-        if "msg" in data and isinstance(data["msg"], dict):
-            data = data["msg"]
+        device_id_str = parsed["device_id"]
+        license_id = parsed["license_id"]
 
-        evt_type = data.get("evt", data.get("eventType", ""))
-        device_id_str = str(data.get("deviceID", data.get("deviceId", "")))
-
-        try:
-            evt_int = int(evt_type)
-        except (ValueError, TypeError):
-            evt_int = -1
-
-        if device_id_str and device_id_str != str(self._device_id):
+        if device_id_str:
+            if device_id_str != str(self._device_id):
+                return
+        elif license_id:
+            if self._sn_num and license_id != self._sn_num:
+                return
+        else:
+            # Ignore unidentified alarm events to avoid cross-device false triggers.
             return
 
-        evt_name = ALARM_TYPE_NAMES.get(evt_int, f"type={evt_type}")
-        is_motion = evt_int in MOTION_ALARM_TYPES
+        evt_name = parsed["evt_name"]
+        is_motion = parsed["is_motion"]
 
         _LOGGER.info(
-            "MQTT event: %s (device=%s, motion=%s)",
-            evt_name, device_id_str, is_motion,
+            "MQTT event: %s (device=%s, license=%s, motion=%s)",
+            evt_name, device_id_str or "?", license_id or "?", is_motion,
         )
 
         if is_motion:
