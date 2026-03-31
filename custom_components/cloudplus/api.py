@@ -78,6 +78,29 @@ def _des_encrypt(plaintext: str) -> str:
     return base64.b64encode(ct).decode()
 
 
+def _password_variants(password: str) -> list[str]:
+    """Generate minimal password variants for apostrophe normalization.
+
+    Some accounts are configured with typographic apostrophes (U+2019) while
+    users may type ASCII apostrophes ('). Try the alternate form only when
+    apostrophe-like characters are present.
+    """
+    variants = [password]
+
+    if "'" in password:
+        variants.append(password.replace("'", "’"))
+    if "’" in password:
+        variants.append(password.replace("’", "'"))
+    if "‘" in password:
+        variants.append(password.replace("‘", "'"))
+
+    out: list[str] = []
+    for candidate in variants:
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
 def _aes_encrypt(plaintext: str, key_str: str) -> str:
     """AES-CBC encrypt (Meari account encryption)."""
     key = key_str.encode("utf-8")
@@ -330,42 +353,62 @@ class MeariApiClient:
         self.country_code = result.get("countryCode", self.country_code)
 
     def _do_login(self) -> None:
-        ts = int(time.time() * 1000)
         path = "/meari/app/login"
-        params = {
-            "phoneType": PHONE_TYPE,
-            "sourceApp": self._source_app,
-            "appVer": self._app_ver,
-            "appVerCode": self._app_ver_code,
-            "countryCode": self.country_code,
-            "phoneCode": self.phone_code,
-            "lngType": "en",
-            "t": str(ts),
-            "userAccount": _encode_user_account(
-                self.email,
-                path,
-                ts,
-                self._partner_id,
-                self._ttid,
-            ),
-            "localTime": str(ts),
-            "password": _des_encrypt(self.password),
-            "iotType": "4",
-            "equipmentNo": " ",
-        }
-        if self._source_app == "8":
-            # CloudEdge app sends this flag explicitly.
-            params["encryStatus"] = "1"
-        headers = self._ca_headers(path)
         url = self.api_server + path
-        r = self.session.post(url, data=params, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("resultCode") != "1001":
-            raise PermissionError(f"Login failed: {data.get('resultCode')}")
-        result = data["result"]
-        self.user_id = result["userID"]
-        self.user_token = result["userToken"]
+
+        last_code: str = ""
+        last_msg: str = ""
+
+        for idx, password_candidate in enumerate(_password_variants(self.password), start=1):
+            ts = int(time.time() * 1000)
+            params = {
+                "phoneType": PHONE_TYPE,
+                "sourceApp": self._source_app,
+                "appVer": self._app_ver,
+                "appVerCode": self._app_ver_code,
+                "countryCode": self.country_code,
+                "phoneCode": self.phone_code,
+                "lngType": "en",
+                "t": str(ts),
+                "userAccount": _encode_user_account(
+                    self.email,
+                    path,
+                    ts,
+                    self._partner_id,
+                    self._ttid,
+                ),
+                "localTime": str(ts),
+                "password": _des_encrypt(password_candidate),
+                "iotType": "4",
+                "equipmentNo": " ",
+            }
+            if self._source_app == "8":
+                # CloudEdge app sends this flag explicitly.
+                params["encryStatus"] = "1"
+
+            headers = self._ca_headers(path)
+            r = self.session.post(url, data=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+
+            result_code = str(data.get("resultCode", ""))
+            if result_code == "1001":
+                if idx > 1:
+                    _LOGGER.warning(
+                        "Login succeeded after password apostrophe normalization for account %s",
+                        self.email,
+                    )
+                result = data["result"]
+                self.user_id = result["userID"]
+                self.user_token = result["userToken"]
+                return
+
+            last_code = result_code
+            last_msg = str(data.get("resultMsg") or "")
+
+        if last_msg:
+            raise PermissionError(f"Login failed: {last_code} ({last_msg})")
+        raise PermissionError(f"Login failed: {last_code}")
 
     def _get_iot_config(self) -> None:
         data = self._get("/v2/app/config/pf/init", {"iotType": "4"})
