@@ -40,12 +40,13 @@ class CloudPlusCamera(Camera):
         super().__init__()
         self._coordinator = coordinator
         self._entry = entry
+        self._attr_entity_registry_enabled_default = coordinator.device_category != "ipc"
         self._attr_unique_id = f"{coordinator.device_uuid}_camera"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudPlus {coordinator.device_name}",
             "manufacturer": "Meari / CloudEdge",
-            "model": "Battery Camera (snap)",
+            "model": coordinator.device_model,
         }
         self._unsub_update: Any = None
 

@@ -49,7 +49,7 @@ class CloudPlusMotionTimeout(NumberEntity):
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudPlus {coordinator.device_name}",
             "manufacturer": "Meari / CloudEdge",
-            "model": "Battery Camera (snap)",
+            "model": coordinator.device_model,
         }
         self._unsub_update: Any = None
 
