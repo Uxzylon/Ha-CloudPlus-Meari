@@ -53,7 +53,7 @@ class CloudPlusConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Single step: collect credentials, auto-add all snap cameras."""
+        """Single step: collect credentials, auto-add all supported cameras."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -73,7 +73,7 @@ class CloudPlusConfigFlow(ConfigFlow, domain=DOMAIN):
 
             try:
                 await self.hass.async_add_executor_job(client.login)
-                snap_devices = client.get_snap_devices()
+                camera_devices = client.get_camera_devices()
             except PermissionError:
                 errors["base"] = "invalid_auth"
             except (ConnectionError, OSError):
@@ -82,7 +82,7 @@ class CloudPlusConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception during login")
                 errors["base"] = "unknown"
             else:
-                if not snap_devices:
+                if not camera_devices:
                     errors["base"] = "no_devices"
                 else:
                     # One config entry per account — prevent duplicates

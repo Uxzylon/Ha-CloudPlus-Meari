@@ -243,6 +243,40 @@ def parse_stream_frame(data: bytes):
     return None
 
 
+def split_stream_frames(data: bytes) -> list[bytes]:
+    """Split payload into candidate 00 00 01 frame chunks.
+
+    Camera payloads can contain multiple frame chunks or leading bytes
+    before the first frame marker.
+    """
+    if len(data) < 4:
+        return []
+
+    starts: list[int] = []
+    i = 0
+    while i < len(data) - 3:
+        if data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 1:
+            frame_type = data[i + 3]
+            if frame_type in (
+                STREAM_TYPE_IFRAME,
+                STREAM_TYPE_PFRAME,
+                STREAM_TYPE_AUDIO,
+                STREAM_TYPE_INFO,
+            ):
+                starts.append(i)
+        i += 1
+
+    if not starts:
+        return [data]
+
+    chunks: list[bytes] = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(data)
+        if end > start:
+            chunks.append(data[start:end])
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # ICE helpers
 # ---------------------------------------------------------------------------
@@ -315,10 +349,30 @@ class P2PStreamer:
         self._running = False
         self._video_count = 0
         self._total_bytes = 0
+        self._active_sock: socket.socket | None = None
+        self._active_sig: MsgSvrClient | None = None
 
     def request_stop(self) -> None:
         """Request the streaming loop to stop (thread-safe)."""
+        _LOGGER.debug("P2P request_stop (id=%s)", hex(id(self)))
         self._running = False
+        sig = self._active_sig
+        if sig is not None:
+            try:
+                sig.close()
+            except Exception:
+                pass
+
+        sock = self._active_sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     @property
     def video_count(self) -> int:
@@ -343,6 +397,7 @@ class P2PStreamer:
             sig_ip, sig_port = _resolve_signaling_server()
             _LOGGER.debug("Connecting to signaling %s:%d", sig_ip, sig_port)
             sig = MsgSvrClient(sig_ip, sig_port)
+            self._active_sig = sig
             sig.connect()
 
             v, b = self._do_stream(sig)
@@ -350,9 +405,18 @@ class P2PStreamer:
             self._total_bytes = b
             return (v, b)
         except Exception as e:
-            _LOGGER.error("P2P session error: %s", e)
+            if (
+                not self._running
+                and isinstance(e, OSError)
+                and getattr(e, "errno", None) == 9
+            ):
+                _LOGGER.debug("P2P session interrupted during stop: %s", e)
+            else:
+                _LOGGER.error("P2P session error: %s", e)
             return (self._video_count, self._total_bytes)
         finally:
+            self._active_sig = None
+            self._active_sock = None
             if sig:
                 try:
                     sig.send_logout(self._device_uuid)
@@ -426,9 +490,11 @@ class P2PStreamer:
         # Allocate TURN relay
         turn = TurnClient(coturn_ip, coturn_port, coturn_user, coturn_pwd)
         turn.connect()
+        self._active_sock = turn.sock
         if not turn.allocate():
             _LOGGER.error("TURN allocation failed")
             turn.close()
+            self._active_sock = None
             return (0, 0)
 
         try:
@@ -437,6 +503,7 @@ class P2PStreamer:
                 dev_nat, coturn_ip, remote,
             )
         finally:
+            self._active_sock = None
             turn.close()
 
     def _stream_with_turn(
@@ -669,6 +736,7 @@ class P2PStreamer:
         login_resend_at = time.time() + 2
         heartbeat_at = time.time() + 3
         iva_heartbeat_at = time.time() + 3
+        start_live_retry_at = time.time() + 5
         turn_refresh_at = time.time() + 60
         stun_keepalive_at = time.time() + 5
 
@@ -677,6 +745,8 @@ class P2PStreamer:
         request_addrs: set = set()
         got_iva_handshake = False
         login_ok = False
+        login_ok_at: float | None = None
+        no_video_timeout = False
         direct_addr = None
         turn.sock.settimeout(0.5)
 
@@ -684,42 +754,111 @@ class P2PStreamer:
         stream_video_count = 0
         stream_total_bytes = 0
         stream_start_time = time.time()
+        no_video_restart_sec = 90.0
         last_video_time = None
         last_kcp_data_time = None
+        last_kcp_payload_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
         kcp_push_count = 0
+        flow = {
+            "udp_packets": 0,
+            "turn_channel_packets": 0,
+            "data_indications": 0,
+            "kcp_segments": 0,
+            "kcp_push": 0,
+            "kcp_data_msgs": 0,
+            "stream_payload_calls": 0,
+            "stream_chunks": 0,
+            "stream_parse_ok": 0,
+            "stream_parse_fail": 0,
+            "video_chunks": 0,
+            "audio_chunks": 0,
+            "tx_heartbeat": 0,
+            "tx_start_live": 0,
+            "tx_ice_check": 0,
+            "tx_iva_handshake": 0,
+        }
+
+        def _log_flow_summary(reason: str) -> None:
+            recv_buf_size = len(getattr(kcp, "recv_buf", {}))
+            recv_frag_parts = len(getattr(kcp, "recv_frag_buf", []))
+            next_recv_sn = int(getattr(kcp, "next_recv_sn", -1))
+            _LOGGER.debug(
+                "Flow summary (%s): udp=%d turn_ch=%d data_ind=%d kcp_seg=%d kcp_push=%d "
+                "kcp_data=%d payloads=%d chunks=%d parsed_ok=%d parsed_fail=%d "
+                "video_chunks=%d audio_chunks=%d video_frames=%d bytes=%d "
+                "kcp_recv_buf=%d kcp_frag_parts=%d next_sn=%d",
+                reason,
+                flow["udp_packets"],
+                flow["turn_channel_packets"],
+                flow["data_indications"],
+                flow["kcp_segments"],
+                flow["kcp_push"],
+                flow["kcp_data_msgs"],
+                flow["stream_payload_calls"],
+                flow["stream_chunks"],
+                flow["stream_parse_ok"],
+                flow["stream_parse_fail"],
+                flow["video_chunks"],
+                flow["audio_chunks"],
+                stream_video_count,
+                stream_total_bytes,
+                recv_buf_size,
+                recv_frag_parts,
+                next_recv_sn,
+            )
+            _LOGGER.debug(
+                "Flow tx (%s): heartbeat=%d start_live=%d ice_checks=%d iva_handshake=%d",
+                reason,
+                flow["tx_heartbeat"],
+                flow["tx_start_live"],
+                flow["tx_ice_check"],
+                flow["tx_iva_handshake"],
+            )
 
         def _handle_stream_payload(payload):
             nonlocal stream_frame_count, stream_video_count, stream_total_bytes
             nonlocal last_video_time
             if not payload or len(payload) < 4:
                 return True
-            if payload[0] != 0 or payload[1] != 0 or payload[2] != 1:
-                return True
-            frame_type = payload[3]
-            stream_frame_count += 1
-            if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME, STREAM_TYPE_AUDIO):
-                decrypted = decrypt_stream_frame(bytearray(payload))
-                parsed = parse_stream_frame(bytes(decrypted))
-            else:
-                parsed = parse_stream_frame(payload)
-            if parsed:
+            flow["stream_payload_calls"] += 1
+            for chunk in split_stream_frames(payload):
+                if len(chunk) < 4:
+                    continue
+                if chunk[0] != 0 or chunk[1] != 0 or chunk[2] != 1:
+                    continue
+                flow["stream_chunks"] += 1
+                frame_type = chunk[3]
+                stream_frame_count += 1
+                if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME, STREAM_TYPE_AUDIO):
+                    decrypted = decrypt_stream_frame(bytearray(chunk))
+                    parsed = parse_stream_frame(bytes(decrypted))
+                else:
+                    parsed = parse_stream_frame(chunk)
+                if not parsed:
+                    flow["stream_parse_fail"] += 1
+                    continue
+                flow["stream_parse_ok"] += 1
                 ftype, _, media_data = parsed
                 if ftype in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
+                    flow["video_chunks"] += 1
                     stream_video_count += 1
                     stream_total_bytes += len(media_data)
+                    self._video_count += 1
+                    self._total_bytes += len(media_data)
                     last_video_time = time.time()
                     if self.on_video:
                         self.on_video(media_data)
-                    return True
-                elif ftype == STREAM_TYPE_AUDIO:
+                    continue
+                if ftype == STREAM_TYPE_AUDIO:
+                    flow["audio_chunks"] += 1
                     if self.on_audio:
                         self.on_audio(media_data)
-                    return True
             return True
 
-        def _drain_kcp_queue():
+        def _drain_kcp_queue() -> int:
+            drained = 0
             while True:
                 queued = kcp.poll_data()
                 if not queued:
@@ -734,22 +873,84 @@ class P2PStreamer:
                         qpayload = qp
                 if qpayload:
                     _handle_stream_payload(qpayload)
+                    drained += 1
+            return drained
+
+        def _kcp_gap_pending() -> bool:
+            next_sn = int(getattr(kcp, "next_recv_sn", -1))
+            recv_buf = getattr(kcp, "recv_buf", {})
+            if next_sn < 0 or not recv_buf:
+                return False
+            if next_sn in recv_buf:
+                return False
+            return any(sn > next_sn for sn in recv_buf)
+
+        def _attempt_kcp_gap_recovery(now_ts: float) -> None:
+            nonlocal last_nudge_time, last_skip_time, last_kcp_payload_time
+            if not login_ok or last_kcp_data_time is None:
+                return
+            if last_video_time is None:
+                return
+            stall_time = now_ts - last_video_time
+            if stall_time <= 0.2:
+                return
+            if now_ts - last_nudge_time > 0.2:
+                if kcp.send_gap_nudge():
+                    last_nudge_time = now_ts
+            if stall_time > 0.8 and now_ts - last_skip_time > 0.8:
+                if kcp.skip_gap():
+                    last_skip_time = now_ts
+                    kcp.flush_acks()
+                    drained = _drain_kcp_queue()
+                    if drained:
+                        last_kcp_payload_time = time.time()
 
         _packet_buf: deque = deque()
 
+        def _video_drought(now_ts: float) -> bool:
+            if last_video_time is not None:
+                return (now_ts - last_video_time) > no_video_restart_sec
+            if login_ok_at is not None:
+                return (now_ts - login_ok_at) > no_video_restart_sec
+            return False
+
         while self._running and time.time() < ice_deadline:
             now = time.time()
+
+            if login_ok and _video_drought(now):
+                _LOGGER.debug(
+                    "No video received %.0fs after VVP login; restarting session",
+                    no_video_restart_sec,
+                )
+                no_video_timeout = True
+                break
 
             # Heartbeats
             if login_ok and now >= heartbeat_at:
                 hb = build_vvp_packet(
                     cmd=VVP_CMD_HEARTBEAT, seq=vvp_seq,
                     host_key=host_key, param=8, licence_id=licence_id)
+                flow["tx_heartbeat"] += 1
                 kcp.send_iva_data(hb)
                 vvp_seq += 1
                 heartbeat_at = now + 10
 
+            if (
+                login_ok
+                and (last_video_time is None or now - last_video_time > 3)
+                and now >= start_live_retry_at
+            ):
+                start_live = build_vvp_packet(
+                    cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                    host_key=host_key, param=8, licence_id=licence_id,
+                )
+                flow["tx_start_live"] += 1
+                kcp.send_iva_data(start_live)
+                vvp_seq += 1
+                start_live_retry_at = now + 5
+
             if login_ok and now >= iva_heartbeat_at:
+                flow["tx_iva_handshake"] += 1
                 kcp.send_handshake()
                 iva_heartbeat_at = now + 3
 
@@ -785,16 +986,60 @@ class P2PStreamer:
                         turn.sock.setblocking(True)
                         turn.sock.settimeout(0.5)
                 except socket.timeout:
+                    if not self._running:
+                        break
+                    if login_ok and now >= heartbeat_at:
+                        hb = build_vvp_packet(
+                            cmd=VVP_CMD_HEARTBEAT, seq=vvp_seq,
+                            host_key=host_key, param=8, licence_id=licence_id,
+                        )
+                        flow["tx_heartbeat"] += 1
+                        kcp.send_iva_data(hb)
+                        vvp_seq += 1
+                        heartbeat_at = now + 10
+                    if (
+                        login_ok
+                        and (last_video_time is None or now - last_video_time > 3)
+                        and now >= start_live_retry_at
+                    ):
+                        start_live = build_vvp_packet(
+                            cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                            host_key=host_key, param=8, licence_id=licence_id,
+                        )
+                        flow["tx_start_live"] += 1
+                        kcp.send_iva_data(start_live)
+                        vvp_seq += 1
+                        start_live_retry_at = now + 5
+                    if login_ok and now >= iva_heartbeat_at:
+                        flow["tx_iva_handshake"] += 1
+                        kcp.send_handshake()
+                        iva_heartbeat_at = now + 3
+                    if login_ok and now >= turn_refresh_at:
+                        try:
+                            turn.refresh(lifetime=600)
+                        except Exception:
+                            pass
+                        turn_refresh_at = now + 60
                     if now >= ice_resend_at:
+                        flow["tx_ice_check"] += 1
                         _send_ice_checks()
                         kcp.retransmit_unacked()
                         ice_resend_at = now + 2
                     if now >= login_resend_at:
                         kcp.retransmit_unacked()
                         login_resend_at = now + 5
+                    if login_ok and _video_drought(now):
+                        _LOGGER.debug(
+                            "No video received %.0fs after VVP login; restarting session",
+                            no_video_restart_sec,
+                        )
+                        no_video_timeout = True
+                        break
+                    _attempt_kcp_gap_recovery(now)
                     continue
 
             raw, addr = _packet_buf.popleft()
+            flow["udp_packets"] += 1
             if len(raw) < 4:
                 continue
 
@@ -804,6 +1049,7 @@ class P2PStreamer:
 
             # Unwrap TURN framing
             if (raw[0] & 0xC0) == 0x40:
+                flow["turn_channel_packets"] += 1
                 ch_num, length = struct.unpack(">HH", raw[:4])
                 data = raw[4 : 4 + length]
                 peer = turn.reverse_channels.get(ch_num)
@@ -829,6 +1075,7 @@ class P2PStreamer:
                 msg = _parse_stun(raw)
                 if msg:
                     if msg["type"] == DATA_INDICATION:
+                        flow["data_indications"] += 1
                         inner_data = msg["attrs"].get(ATTR_DATA, b"")
                         pip, pport = None, None
                         if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
@@ -885,9 +1132,11 @@ class P2PStreamer:
             # KCP processing
             kcp_seg = parse_kcp_segment(data)
             if kcp_seg:
+                flow["kcp_segments"] += 1
                 result = kcp.process_input(data)
                 kcp.flush_acks()
                 if kcp_seg["cmd"] == 81:
+                    flow["kcp_push"] += 1
                     kcp_push_count += 1
                     last_kcp_data_time = time.time()
                     if not confirmed_peer[0] and source_addr:
@@ -908,6 +1157,8 @@ class P2PStreamer:
                             if direct_addr and direct_addr[0] != coturn_ip:
                                 send_addr_holder[0] = direct_addr
                     elif rtype == "data" and rdata:
+                        flow["kcp_data_msgs"] += 1
+                        last_kcp_payload_time = time.time()
                         payload = rdata
                         if len(rdata) >= 20 and rdata[0] == 0xFF and rdata[1] == 0x01:
                             iva = parse_iva_frame(rdata)
@@ -919,6 +1170,7 @@ class P2PStreamer:
                         if payload:
                             if not login_ok:
                                 login_ok = True
+                                login_ok_at = time.time()
                                 stream_start_time = time.time()
                                 if self.on_login:
                                     self.on_login()
@@ -926,30 +1178,37 @@ class P2PStreamer:
                                     cmd=VVP_CMD_HEARTBEAT, seq=vvp_seq,
                                     host_key=host_key, param=8,
                                     licence_id=licence_id)
+                                flow["tx_heartbeat"] += 1
                                 kcp.send_iva_data(hb)
+                                vvp_seq += 1
+                                # Push an explicit START_LIVE as soon as login
+                                # is confirmed; some sessions otherwise remain
+                                # audio-only or idle until a later retry.
+                                start_live = build_vvp_packet(
+                                    cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                                    host_key=host_key, param=8,
+                                    licence_id=licence_id,
+                                )
+                                flow["tx_start_live"] += 1
+                                kcp.send_iva_data(start_live)
                                 vvp_seq += 1
                             ice_deadline = max(ice_deadline, time.time() + 30)
                             _handle_stream_payload(payload)
-                        _drain_kcp_queue()
+                        drained = _drain_kcp_queue()
+                        if drained:
+                            last_kcp_payload_time = time.time()
 
                 # Stall recovery + deadline management
                 if login_ok:
-                    kcp_alive = last_kcp_data_time and time.time() - last_kcp_data_time < 20
+                    now2 = time.time()
+                    kcp_alive = last_kcp_data_time and now2 - last_kcp_data_time < 20
                     if not kcp_alive and last_kcp_data_time:
                         break
-                    if last_video_time and time.time() - last_video_time < 10:
+                    if last_video_time and now2 - last_video_time < 10:
                         ice_deadline = max(ice_deadline, time.time() + 15)
                     elif kcp_alive:
                         ice_deadline = max(ice_deadline, time.time() + 10)
-                    if last_video_time and time.time() - last_video_time > 0.2:
-                        if time.time() - last_nudge_time > 0.2:
-                            kcp.send_gap_nudge()
-                            last_nudge_time = time.time()
-                        stall_time = time.time() - last_video_time
-                        if stall_time > 0.8 and time.time() - last_skip_time > 0.8 and kcp.skip_gap():
-                            last_skip_time = time.time()
-                            kcp.flush_acks()
-                            _drain_kcp_queue()
+                    _attempt_kcp_gap_recovery(now2)
                 continue
 
             # Raw IVA frame
@@ -962,9 +1221,15 @@ class P2PStreamer:
         # Connection loop done — enter continuation receiver if we got video
         if not login_ok:
             _LOGGER.warning("VVP login failed")
+            _log_flow_summary("login-failed")
+            return (stream_video_count, stream_total_bytes)
+
+        if no_video_timeout:
+            _log_flow_summary("no-video-timeout")
             return (stream_video_count, stream_total_bytes)
 
         if last_video_time and time.time() - last_video_time > 10:
+            _log_flow_summary("video-stale")
             return (stream_video_count, stream_total_bytes)
 
         # Continuation receiver
@@ -973,6 +1238,7 @@ class P2PStreamer:
             vvp_seq, stream_frame_count, stream_video_count,
             stream_total_bytes, stream_start_time,
         )
+        _log_flow_summary("handoff-to-continuation")
         return (v2, b2)
 
     # ------------------------------------------------------------------
@@ -990,15 +1256,32 @@ class P2PStreamer:
         total_bytes = bytes_start
         last_video_time: float | None = None
         last_kcp_data_time = time.time()
+        last_kcp_payload_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
         vvp_seq = vvp_seq_start
         last_heartbeat = time.time()
         last_iva_heartbeat = time.time()
+        start_live_retry_at = time.time() + 5
         last_turn_refresh = time.time()
+        recv_flow = {
+            "udp_packets": 0,
+            "turn_channel_packets": 0,
+            "data_indications": 0,
+            "kcp_segments": 0,
+            "kcp_push": 0,
+            "kcp_data_msgs": 0,
+            "payload_calls": 0,
+            "chunks": 0,
+            "parse_ok": 0,
+            "parse_fail": 0,
+            "video_chunks": 0,
+            "audio_chunks": 0,
+        }
 
         def _process_kcp_message(msg_data):
-            nonlocal frame_count, video_frame_count, total_bytes, last_video_time
+            nonlocal frame_count, video_frame_count, total_bytes
+            nonlocal last_video_time, last_kcp_payload_time
             payload = msg_data
             if len(msg_data) >= 20 and msg_data[0] == 0xFF and msg_data[1] == 0x01:
                 iva = parse_iva_frame(msg_data)
@@ -1009,27 +1292,40 @@ class P2PStreamer:
                     payload = ipayload
             if not payload or len(payload) < 4:
                 return True
-            if payload[0] == 0 and payload[1] == 0 and payload[2] == 1:
-                frame_type = payload[3]
+            last_kcp_payload_time = time.time()
+            recv_flow["payload_calls"] += 1
+            for chunk in split_stream_frames(payload):
+                if len(chunk) < 4:
+                    continue
+                if chunk[0] != 0 or chunk[1] != 0 or chunk[2] != 1:
+                    continue
+                recv_flow["chunks"] += 1
+                frame_type = chunk[3]
                 frame_count += 1
                 if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME, STREAM_TYPE_AUDIO):
-                    decrypted = decrypt_stream_frame(bytearray(payload))
+                    decrypted = decrypt_stream_frame(bytearray(chunk))
                     parsed = parse_stream_frame(bytes(decrypted))
                 else:
-                    parsed = parse_stream_frame(payload)
-                if parsed:
-                    ftype, _, media_data = parsed
-                    if ftype in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
-                        video_frame_count += 1
-                        total_bytes += len(media_data)
-                        last_video_time = time.time()
-                        if self.on_video:
-                            self.on_video(media_data)
-                        return True
-                    elif ftype == STREAM_TYPE_AUDIO:
-                        if self.on_audio:
-                            self.on_audio(media_data)
-                        return True
+                    parsed = parse_stream_frame(chunk)
+                if not parsed:
+                    recv_flow["parse_fail"] += 1
+                    continue
+                recv_flow["parse_ok"] += 1
+                ftype, _, media_data = parsed
+                if ftype in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
+                    recv_flow["video_chunks"] += 1
+                    video_frame_count += 1
+                    total_bytes += len(media_data)
+                    self._video_count += 1
+                    self._total_bytes += len(media_data)
+                    last_video_time = time.time()
+                    if self.on_video:
+                        self.on_video(media_data)
+                    continue
+                if ftype == STREAM_TYPE_AUDIO:
+                    recv_flow["audio_chunks"] += 1
+                    if self.on_audio:
+                        self.on_audio(media_data)
             return True
 
         # Drain queued KCP messages
@@ -1039,6 +1335,45 @@ class P2PStreamer:
                 break
             _process_kcp_message(queued)
 
+        def _kcp_gap_pending() -> bool:
+            next_sn = int(getattr(kcp, "next_recv_sn", -1))
+            recv_buf = getattr(kcp, "recv_buf", {})
+            if next_sn < 0 or not recv_buf:
+                return False
+            if next_sn in recv_buf:
+                return False
+            return any(sn > next_sn for sn in recv_buf)
+
+        def _drain_recv_queue() -> int:
+            drained = 0
+            while True:
+                queued = kcp.poll_data()
+                if not queued:
+                    break
+                _process_kcp_message(queued)
+                drained += 1
+            return drained
+
+        def _attempt_kcp_gap_recovery(now_ts: float) -> None:
+            nonlocal last_nudge_time, last_skip_time, last_kcp_payload_time
+            if last_kcp_data_time is None:
+                return
+            if last_video_time is None:
+                return
+            stall = now_ts - last_video_time
+            if stall <= 0.2:
+                return
+            if now_ts - last_nudge_time > 0.2:
+                if kcp.send_gap_nudge():
+                    last_nudge_time = now_ts
+            if stall > 0.8 and now_ts - last_skip_time > 0.8:
+                if kcp.skip_gap():
+                    last_skip_time = now_ts
+                    kcp.flush_acks()
+                    drained = _drain_recv_queue()
+                    if drained:
+                        last_kcp_payload_time = time.time()
+
         # Send initial heartbeat
         if host_key:
             hb = build_vvp_packet(
@@ -1046,9 +1381,18 @@ class P2PStreamer:
                 host_key=host_key, param=8, licence_id=licence_id)
             kcp.send_iva_data(hb)
             vvp_seq += 1
+            # Issue START_LIVE immediately after heartbeat in continuation,
+            # then keep periodic retries if no video arrives.
+            start_live = build_vvp_packet(
+                cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                host_key=host_key, param=8, licence_id=licence_id,
+            )
+            kcp.send_iva_data(start_live)
+            vvp_seq += 1
 
         _recv_buf: deque = deque()
         timeout_count = 0
+        no_video_restart_sec = 90.0
 
         while self._running:
             if not _recv_buf:
@@ -1069,6 +1413,8 @@ class P2PStreamer:
                         turn.sock.settimeout(0.5)
                 except socket.timeout:
                     now = time.time()
+                    if not self._running:
+                        break
                     if host_key and now - last_heartbeat >= 10:
                         hb = build_vvp_packet(
                             cmd=VVP_CMD_HEARTBEAT, seq=vvp_seq,
@@ -1076,6 +1422,16 @@ class P2PStreamer:
                         kcp.send_iva_data(hb)
                         vvp_seq += 1
                         last_heartbeat = now
+                    if (
+                        last_video_time is None or now - last_video_time > 3
+                    ) and now >= start_live_retry_at:
+                        start_live = build_vvp_packet(
+                            cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                            host_key=host_key, param=8, licence_id=licence_id,
+                        )
+                        kcp.send_iva_data(start_live)
+                        vvp_seq += 1
+                        start_live_retry_at = now + 5
                     if now - last_iva_heartbeat >= 3:
                         kcp.send_handshake()
                         last_iva_heartbeat = now
@@ -1089,32 +1445,34 @@ class P2PStreamer:
                         timeout_count += 1
                         if timeout_count >= 60:
                             break
+                    if (
+                        (last_video_time is None and now - start_time > no_video_restart_sec)
+                        or (
+                            last_video_time is not None
+                            and now - last_video_time > no_video_restart_sec
+                        )
+                    ):
+                        _LOGGER.debug(
+                            "No video received %.0fs after login in continuation; restarting session",
+                            no_video_restart_sec,
+                        )
+                        break
                     if last_kcp_data_time and now - last_kcp_data_time > 20:
                         _LOGGER.debug("No KCP data for 20s, ending session")
                         break
-                    if last_video_time and now - last_video_time > 0.2:
-                        if now - last_nudge_time > 0.2:
-                            kcp.send_gap_nudge()
-                            last_nudge_time = now
-                        stall = now - last_video_time
-                        if stall > 0.8 and now - last_skip_time > 0.8 and kcp.skip_gap():
-                            last_skip_time = now
-                            kcp.flush_acks()
-                            while True:
-                                q = kcp.poll_data()
-                                if not q:
-                                    break
-                                _process_kcp_message(q)
+                    _attempt_kcp_gap_recovery(now)
                     continue
 
             raw, addr = _recv_buf.popleft()
             timeout_count = 0
+            recv_flow["udp_packets"] += 1
             if len(raw) < 4:
                 continue
 
             # Unwrap TURN framing
             data = raw
             if (raw[0] & 0xC0) == 0x40:
+                recv_flow["turn_channel_packets"] += 1
                 ch, length = struct.unpack(">HH", raw[:4])
                 data = raw[4 : 4 + length]
                 inner_stun = _parse_stun(data)
@@ -1131,6 +1489,7 @@ class P2PStreamer:
                 msg = _parse_stun(raw)
                 if msg:
                     if msg["type"] == DATA_INDICATION:
+                        recv_flow["data_indications"] += 1
                         inner = msg["attrs"].get(ATTR_DATA, b"")
                         pip, pport = None, None
                         if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
@@ -1157,6 +1516,9 @@ class P2PStreamer:
             # KCP processing
             seg = parse_kcp_segment(data)
             if seg:
+                recv_flow["kcp_segments"] += 1
+                if seg["cmd"] == 81:
+                    recv_flow["kcp_push"] += 1
                 if seg["cmd"] == 81:
                     last_kcp_data_time = time.time()
                 result = kcp.process_input(data)
@@ -1164,23 +1526,12 @@ class P2PStreamer:
                 if result:
                     rtype, rdata = result
                     if rtype == "data" and rdata:
+                        recv_flow["kcp_data_msgs"] += 1
                         _process_kcp_message(rdata)
-                        while True:
-                            q = kcp.poll_data()
-                            if not q:
-                                break
-                            _process_kcp_message(q)
+                        _drain_recv_queue()
                 # Stall recovery
                 now = time.time()
-                if last_video_time and now - last_video_time > 0.8:
-                    if now - last_skip_time > 0.8 and kcp.skip_gap():
-                        last_skip_time = now
-                        kcp.flush_acks()
-                        while True:
-                            q = kcp.poll_data()
-                            if not q:
-                                break
-                            _process_kcp_message(q)
+                _attempt_kcp_gap_recovery(now)
                 if last_kcp_data_time and now - last_kcp_data_time > 20:
                     break
             elif data[0] == 0xFF and data[1] == 0x01:
@@ -1188,6 +1539,18 @@ class P2PStreamer:
 
             # Heartbeats
             now = time.time()
+            if (
+                (last_video_time is None and now - start_time > no_video_restart_sec)
+                or (
+                    last_video_time is not None
+                    and now - last_video_time > no_video_restart_sec
+                )
+            ):
+                _LOGGER.debug(
+                    "No video received %.0fs after login in continuation; restarting session",
+                    no_video_restart_sec,
+                )
+                break
             if host_key and now - last_heartbeat >= 10:
                 hb = build_vvp_packet(
                     cmd=VVP_CMD_HEARTBEAT, seq=vvp_seq,
@@ -1195,8 +1558,40 @@ class P2PStreamer:
                 kcp.send_iva_data(hb)
                 vvp_seq += 1
                 last_heartbeat = now
+            if (
+                last_video_time is None or now - last_video_time > 3
+            ) and now >= start_live_retry_at:
+                start_live = build_vvp_packet(
+                    cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
+                    host_key=host_key, param=8, licence_id=licence_id,
+                )
+                kcp.send_iva_data(start_live)
+                vvp_seq += 1
+                start_live_retry_at = now + 5
             if now - last_iva_heartbeat >= 3:
                 kcp.send_handshake()
                 last_iva_heartbeat = now
-
+        _LOGGER.debug(
+            "Continuation summary: udp=%d turn_ch=%d data_ind=%d kcp_seg=%d kcp_push=%d "
+            "kcp_data=%d payloads=%d chunks=%d parse_ok=%d parse_fail=%d "
+            "video_chunks=%d audio_chunks=%d video_frames=%d bytes=%d "
+            "kcp_recv_buf=%d kcp_frag_parts=%d next_sn=%d",
+            recv_flow["udp_packets"],
+            recv_flow["turn_channel_packets"],
+            recv_flow["data_indications"],
+            recv_flow["kcp_segments"],
+            recv_flow["kcp_push"],
+            recv_flow["kcp_data_msgs"],
+            recv_flow["payload_calls"],
+            recv_flow["chunks"],
+            recv_flow["parse_ok"],
+            recv_flow["parse_fail"],
+            recv_flow["video_chunks"],
+            recv_flow["audio_chunks"],
+            video_frame_count,
+            total_bytes,
+            len(getattr(kcp, "recv_buf", {})),
+            len(getattr(kcp, "recv_frag_buf", [])),
+            int(getattr(kcp, "next_recv_sn", -1)),
+        )
         return (video_frame_count, total_bytes)

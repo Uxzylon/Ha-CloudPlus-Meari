@@ -16,7 +16,7 @@
     "error": {
       "cannot_connect": "Failed to connect to CloudEdge API.",
       "invalid_auth": "Invalid email or password.",
-      "no_devices": "No battery cameras found on this account.",
+      "no_devices": "No supported cameras found on this account.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
