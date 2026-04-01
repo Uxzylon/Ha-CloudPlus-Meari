@@ -1,4 +1,4 @@
-"""The CloudPlus / Meari camera integration."""
+"""The CloudEdge / Meari camera integration."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .const import (
     DEFAULT_PHONE_CODE,
     DOMAIN,
 )
-from .coordinator import CloudPlusCoordinator
+from .coordinator import CloudEdgeMeariCoordinator
 from .api import MeariApiClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ PLATFORMS = ["camera", "binary_sensor", "button", "sensor", "number", "select", 
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up CloudPlus from a config entry (one entry = one account)."""
+    """Set up CloudEdge / Meari from a config entry (one entry = one account)."""
     hass.data.setdefault(DOMAIN, {})
 
     email = entry.data[CONF_EMAIL]
@@ -47,9 +47,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.async_add_executor_job(api.login)
     camera_devices = api.get_camera_devices()
 
-    coordinators: list[CloudPlusCoordinator] = []
+    coordinators: list[CloudEdgeMeariCoordinator] = []
     for dev in camera_devices:
-        coord = CloudPlusCoordinator(
+        coord = CloudEdgeMeariCoordinator(
             hass,
             email,
             password,
@@ -72,7 +72,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    coordinators: list[CloudPlusCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
 
     for coord in coordinators:
         await coord.async_stop()

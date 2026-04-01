@@ -146,7 +146,7 @@ def format_sn(sn: str) -> str:
 
 
 class MeariApiClient:
-    """HTTP API client for CloudEdge / Meari / CloudPlus."""
+    """HTTP API client for CloudEdge / Meari."""
 
     def __init__(
         self,

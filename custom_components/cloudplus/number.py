@@ -1,4 +1,4 @@
-"""Number platform for CloudPlus / Meari — motion timeout."""
+"""Number platform for CloudEdge / Meari — motion timeout."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, CONF_MOTION_TIMEOUT
-from .coordinator import CloudPlusCoordinator
+from .coordinator import CloudEdgeMeariCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,14 +22,14 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up CloudPlus number entities from a config entry."""
-    coordinators: list[CloudPlusCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    """Set up CloudEdge / Meari number entities from a config entry."""
+    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [CloudPlusMotionTimeout(coord, entry) for coord in coordinators]
+        [CloudEdgeMeariMotionTimeout(coord, entry) for coord in coordinators]
     )
 
 
-class CloudPlusMotionTimeout(NumberEntity):
+class CloudEdgeMeariMotionTimeout(NumberEntity):
     """Number entity to control the motion-wake timeout (seconds)."""
 
     _attr_has_entity_name = True
@@ -41,14 +41,14 @@ class CloudPlusMotionTimeout(NumberEntity):
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
     _attr_mode = NumberMode.SLIDER
 
-    def __init__(self, coordinator: CloudPlusCoordinator, entry: ConfigEntry) -> None:
+    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_motion_timeout"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudPlus {coordinator.device_name}",
-            "manufacturer": "Meari / CloudEdge",
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
             "model": coordinator.device_model,
         }
         self._unsub_update: Any = None
