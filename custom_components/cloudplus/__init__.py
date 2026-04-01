@@ -36,7 +36,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     phone_code = entry.data.get(CONF_PHONE_CODE, DEFAULT_PHONE_CODE)
     app_profile = entry.data.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE)
 
-    # Discover all snap (battery) cameras on the account
+    # Discover supported cameras on the account
     api = MeariApiClient(
         email=email,
         password=password,
@@ -45,10 +45,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         app_profile=app_profile,
     )
     await hass.async_add_executor_job(api.login)
-    snap_devices = api.get_snap_devices()
+    camera_devices = api.get_camera_devices()
 
     coordinators: list[CloudPlusCoordinator] = []
-    for dev in snap_devices:
+    for dev in camera_devices:
         coord = CloudPlusCoordinator(
             hass,
             email,

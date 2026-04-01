@@ -544,6 +544,14 @@ class MeariApiClient:
         """Return only battery (snap) cameras."""
         return [d for d in self.devices.values() if d.get("_category") == "snap"]
 
+    def get_camera_devices(self) -> list[dict]:
+        """Return camera-capable devices (battery + wired cameras)."""
+        categories = {"snap", "ipc", "doorbell"}
+        return [
+            d for d in self.devices.values()
+            if str(d.get("_category", "")).lower() in categories
+        ]
+
     def get_device_status(self, sn_num: str) -> str:
         """Query device status via OpenAPI. Returns online/offline/dormancy."""
         device_id = format_sn(sn_num)

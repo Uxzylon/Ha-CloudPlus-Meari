@@ -49,7 +49,7 @@ class CloudPlusMotionSensor(BinarySensorEntity):
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudPlus {coordinator.device_name}",
             "manufacturer": "Meari / CloudEdge",
-            "model": "Battery Camera (snap)",
+            "model": coordinator.device_model,
         }
         self._unsub_motion: Any = None
         self._unsub_update: Any = None
@@ -108,7 +108,7 @@ class CloudPlusAwakeSensor(BinarySensorEntity):
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudPlus {coordinator.device_name}",
             "manufacturer": "Meari / CloudEdge",
-            "model": "Battery Camera (snap)",
+            "model": coordinator.device_model,
         }
         self._unsub_update: Any = None
 
@@ -149,7 +149,7 @@ class CloudPlusChargingSensor(BinarySensorEntity):
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudPlus {coordinator.device_name}",
             "manufacturer": "Meari / CloudEdge",
-            "model": "Battery Camera (snap)",
+            "model": coordinator.device_model,
         }
         self._unsub_update: Any = None
 
