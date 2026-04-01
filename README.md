@@ -1,11 +1,11 @@
-# CloudEdge / CloudPlus / Meari — Home Assistant Integration
+# CloudEdge / Meari — Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Home Assistant custom integration for **CloudEdge / CloudPlus / Meari** battery-powered Wi-Fi cameras.
+A Home Assistant custom integration for **CloudEdge / Meari** battery-powered Wi-Fi cameras.
 
-These cameras are sold under various brand names (CloudPlus, CloudEdge, Meari, etc.) and all use the Meari cloud platform with the VVP (PPStrong) P2P protocol.
+These cameras are sold under various brand names (CloudEdge, CloudPlus, Meari, etc.) and all use the Meari cloud platform with the VVP (PPStrong) P2P protocol.
 
 ## Features
 
@@ -22,7 +22,7 @@ These cameras are sold under various brand names (CloudPlus, CloudEdge, Meari, e
 
 ## Requirements
 
-- A CloudPlus / CloudEdge / Meari-based camera with cloud account
+- A CloudEdge / Meari-based camera with cloud account
 - Home Assistant 2024.1+
 - `ffmpeg` installed in your HA environment (included in HAOS and HA Docker images)
 - `pycryptodome` and `paho-mqtt` (installed automatically)
@@ -46,7 +46,7 @@ These cameras are sold under various brand names (CloudPlus, CloudEdge, Meari, e
 
 1. Go to **Settings → Devices & Services → Add Integration**
 2. Search for **CloudEdge / CloudPlus / Meari**
-3. Enter your Meari / CloudEdge account email and password
+3. Enter your CloudEdge / Meari account email and password
 4. Select the camera to add
 5. The integration will create all entities automatically
 

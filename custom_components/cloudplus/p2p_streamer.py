@@ -1,4 +1,4 @@
-"""P2P streaming engine for CloudPlus / Meari cameras.
+"""P2P streaming engine for CloudEdge / Meari cameras.
 
 Ported from main.py — handles signaling, TURN, ICE, KCP, VVP, and
 stream decryption. Designed for use by the HA coordinator.
@@ -313,7 +313,7 @@ def _send_direct_ice_binding(sock, peer_ip: str, peer_port: int,
 # ---------------------------------------------------------------------------
 
 class P2PStreamer:
-    """Runs P2P streaming sessions for a CloudPlus camera.
+    """Runs P2P streaming sessions for a CloudEdge / Meari camera.
 
     Callbacks:
       on_video(data: bytes)  — raw HEVC video payload (I/P frame)

@@ -2,14 +2,14 @@
   "config": {
     "step": {
       "user": {
-        "title": "CloudPlus Account",
-        "description": "Enter your CloudEdge / CloudPlus credentials. If login fails, adjust country/phone code and app profile.",
+        "title": "CloudEdge / Meari Account",
+        "description": "Enter your CloudEdge / Meari credentials. If login fails, adjust country/phone code and app profile.",
         "data": {
           "email": "Email",
           "password": "Password",
           "country_code": "Country code (ISO, e.g. FR, US)",
           "phone_code": "Phone code (e.g. 33, 1)",
-          "app_profile": "App profile (cloudplus/cloudedge)"
+          "app_profile": "App profile (cloudedge/cloudplus)"
         }
       }
     },

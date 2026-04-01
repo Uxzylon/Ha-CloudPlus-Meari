@@ -1,4 +1,4 @@
-"""Camera platform for CloudPlus / Meari integration."""
+"""Camera platform for CloudEdge / Meari integration."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import CloudPlusCoordinator
+from .coordinator import CloudEdgeMeariCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,21 +21,21 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up CloudPlus camera from a config entry."""
-    coordinators: list[CloudPlusCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    """Set up CloudEdge / Meari camera from a config entry."""
+    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [CloudPlusCamera(coord, entry) for coord in coordinators]
+        [CloudEdgeMeariCamera(coord, entry) for coord in coordinators]
     )
 
 
-class CloudPlusCamera(Camera):
-    """Representation of a CloudPlus / Meari camera."""
+class CloudEdgeMeariCamera(Camera):
+    """Representation of a CloudEdge / Meari camera."""
 
     _attr_has_entity_name = True
     _attr_name = "Camera"
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, coordinator: CloudPlusCoordinator, entry: ConfigEntry) -> None:
+    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
         """Initialize the camera."""
         super().__init__()
         self._coordinator = coordinator
@@ -44,8 +44,8 @@ class CloudPlusCamera(Camera):
         self._attr_unique_id = f"{coordinator.device_uuid}_camera"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudPlus {coordinator.device_name}",
-            "manufacturer": "Meari / CloudEdge",
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
             "model": coordinator.device_model,
         }
         self._unsub_update: Any = None

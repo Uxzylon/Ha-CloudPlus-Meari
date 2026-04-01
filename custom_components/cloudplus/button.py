@@ -1,4 +1,4 @@
-"""Button platform for CloudPlus / Meari — wake camera."""
+"""Button platform for CloudEdge / Meari — wake camera."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import CloudPlusCoordinator
+from .coordinator import CloudEdgeMeariCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,28 +21,28 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up CloudPlus buttons from a config entry."""
-    coordinators: list[CloudPlusCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    """Set up CloudEdge / Meari buttons from a config entry."""
+    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [CloudPlusWakeButton(coord, entry) for coord in coordinators]
+        [CloudEdgeMeariWakeButton(coord, entry) for coord in coordinators]
     )
 
 
-class CloudPlusWakeButton(ButtonEntity):
+class CloudEdgeMeariWakeButton(ButtonEntity):
     """Button to wake the camera."""
 
     _attr_has_entity_name = True
     _attr_name = "Wake Camera"
     _attr_icon = "mdi:alarm-light-outline"
 
-    def __init__(self, coordinator: CloudPlusCoordinator, entry: ConfigEntry) -> None:
+    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_wake"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudPlus {coordinator.device_name}",
-            "manufacturer": "Meari / CloudEdge",
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
             "model": coordinator.device_model,
         }
         self._unsub_update: Any = None

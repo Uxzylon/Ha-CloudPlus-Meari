@@ -1,4 +1,4 @@
-"""Coordinator for CloudPlus / Meari camera — manages lifecycle.
+"""Coordinator for CloudEdge / Meari camera — manages lifecycle.
 
 Runs MQTT listener, P2P streaming, ffmpeg muxer, TCP stream server,
 and idle stream in background threads. Manages camera wake/sleep state
@@ -40,8 +40,8 @@ STATUS_POLL_INTERVAL = 60.0
 BATTERY_POLL_INTERVAL = 300.0
 
 
-class CloudPlusCoordinator:
-    """Manages connection to a single CloudPlus / Meari camera."""
+class CloudEdgeMeariCoordinator:
+    """Manages connection to a single CloudEdge / Meari camera."""
 
     # Watch states
     _W_IDLE = 0
@@ -786,7 +786,7 @@ class CloudPlusCoordinator:
             daemon=True,
         )
         self._thread.start()
-        _LOGGER.info("Started CloudPlus coordinator for %s", self._sn_num)
+        _LOGGER.info("Started CloudEdge / Meari coordinator for %s", self._sn_num)
 
     async def async_stop(self) -> None:
         self._running = False
@@ -803,7 +803,7 @@ class CloudPlusCoordinator:
             self._thread.join(timeout=15)
             self._thread = None
         self._available = False
-        _LOGGER.info("Stopped CloudPlus coordinator for %s", self._sn_num)
+        _LOGGER.info("Stopped CloudEdge / Meari coordinator for %s", self._sn_num)
 
     # ------------------------------------------------------------------
     # MQTT

@@ -1,4 +1,4 @@
-"""Config flow for CloudPlus / Meari integration."""
+"""Config flow for CloudEdge / Meari integration."""
 
 from __future__ import annotations
 
@@ -45,8 +45,8 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
-class CloudPlusConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for CloudPlus / Meari."""
+class CloudEdgeMeariConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for CloudEdge / Meari."""
 
     VERSION = 1
 
@@ -90,7 +90,7 @@ class CloudPlusConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._abort_if_unique_id_configured()
 
                     return self.async_create_entry(
-                        title=f"CloudPlus ({email})",
+                        title=f"CloudEdge / Meari ({email})",
                         data={
                             CONF_EMAIL: email,
                             CONF_PASSWORD: password,

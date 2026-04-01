@@ -1,4 +1,4 @@
-"""Constants for the CloudPlus / Meari integration."""
+"""Constants for the CloudEdge / Meari integration."""
 
 DOMAIN = "cloudplus"
 
@@ -16,8 +16,8 @@ CONF_MOTION_TIMEOUT = "motion_timeout"
 DEFAULT_MOTION_TIMEOUT = 120
 DEFAULT_COUNTRY_CODE = "FR"
 DEFAULT_PHONE_CODE = "33"
-DEFAULT_APP_PROFILE = "cloudplus"
-APP_PROFILES = ["cloudplus", "cloudedge"]
+DEFAULT_APP_PROFILE = "cloudedge"
+APP_PROFILES = ["cloudedge", "cloudplus"]
 
 # CloudEdge / Meari API
 PARTNER_ID = "77"
