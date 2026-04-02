@@ -83,17 +83,31 @@ class CloudEdgeMeariCoordinator:
         # Shared state
         self._latest_image: bytes | None = None
         self._latest_video_kf: bytes | None = None  # raw Annex-B keyframe for deferred JPEG conversion
+        self._idle_scene_kf: bytes | None = None  # cached last scene keyframe for idle keepalive
+        self._idle_video_kf: bytes | None = None  # lightweight keyframe used for long idle keepalive
         # Backward-compatible alias used by older debug tooling.
         self._latest_hevc_kf: bytes | None = None
         self._video_codec: str = "hevc"  # "hevc" or "h264"
+        self._idle_since: float = time.monotonic()
+        self._idle_scene_hold_seconds: float = 3.0
+        self._idle_keepalive_fps_initial: float = 15.0
+        self._idle_keepalive_fps_steady: float = 2.0
+        self._idle_keepalive_fps_with_clients: float = 15.0
+        self._idle_keepalive_settle_seconds: float = 5.0
+        self._live_gap_fill_after_seconds: float = 0.5
+        self._live_gap_fill_fps: float = 3.0
+        self._audio_gain_db: float = 18.0
         self._last_p2p_video_time: float = 0.0  # monotonic timestamp of last camera video frame
         self._last_p2p_audio_time: float = 0.0  # monotonic timestamp of last camera audio frame
         self._last_video_time: float = 0.0  # monotonic timestamp of last video write
         self._p2p_audio_frames: int = 0
         self._p2p_audio_bytes: int = 0
+        self._p2p_audio_non_ff_bytes: int = 0
+        self._p2p_audio_all_ff_frames: int = 0
         self._last_snapshot_convert_time: float = 0.0
         self._snapshot_convert_interval: float = max(0.5, float(snapshot_min_interval))
         self._snapshot_convert_lock = threading.Lock()
+        self._idle_scene_convert_lock = threading.Lock()
         self._motion_detected = False
         self._motion_type: str = ""
         self._last_motion_time: float = 0.0
@@ -133,6 +147,16 @@ class CloudEdgeMeariCoordinator:
         self._stream_port: int = 0
         self._stream_server_sock: socket.socket | None = None
         self._stream_clients: list[socket.socket] = []
+        self._stream_pending: dict[socket.socket, bytearray] = {}
+        self._stream_backlog: bytearray = bytearray()
+        # Keep bootstrap backlog small so newly connected readers lock quickly
+        # without inheriting seconds of old latency.
+        self._stream_backlog_max_bytes: int = 131072
+        # Keep enough headroom for downstream remuxers (go2rtc/frigate)
+        # without forcing reconnect loops on short backpressure spikes.
+        self._stream_max_pending_bytes: int = 524288
+        self._stream_send_chunk_bytes: int = 262144
+        self._stream_max_send_iters: int = 8
         self._stream_clients_lock = threading.Lock()
         self._stream_accept_thread: threading.Thread | None = None
         self._stream_epoch: float = 0.0  # wall-clock anchor for MPEG-TS timestamps
@@ -142,11 +166,17 @@ class CloudEdgeMeariCoordinator:
         self._ffmpeg_reader_thread: threading.Thread | None = None
         self._audio_write_fd: int = -1
         self._audio_primed = threading.Event()  # set when real camera audio arrives
+        self._audio_writer_thread: threading.Thread | None = None
+        self._audio_real_started: bool = False
+        # Keep audio buffering shallow and realtime-friendly.
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=48)
+        self._audio_queue_drops: int = 0
 
         # Video pacing queue — smooths network jitter for wallclock PTS.
-        # Match main.py behavior with a deeper queue so bursty input still
-        # renders fluidly instead of appearing as sparse frame updates.
-        self._video_queue: queue.Queue = queue.Queue(maxsize=60)
+        # Keep this queue bounded to limit end-to-end live delay.
+        self._video_queue: queue.Queue = queue.Queue(maxsize=18)
+        self._video_lag_drop_threshold: int = 4
+        self._video_queue_drops: int = 0
 
         # P2P streamer
         self._p2p_streamer: P2PStreamer | None = None
@@ -154,9 +184,9 @@ class CloudEdgeMeariCoordinator:
         self._stream_grab_only = False
         self._live_stream_requested = False
 
-        # Reinjecting identical keyframes in idle mode can produce
-        # non-monotonic DTS in copy-mux pipelines, so keep it off by default.
-        self._idle_video_keepalive = False
+        # Keep idle video alive so Frigate clients always see
+        # continuous video packets even while battery cameras sleep.
+        self._idle_video_keepalive = True
 
         # Stream host mode: "ip" (default) or "docker"
         self._stream_host_mode: str = "ip"
@@ -353,6 +383,8 @@ class CloudEdgeMeariCoordinator:
                 except OSError:
                     pass
             self._stream_clients.clear()
+            self._stream_pending.clear()
+            self._stream_backlog.clear()
 
     def _accept_stream_clients(self) -> None:
         """Accept loop for TCP stream clients (runs in thread)."""
@@ -361,32 +393,79 @@ class CloudEdgeMeariCoordinator:
                 client, addr = self._stream_server_sock.accept()
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-                client.settimeout(0.1)
+                # Non-blocking fanout avoids head-of-line blocking when one
+                # downstream consumer is slower than the others.
+                client.setblocking(False)
                 with self._stream_clients_lock:
                     self._stream_clients.append(client)
+                    self._stream_pending[client] = bytearray(self._stream_backlog)
                 _LOGGER.debug("Stream client connected from %s", addr)
             except socket.timeout:
                 continue
             except OSError:
                 break
 
+    def _append_stream_backlog(self, data: bytes) -> None:
+        """Keep a bounded MPEG-TS backlog for new client bootstrap."""
+        if not data:
+            return
+        self._stream_backlog.extend(data)
+        if len(self._stream_backlog) > self._stream_backlog_max_bytes:
+            overflow = len(self._stream_backlog) - self._stream_backlog_max_bytes
+            del self._stream_backlog[:overflow]
+
+        # Keep backlog aligned to MPEG-TS packet boundaries.
+        if self._stream_backlog:
+            first_sync = self._stream_backlog.find(b"\x47")
+            if first_sync < 0:
+                self._stream_backlog.clear()
+                return
+            if first_sync > 0:
+                del self._stream_backlog[:first_sync]
+            rem = len(self._stream_backlog) % 188
+            if rem:
+                del self._stream_backlog[-rem:]
+
     def _broadcast_stream(self, data: bytes) -> None:
         """Send MPEG-TS data to all connected stream clients."""
         if not data:
             return
         with self._stream_clients_lock:
+            self._append_stream_backlog(data)
             dead: list[socket.socket] = []
-            for client in self._stream_clients:
-                try:
-                    client.sendall(data)
-                except socket.timeout:
-                    # Skip this chunk if the client is temporarily backpressured,
-                    # but keep the connection for subsequent writes.
+            for client in list(self._stream_clients):
+                pending = self._stream_pending.get(client)
+                if pending is None:
+                    pending = bytearray()
+                    self._stream_pending[client] = pending
+                if len(pending) + len(data) > self._stream_max_pending_bytes:
+                    # Disconnect lagging consumers instead of trimming bytes in
+                    # place, which can leave remuxers stuck on corrupted state.
+                    dead.append(client)
                     continue
-                except (BrokenPipeError, ConnectionError, OSError):
+                pending.extend(data)
+                try:
+                    if pending:
+                        for _ in range(self._stream_max_send_iters):
+                            if not pending:
+                                break
+                            sent = client.send(pending[: self._stream_send_chunk_bytes])
+                            if sent > 0:
+                                del pending[:sent]
+                                continue
+                            if sent == 0:
+                                dead.append(client)
+                                break
+                            break
+                except (BlockingIOError, InterruptedError):
+                    # Client socket is temporarily backpressured.
+                    pass
+                except (BrokenPipeError, ConnectionError, OSError, ValueError):
                     dead.append(client)
             for c in dead:
-                self._stream_clients.remove(c)
+                if c in self._stream_clients:
+                    self._stream_clients.remove(c)
+                self._stream_pending.pop(c, None)
                 try:
                     c.close()
                 except OSError:
@@ -411,13 +490,13 @@ class CloudEdgeMeariCoordinator:
             "-fflags", "+genpts+igndts+discardcorrupt",
             "-use_wallclock_as_timestamps", "1",
             "-err_detect", "ignore_err",
-            "-probesize", "500000",
-            "-analyzeduration", "1000000",
+            "-probesize", "131072",
+            "-analyzeduration", "500000",
             "-framerate", "15",
-            "-thread_queue_size", "512",
+            "-thread_queue_size", "128",
             "-f", video_fmt, "-i", "pipe:0",
             # Audio input (G.711 µ-law from pipe)
-            "-thread_queue_size", "1024",
+            "-thread_queue_size", "256",
             "-f", "mulaw", "-ar", "8000", "-ac", "1",
             "-i", f"pipe:{audio_r}",
             # Output: pass-through camera video, transcode audio
@@ -425,13 +504,17 @@ class CloudEdgeMeariCoordinator:
             "-c:v", "copy",
             # Force monotonic packet timestamps for copy-mux output.
             "-bsf:v", "setts=pts=N/(15*TB):dts=N/(15*TB)",
-            "-c:a", "aac", "-b:a", "24k",
+            # Camera audio is often near digital silence (mu-law around 0xFF);
+            # boost output level so speech/environmental sound stays audible.
+            "-filter:a", f"volume={self._audio_gain_db:.1f}dB,alimiter=limit=0.92",
+            # Upsample audio for broader player/browser compatibility.
+            "-c:a", "aac", "-profile:a", "aac_low", "-ar", "16000", "-b:a", "64k",
             "-max_delay", "0",
             "-muxpreload", "0",
             "-muxdelay", "0",
             "-flush_packets", "1",
             "-f", "mpegts",
-            "-mpegts_flags", "resend_headers",
+            "-mpegts_flags", "+resend_headers+pat_pmt_at_frames",
             "pipe:1",
         ]
 
@@ -452,6 +535,26 @@ class CloudEdgeMeariCoordinator:
                 fcntl.fcntl(self._audio_write_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
             except Exception:
                 pass
+
+            # Drop stale buffered audio from previous sessions.
+            while True:
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._audio_queue_drops = 0
+            self._video_queue_drops = 0
+            self._audio_real_started = False
+
+            # Serialize all writes through a dedicated writer thread so
+            # partial non-blocking writes never corrupt realtime audio flow.
+            proc_ref = self._ffmpeg_proc
+            self._audio_writer_thread = threading.Thread(
+                target=self._audio_writer,
+                args=(proc_ref,),
+                daemon=True,
+            )
+            self._audio_writer_thread.start()
 
             # Enlarge stdin pipe buffer to 1MB.
             # Without this, any brief ffmpeg decode stutter fills the
@@ -529,6 +632,16 @@ class CloudEdgeMeariCoordinator:
                     pass
             self._ffmpeg_proc = None
 
+        if self._audio_writer_thread:
+            self._audio_writer_thread.join(timeout=2)
+            self._audio_writer_thread = None
+
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
         if self._ffmpeg_reader_thread:
             self._ffmpeg_reader_thread.join(timeout=5)
             self._ffmpeg_reader_thread = None
@@ -545,7 +658,8 @@ class CloudEdgeMeariCoordinator:
         """Read MPEG-TS from ffmpeg stdout and broadcast to TCP clients."""
         try:
             while self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
-                data = self._ffmpeg_proc.stdout.read1(32768)
+                # Smaller reads reduce burstiness seen by downstream clients.
+                data = self._ffmpeg_proc.stdout.read1(8192)
                 if not data:
                     break
                 self._broadcast_stream(data)
@@ -576,8 +690,18 @@ class CloudEdgeMeariCoordinator:
         try:
             self._video_queue.put_nowait(data)
         except queue.Full:
-            # Match main.py behavior: drop new frame when saturated.
-            pass
+            # Keep latency bounded: discard one stale queued frame and
+            # enqueue the newest camera frame.
+            self._video_queue_drops += 1
+            try:
+                self._video_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._video_queue.put_nowait(data)
+            except queue.Full:
+                # Queue was immediately refilled by producer races.
+                self._video_queue_drops += 1
 
     def _video_pacer(self, proc_ref: subprocess.Popen) -> None:
         """Write queued video frames to ffmpeg at a steady 1/15 s cadence.
@@ -594,7 +718,19 @@ class CloudEdgeMeariCoordinator:
                 data = self._video_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            # Ensure minimum spacing between writes
+            # If backlog grows, drop stale queued frames and keep cadence.
+            # This avoids fast-forward bursts that trigger client buffering UI.
+            dropped = 0
+            while self._video_queue.qsize() > self._video_lag_drop_threshold:
+                try:
+                    data = self._video_queue.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped:
+                self._video_queue_drops += dropped
+
+            # Ensure minimum spacing between writes for stable realtime playback.
             now = time.monotonic()
             elapsed = now - last_write
             if elapsed < INTERVAL:
@@ -612,54 +748,135 @@ class CloudEdgeMeariCoordinator:
         """Re-feed last keyframe to produce idle frames and fill gaps.
 
         When no camera data flows (idle or network hiccup), this
-        injects the last keyframe at ~2 fps so the MPEG-TS stream
-        never goes silent.  Frigate / go2rtc interpret silence as
-        signal loss, so continuous frames are essential.
+        injects the last keyframe at stream cadence so the MPEG-TS
+        stream never goes silent. Frigate / go2rtc interpret sparse
+        packet output as stalls, so keep idle output regular.
+
+        Keep the most recent scene briefly after going idle, then switch
+        to a cached idle keyframe derived from the same camera bitstream
+        for decoder compatibility. Falls back to black only when no real
+        scene keyframe is available yet.
         """
         while (
             self._ffmpeg_proc is proc_ref
             and proc_ref.poll() is None
         ):
-            time.sleep(0.5)
-            # Do not inject duplicated keyframes during active live sessions.
-            # Re-sending the same AU can cause timestamp regressions for copy mux.
             if self._camera_awake:
+                # Keep stream continuity during brief live stalls so go2rtc/
+                # Frigate don't report intermittent "no video" states.
+                time.sleep(0.1)
+                now_mono = time.monotonic()
+                last_live = self._last_p2p_video_time
+                if (
+                    self._latest_video_kf
+                    and last_live > 0.0
+                    and (now_mono - last_live) >= self._live_gap_fill_after_seconds
+                ):
+                    live_interval = 1.0 / max(1.0, self._live_gap_fill_fps)
+                    if now_mono - self._last_video_time >= live_interval:
+                        self._feed_video(self._latest_video_kf)
                 continue
+
+            now_mono = time.monotonic()
+            idle_elapsed = (now_mono - self._idle_since) if self._idle_since > 0.0 else 0.0
+            fps = self._idle_keepalive_fps_initial
+            if idle_elapsed >= self._idle_keepalive_settle_seconds:
+                fps = self._idle_keepalive_fps_steady
+            # Keep stream time advancing at realtime pace for active downstream
+            # consumers (go2rtc/frigate), otherwise idle low-fps can look stalled.
+            with self._stream_clients_lock:
+                has_clients = bool(self._stream_clients)
+            if has_clients:
+                fps = max(fps, self._idle_keepalive_fps_with_clients)
+            interval = 1.0 / max(1.0, fps)
+            # Wake frequently and top up frames with adaptive idle cadence.
+            time.sleep(interval / 2.0)
+            now_mono = time.monotonic()
+            source = self._latest_video_kf or self._idle_video_kf
             if (
-                self._latest_video_kf
-                and time.monotonic() - self._last_video_time > 0.5
+                (self._idle_scene_kf or self._latest_video_kf or self._idle_video_kf)
+                and self._idle_since > 0.0
+                and (now_mono - self._idle_since) >= self._idle_scene_hold_seconds
             ):
-                self._feed_video(self._latest_video_kf)
+                # Keep showing the real last scene if conversion is pending.
+                # Fall back to black only when no scene keyframe exists.
+                source = self._idle_scene_kf or self._latest_video_kf or self._idle_video_kf
+            if (
+                source
+                and now_mono - self._last_video_time >= interval
+            ):
+                self._feed_video(source)
 
     def _silence_feeder(self) -> None:
         """Feed µ-law silence at real-time rate until camera audio arrives."""
-        CHUNK = 800   # 100 ms of 8 kHz mono µ-law
-        INTERVAL = 0.1
         while (
             not self._audio_primed.is_set()
             and self._ffmpeg_proc is not None
             and self._ffmpeg_proc.poll() is None
         ):
+            if self._camera_awake:
+                chunk = 800    # 100 ms at 8 kHz mono µ-law
+                interval = 0.1
+            else:
+                # Idle mode: one silence chunk per second is enough to keep
+                # the audio track alive while minimizing encoder CPU load.
+                chunk = 8000
+                interval = 1.0
+            self._queue_audio(b"\xff" * chunk)
+            self._audio_primed.wait(timeout=interval)
+
+    def _queue_audio(self, data: bytes) -> None:
+        """Queue audio without ever blocking the P2P receive thread."""
+        if self._audio_write_fd < 0 or not data:
+            return
+        while True:
             try:
-                os.write(self._audio_write_fd, b"\xff" * CHUNK)
+                self._audio_queue.put_nowait(data)
+                return
+            except queue.Full:
+                # Preserve low latency under pressure by dropping oldest audio.
+                self._audio_queue_drops += 1
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def _audio_writer(self, proc_ref: subprocess.Popen) -> None:
+        """Drain queued audio to ffmpeg and correctly handle partial writes."""
+        pending = memoryview(b"")
+        while self._ffmpeg_proc is proc_ref and proc_ref.poll() is None:
+            if not pending:
+                try:
+                    chunk = self._audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if not chunk:
+                    continue
+                pending = memoryview(chunk)
+            try:
+                written = os.write(self._audio_write_fd, pending)
+                if written <= 0:
+                    raise OSError("audio pipe write returned no bytes")
+                pending = pending[written:]
             except BlockingIOError:
-                # Drop this silence slice when ffmpeg input is saturated.
-                pass
-            except OSError:
+                # Pipe is full; briefly back off and retry the same bytes.
+                time.sleep(0.002)
+            except (BrokenPipeError, OSError):
                 break
-            self._audio_primed.wait(timeout=INTERVAL)
 
     def _feed_audio(self, data: bytes) -> None:
         """Write G.711 µ-law audio data to ffmpeg audio input."""
         if self._audio_write_fd >= 0:
             self._audio_primed.set()  # stop silence feeder
-            try:
-                os.write(self._audio_write_fd, data)
-            except BlockingIOError:
-                # Never block the P2P recv loop on audio backpressure.
-                pass
-            except (BrokenPipeError, OSError):
-                pass
+            if not self._audio_real_started:
+                # Drop queued bootstrap silence so first real audio is not delayed.
+                self._audio_real_started = True
+                while True:
+                    try:
+                        self._audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            self._queue_audio(data)
 
     # ------------------------------------------------------------------
     # Black keyframe generator (bootstrap for keepalive)
@@ -703,8 +920,7 @@ class CloudEdgeMeariCoordinator:
                 timeout=10,
             )
             if result.returncode == 0 and result.stdout:
-                self._latest_video_kf = result.stdout
-                self._latest_hevc_kf = result.stdout
+                self._idle_video_kf = result.stdout
                 _LOGGER.debug(
                     "Generated black %s keyframe (%d bytes)",
                     fmt,
@@ -714,6 +930,25 @@ class CloudEdgeMeariCoordinator:
                 _LOGGER.warning("Failed to generate black %s keyframe", fmt)
         except Exception as e:
             _LOGGER.warning("Failed to generate black %s keyframe: %s", fmt, e)
+
+    def _build_idle_scene_keyframe(self) -> None:
+        """Cache an idle keyframe from the latest real camera scene.
+
+        Re-encoding idle frames with a different encoder profile can
+        desync HEVC/H264 parameter sets across idle→live transitions.
+        Keep the camera bitstream untouched for seamless decoder handoff.
+        """
+        if not self._idle_scene_convert_lock.acquire(blocking=False):
+            return
+        try:
+            src = self._latest_video_kf
+            if not src:
+                return
+            self._idle_scene_kf = bytes(src)
+        except Exception as e:
+            _LOGGER.debug("Idle scene keyframe update failed: %s", e)
+        finally:
+            self._idle_scene_convert_lock.release()
 
     # ------------------------------------------------------------------
     # Snapshot conversion (video keyframe → JPEG)
@@ -776,8 +1011,8 @@ class CloudEdgeMeariCoordinator:
         self._available = True
         # Generate a black keyframe and start the persistent muxer.
         # The muxer runs for the entire coordinator lifetime — keepalive
-        # injects the keyframe at ~2 fps during idle, producing a
-        # continuous MPEG-TS stream with no timestamp discontinuities.
+        # injects idle keyframes continuously with no timestamp
+        # discontinuities for downstream readers.
         self._generate_black_keyframe()
         self._start_ffmpeg_muxer()
         self._thread = threading.Thread(
@@ -1026,6 +1261,7 @@ class CloudEdgeMeariCoordinator:
             except queue.Empty:
                 break
 
+        self._idle_scene_kf = None
         self._generate_black_keyframe(new_codec)
         self._stop_ffmpeg_muxer()
         self._start_ffmpeg_muxer()
@@ -1041,6 +1277,14 @@ class CloudEdgeMeariCoordinator:
 
         if not grab_only:
             self._live_stream_requested = True
+            # New live session: reset audio priming state so stale idle silence
+            # cannot leak into the next live period and drift A/V sync.
+            self._audio_real_started = False
+            while True:
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
         grab_start: float | None = None  # set on first keyframe in grab mode
         GRAB_DURATION = 5.0  # seconds to stream before stopping in grab mode
@@ -1049,6 +1293,8 @@ class CloudEdgeMeariCoordinator:
         got_keyframe = False
         self._p2p_audio_frames = 0
         self._p2p_audio_bytes = 0
+        self._p2p_audio_non_ff_bytes = 0
+        self._p2p_audio_all_ff_frames = 0
         self._last_p2p_audio_time = 0.0
 
         def on_video(data: bytes):
@@ -1104,6 +1350,10 @@ class CloudEdgeMeariCoordinator:
             self._last_p2p_audio_time = time.monotonic()
             self._p2p_audio_frames += 1
             self._p2p_audio_bytes += len(data)
+            non_ff = sum(1 for b in data if b != 0xFF)
+            self._p2p_audio_non_ff_bytes += non_ff
+            if data and non_ff == 0:
+                self._p2p_audio_all_ff_frames += 1
             self._feed_audio(data)
 
         def on_login():
@@ -1150,13 +1400,31 @@ class CloudEdgeMeariCoordinator:
             try:
                 v, b = streamer.run_session()
                 _LOGGER.info(
-                    "P2P session done for %s: %d video frames, %d bytes, %d audio frames, %d audio bytes",
+                    "P2P session done for %s: %d video frames, %d bytes, %d audio frames, %d audio bytes (non_ff=%d, all_ff_frames=%d, audio_q_drops=%d, video_q_drops=%d)",
                     self._sn_num,
                     v,
                     b,
                     self._p2p_audio_frames,
                     self._p2p_audio_bytes,
+                    self._p2p_audio_non_ff_bytes,
+                    self._p2p_audio_all_ff_frames,
+                    self._audio_queue_drops,
+                    self._video_queue_drops,
                 )
+                if self._audio_queue_drops:
+                    _LOGGER.warning(
+                        "Audio queue dropped %d chunks for %s (writer backpressure)",
+                        self._audio_queue_drops,
+                        self._sn_num,
+                    )
+                if (
+                    self._p2p_audio_frames >= 40
+                    and self._p2p_audio_non_ff_bytes <= max(8, self._p2p_audio_bytes // 200)
+                ):
+                    _LOGGER.warning(
+                        "Audio payload appears silent for %s (mostly 0xFF frames)",
+                        self._sn_num,
+                    )
             except Exception as e:
                 _LOGGER.error("P2P stream error for %s: %s", self._sn_num, e)
             finally:
@@ -1187,16 +1455,23 @@ class CloudEdgeMeariCoordinator:
                     self._stream_thread = None
                     # Keep awake state while reconnecting to avoid UI flicker.
                     self._camera_awake = True
+                    self._idle_since = 0.0
+                    self._idle_scene_kf = None
                     self._fire_update()
                     time.sleep(0.8)
                     self._begin_streaming(api, grab_only=False)
                 else:
+                    threading.Thread(
+                        target=self._build_idle_scene_keyframe,
+                        daemon=True,
+                    ).start()
                     # Restart silence feeder so idle audio keeps flowing.
                     self._audio_primed.clear()
                     threading.Thread(
                         target=self._silence_feeder, daemon=True,
                     ).start()
                     self._camera_awake = False
+                    self._idle_since = time.monotonic()
                     self._fire_update()
 
         self._stream_thread = threading.Thread(
@@ -1207,6 +1482,8 @@ class CloudEdgeMeariCoordinator:
         self._stream_thread.start()
         if not grab_only:
             self._camera_awake = True
+            self._idle_since = 0.0
+            self._idle_scene_kf = None
         self._fire_update()
 
     def _end_streaming(self) -> None:
@@ -1352,6 +1629,7 @@ class CloudEdgeMeariCoordinator:
                     self._live_stream_requested = True
                     # Set state immediately so UI updates without delay
                     self._camera_awake = True
+                    self._idle_since = 0.0
                     self._fire_update()
                     motion_deadline = now + self._motion_timeout
 
@@ -1394,6 +1672,7 @@ class CloudEdgeMeariCoordinator:
                     if not self._camera_awake:
                         # Set state immediately so UI updates without delay
                         self._camera_awake = True
+                        self._idle_since = 0.0
                         self._fire_update()
                         if self._is_snap:
                             self._do_wake(api)
