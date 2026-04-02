@@ -6,4 +6,6 @@ record*/
 *.xapk
 fcm_credentials.json
 /*.py
+!debug.py
 *_example/
+.idea/
