@@ -378,6 +378,26 @@ class P2PStreamer:
     def video_count(self) -> int:
         return self._video_count
 
+    def _parse_stream_chunk(self, chunk: bytes):
+        """Parse one stream chunk.
+
+        Audio frames are always parsed from the decrypted stream payload.
+        Feeding raw encrypted audio bytes to ffmpeg produces audible beeps.
+        """
+        if len(chunk) < 4:
+            return None
+        frame_type = chunk[3]
+
+        if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
+            decrypted = decrypt_stream_frame(bytearray(chunk))
+            return parse_stream_frame(bytes(decrypted))
+
+        if frame_type == STREAM_TYPE_AUDIO:
+            decrypted = decrypt_stream_frame(bytearray(chunk))
+            return parse_stream_frame(bytes(decrypted))
+
+        return parse_stream_frame(chunk)
+
     # ------------------------------------------------------------------
     # Main entry point — call from a thread
     # ------------------------------------------------------------------
@@ -831,11 +851,7 @@ class P2PStreamer:
                 flow["stream_chunks"] += 1
                 frame_type = chunk[3]
                 stream_frame_count += 1
-                if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME, STREAM_TYPE_AUDIO):
-                    decrypted = decrypt_stream_frame(bytearray(chunk))
-                    parsed = parse_stream_frame(bytes(decrypted))
-                else:
-                    parsed = parse_stream_frame(chunk)
+                parsed = self._parse_stream_chunk(chunk)
                 if not parsed:
                     flow["stream_parse_fail"] += 1
                     continue
@@ -892,12 +908,12 @@ class P2PStreamer:
             if last_video_time is None:
                 return
             stall_time = now_ts - last_video_time
-            if stall_time <= 0.2:
+            if stall_time <= 0.35:
                 return
-            if now_ts - last_nudge_time > 0.2:
+            if now_ts - last_nudge_time > 0.35:
                 if kcp.send_gap_nudge():
                     last_nudge_time = now_ts
-            if stall_time > 0.8 and now_ts - last_skip_time > 0.8:
+            if stall_time > 1.2 and now_ts - last_skip_time > 1.0:
                 if kcp.skip_gap():
                     last_skip_time = now_ts
                     kcp.flush_acks()
@@ -1302,11 +1318,7 @@ class P2PStreamer:
                 recv_flow["chunks"] += 1
                 frame_type = chunk[3]
                 frame_count += 1
-                if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME, STREAM_TYPE_AUDIO):
-                    decrypted = decrypt_stream_frame(bytearray(chunk))
-                    parsed = parse_stream_frame(bytes(decrypted))
-                else:
-                    parsed = parse_stream_frame(chunk)
+                parsed = self._parse_stream_chunk(chunk)
                 if not parsed:
                     recv_flow["parse_fail"] += 1
                     continue
@@ -1361,12 +1373,12 @@ class P2PStreamer:
             if last_video_time is None:
                 return
             stall = now_ts - last_video_time
-            if stall <= 0.2:
+            if stall <= 0.35:
                 return
-            if now_ts - last_nudge_time > 0.2:
+            if now_ts - last_nudge_time > 0.35:
                 if kcp.send_gap_nudge():
                     last_nudge_time = now_ts
-            if stall > 0.8 and now_ts - last_skip_time > 0.8:
+            if stall > 1.2 and now_ts - last_skip_time > 1.0:
                 if kcp.skip_gap():
                     last_skip_time = now_ts
                     kcp.flush_acks()
