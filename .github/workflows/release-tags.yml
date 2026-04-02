@@ -1,0 +1,128 @@
+name: Release Tags
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create tag and release from manifest version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          manifest_path="custom_components/cloudplus/manifest.json"
+          if [[ ! -f "${manifest_path}" ]]; then
+            echo "Missing manifest: ${manifest_path}"
+            exit 1
+          fi
+
+          base_version="$(jq -r '.version' "${manifest_path}")"
+          if [[ -z "${base_version}" || "${base_version}" == "null" ]]; then
+            echo "Manifest version is missing or invalid"
+            exit 1
+          fi
+
+          base_version="${base_version#v}"
+          if [[ ! "${base_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Manifest version must match X.Y.Z, got: ${base_version}"
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+
+          is_prerelease="false"
+          previous_dev_tag=""
+          if [[ "${BRANCH_NAME}" == "dev" ]]; then
+            latest_num=0
+            while IFS= read -r existing_tag; do
+              [[ -z "${existing_tag}" ]] && continue
+              num="${existing_tag#v${base_version}-dev.}"
+              if [[ "${num}" =~ ^[0-9]+$ ]] && (( num > latest_num )); then
+                latest_num="${num}"
+              fi
+            done < <(git tag -l "v${base_version}-dev.*")
+
+            if (( latest_num > 0 )); then
+              previous_dev_tag="v${base_version}-dev.${latest_num}"
+            fi
+
+            next_num=$((latest_num + 1))
+            tag_name="v${base_version}-dev.${next_num}"
+            is_prerelease="true"
+          elif [[ "${BRANCH_NAME}" == "main" ]]; then
+            tag_name="v${base_version}"
+          else
+            echo "Unsupported branch: ${BRANCH_NAME}"
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null; then
+            echo "Tag already exists: ${tag_name}"
+            exit 1
+          fi
+
+          if [[ "${BRANCH_NAME}" == "dev" && -n "${previous_dev_tag}" ]] \
+            && git rev-parse -q --verify "refs/tags/${previous_dev_tag}" >/dev/null; then
+            commit_range="${previous_dev_tag}..${HEAD_SHA}"
+          elif [[ "${BEFORE_SHA}" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            root_commit="$(git rev-list --max-parents=0 "${HEAD_SHA}" | tail -n 1)"
+            commit_range="${root_commit}..${HEAD_SHA}"
+          else
+            commit_range="${BEFORE_SHA}..${HEAD_SHA}"
+          fi
+
+          commit_lines="$(git log --pretty=format:'- %h %s (%an)' "${commit_range}" || true)"
+          if [[ -z "${commit_lines}" ]]; then
+            commit_lines="- $(git rev-parse --short "${HEAD_SHA}")"
+          fi
+
+          notes_file="$(mktemp)"
+          {
+            echo "Automated release for branch ${BRANCH_NAME}."
+            echo
+            echo "Commits:"
+            echo "${commit_lines}"
+          } > "${notes_file}"
+
+          git tag "${tag_name}" "${HEAD_SHA}"
+          git push origin "refs/tags/${tag_name}"
+
+          release_args=(
+            release
+            create
+            "${tag_name}"
+            --target "${HEAD_SHA}"
+            --title "${tag_name}"
+            --notes-file "${notes_file}"
+          )
+
+          if [[ "${is_prerelease}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh "${release_args[@]}"
+
+          echo "Created tag and release: ${tag_name}"
