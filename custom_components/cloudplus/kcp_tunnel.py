@@ -313,13 +313,14 @@ class KcpTunnel:
         self.send_func(bytes(buf))
         return True
 
-    def skip_gap(self):
-        """Skip past ALL persistent gaps to unblock delivery.
+    def skip_gap(self, max_gaps: int | None = None):
+        """Skip past persistent gaps to unblock delivery.
 
         When next_recv_sn is missing but higher segments are buffered,
-        advance next_recv_sn past EVERY gap (not just the first one).
-        This loses the missing segment(s) but unblocks delivery of all
-        buffered data immediately.
+        advance next_recv_sn to the next available buffered segment.
+        By default all visible gaps are skipped (legacy behavior). When
+        max_gaps is set, only that many gaps are skipped, which provides a
+        lower-loss recovery mode for jittery links.
         Returns True if any gap was skipped and messages may be available.
         """
         if self.next_recv_sn < 0 or not self.recv_buf:
@@ -329,6 +330,7 @@ class KcpTunnel:
 
         any_skipped = False
         total_gaps = 0
+        gaps_skipped = 0
         first_skip_sn = self.next_recv_sn
 
         # Loop: skip gap, assemble contiguous run, check for next gap, repeat
@@ -340,6 +342,7 @@ class KcpTunnel:
             new_sn = min(above)
             gap_size = new_sn - self.next_recv_sn
             total_gaps += gap_size
+            gaps_skipped += 1
             # Discard any partial fragment state (the missing segment
             # was likely a fragment boundary, so existing fragments are stale)
             self.recv_frag_buf = []
@@ -360,11 +363,13 @@ class KcpTunnel:
             # If next_recv_sn is now in recv_buf (no gap), we're done
             if self.next_recv_sn in self.recv_buf or not self.recv_buf:
                 break
+            if max_gaps is not None and gaps_skipped >= max_gaps:
+                break
             # Otherwise there's another gap — loop and skip it too
 
         if any_skipped:
             print(f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
-                  f"({total_gaps} missing), buf={len(self.recv_buf)}, "
+                  f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
                   f"queued={len(self.recv_queue)}")
         return any_skipped
 

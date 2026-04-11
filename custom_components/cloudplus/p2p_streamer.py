@@ -332,6 +332,8 @@ class P2PStreamer:
         on_login: Callable[[], None] | None = None,
         on_disconnect: Callable[[], None] | None = None,
         remote: bool = False,
+        allow_lossy_gap_skip: bool = False,
+        adaptive_lossy_gap_skip: bool = False,
     ) -> None:
         self._api = api
         self._device = device
@@ -345,6 +347,8 @@ class P2PStreamer:
         self.on_login = on_login
         self.on_disconnect = on_disconnect
         self._remote = remote
+        self._allow_lossy_gap_skip = bool(allow_lossy_gap_skip)
+        self._adaptive_lossy_gap_skip = bool(adaptive_lossy_gap_skip)
 
         self._running = False
         self._video_count = 0
@@ -756,7 +760,7 @@ class P2PStreamer:
         login_resend_at = time.time() + 2
         heartbeat_at = time.time() + 3
         iva_heartbeat_at = time.time() + 3
-        start_live_retry_at = time.time() + 5
+        start_live_retry_at = time.time() + 2.5
         turn_refresh_at = time.time() + 60
         stun_keepalive_at = time.time() + 5
 
@@ -780,6 +784,21 @@ class P2PStreamer:
         last_kcp_payload_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
+        last_gap_sn = -1
+        last_gap_since = 0.0
+        gap_nudges = 0
+        push_rate_ema = 140.0
+        last_push_time = 0.0
+        audio_catchup_until = 0.0
+        audio_catchup_stride = 4
+        audio_catchup_seen = 0
+        skip_expect_recovery_by = 0.0
+        skip_failures = 0
+        skip_backoff_until = 0.0
+        last_skip_video_time = 0.0
+        long_stall_marks: deque[float] = deque()
+        lossy_session_mode = False
+        recovery_aggr = 0.0
         kcp_push_count = 0
         flow = {
             "udp_packets": 0,
@@ -840,6 +859,7 @@ class P2PStreamer:
         def _handle_stream_payload(payload):
             nonlocal stream_frame_count, stream_video_count, stream_total_bytes
             nonlocal last_video_time
+            nonlocal audio_catchup_until, audio_catchup_seen
             if not payload or len(payload) < 4:
                 return True
             flow["stream_payload_calls"] += 1
@@ -869,6 +889,11 @@ class P2PStreamer:
                     continue
                 if ftype == STREAM_TYPE_AUDIO:
                     flow["audio_chunks"] += 1
+                    now_audio = time.time()
+                    if now_audio < audio_catchup_until:
+                        audio_catchup_seen += 1
+                        if (audio_catchup_seen % audio_catchup_stride) != 0:
+                            continue
                     if self.on_audio:
                         self.on_audio(media_data)
             return True
@@ -892,34 +917,291 @@ class P2PStreamer:
                     drained += 1
             return drained
 
-        def _kcp_gap_pending() -> bool:
+        def _kcp_gap_state() -> tuple[bool, int, int]:
             next_sn = int(getattr(kcp, "next_recv_sn", -1))
             recv_buf = getattr(kcp, "recv_buf", {})
             if next_sn < 0 or not recv_buf:
-                return False
+                return (False, 0, 0)
             if next_sn in recv_buf:
-                return False
-            return any(sn > next_sn for sn in recv_buf)
+                return (False, 0, 0)
+            higher = [sn for sn in recv_buf if sn > next_sn]
+            if not higher:
+                return (False, 0, 0)
+            min_above = min(higher)
+            max_above = max(higher)
+            gap_size = max(1, min_above - next_sn)
+            backlog = (max_above - next_sn) + 1
+            return (True, gap_size, backlog)
 
         def _attempt_kcp_gap_recovery(now_ts: float) -> None:
             nonlocal last_nudge_time, last_skip_time, last_kcp_payload_time
+            nonlocal last_gap_sn, last_gap_since, gap_nudges
+            nonlocal audio_catchup_until, audio_catchup_seen
+            nonlocal push_rate_ema
+            nonlocal skip_expect_recovery_by, skip_failures, skip_backoff_until
+            nonlocal last_skip_video_time
+            nonlocal long_stall_marks
+            nonlocal lossy_session_mode
+            nonlocal recovery_aggr
             if not login_ok or last_kcp_data_time is None:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+                skip_expect_recovery_by = 0.0
+                skip_backoff_until = 0.0
+                skip_failures = 0
+                recovery_aggr = 0.0
                 return
             if last_video_time is None:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+                skip_expect_recovery_by = 0.0
+                skip_backoff_until = 0.0
+                skip_failures = 0
+                recovery_aggr = 0.0
                 return
+
+            if skip_expect_recovery_by > 0.0 and now_ts >= skip_expect_recovery_by:
+                if last_video_time <= last_skip_video_time:
+                    skip_failures = min(skip_failures + 1, 6)
+                    skip_backoff_until = now_ts + min(8.0, 1.0 + (skip_failures * 1.2))
+                else:
+                    skip_failures = max(0, skip_failures - 1)
+                skip_expect_recovery_by = 0.0
+
             stall_time = now_ts - last_video_time
             if stall_time <= 0.35:
+                recovery_aggr = max(0.0, recovery_aggr * 0.94)
                 return
-            if now_ts - last_nudge_time > 0.35:
+
+            if stall_time > 3.0:
+                if not long_stall_marks or (now_ts - long_stall_marks[-1]) > 2.0:
+                    long_stall_marks.append(now_ts)
+            while long_stall_marks and (now_ts - long_stall_marks[0]) > 45.0:
+                long_stall_marks.popleft()
+            long_stalls_recent = len(long_stall_marks)
+
+            gap_pending, gap_size, backlog = _kcp_gap_state()
+            next_sn = int(getattr(kcp, "next_recv_sn", -1))
+            if gap_pending:
+                if next_sn != last_gap_sn:
+                    last_gap_sn = next_sn
+                    last_gap_since = now_ts
+                    gap_nudges = 0
+            else:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+
+            backlog_secs = backlog / max(1.0, push_rate_ema)
+
+            elapsed_s = max(1.0, now_ts - stream_start_time)
+            live_fps = stream_video_count / elapsed_s if stream_video_count > 0 else 0.0
+            fps_pressure = max(0.0, min(1.0, (10.5 - live_fps) / 10.5))
+            stall_pressure = max(0.0, min(1.0, (stall_time - 1.2) / 4.5))
+            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 4.0))
+            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.5))
+            failure_pressure = max(0.0, min(1.0, skip_failures / 3.0))
+            pressure = (
+                (0.30 * stall_pressure)
+                + (0.25 * long_stall_pressure)
+                + (0.20 * fps_pressure)
+                + (0.15 * backlog_pressure)
+                + (0.10 * failure_pressure)
+            )
+            if self._adaptive_lossy_gap_skip:
+                pressure = min(1.0, pressure + 0.12)
+            recovery_aggr = (recovery_aggr * 0.82) + (pressure * 0.18)
+
+            nudge_interval = max(
+                0.16,
+                min(0.55, (0.18 + (backlog_secs * 0.10)) * (1.0 - (0.25 * recovery_aggr))),
+            )
+
+            if gap_pending and now_ts - last_nudge_time > nudge_interval:
                 if kcp.send_gap_nudge():
                     last_nudge_time = now_ts
-            if stall_time > 1.2 and now_ts - last_skip_time > 1.0:
-                if kcp.skip_gap():
+                    gap_nudges += 1
+
+            payload_idle = now_ts - last_kcp_payload_time
+            gap_age = (now_ts - last_gap_since) if last_gap_since > 0.0 else 0.0
+            adaptive_wait_base = max(3.8, min(9.0, 6.0 - (0.65 * min(backlog_secs, 2.5))))
+            adaptive_wait = max(1.5, adaptive_wait_base * (1.0 - (0.40 * recovery_aggr)))
+            min_nudges_base = 4 if backlog_secs >= 2.0 else 5 if backlog_secs >= 1.0 else 6
+            min_nudges = max(2, int(round(min_nudges_base - (2.0 * recovery_aggr))))
+
+            if (
+                not self._allow_lossy_gap_skip
+                and not lossy_session_mode
+                and gap_pending
+                and (
+                    (stall_time > 2.8 and backlog_secs > 1.0)
+                    or (
+                        self._adaptive_lossy_gap_skip
+                        and (now_ts - stream_start_time) > 8.0
+                        and (stall_time > 2.2 or recovery_aggr > 0.40 or live_fps < 9.0)
+                    )
+                    or long_stalls_recent >= 1
+                )
+            ):
+                lossy_session_mode = True
+                _LOGGER.warning(
+                    "Auto-escalating to lossy recovery for this session (stall=%.2fs, long_stalls=%d)",
+                    stall_time,
+                    long_stalls_recent,
+                )
+
+            effective_lossy = (
+                self._allow_lossy_gap_skip
+                or lossy_session_mode
+                or (self._adaptive_lossy_gap_skip and gap_pending and recovery_aggr >= 0.30)
+                or skip_failures >= 1
+                or (stall_time > 8.0 and gap_pending and backlog_secs > 1.6)
+                or long_stalls_recent >= 2
+            )
+            if effective_lossy:
+                lossy_scale = 0.60 if self._allow_lossy_gap_skip else 0.72
+                lossy_scale = max(0.45, lossy_scale - (0.16 * recovery_aggr))
+                lossy_wait = max(1.2, min(3.2, adaptive_wait * lossy_scale))
+                nudge_gate = max(
+                    1,
+                    min_nudges - (2 if self._adaptive_lossy_gap_skip else 1),
+                )
+                idle_gate = lossy_wait * (0.35 if self._adaptive_lossy_gap_skip else 0.45)
+                age_gate = lossy_wait * (0.40 if self._adaptive_lossy_gap_skip else 0.50)
+                if (
+                    gap_pending
+                    and now_ts >= skip_backoff_until
+                    and stall_time > lossy_wait
+                    and payload_idle > idle_gate
+                    and gap_age > age_gate
+                    and gap_nudges >= nudge_gate
+                    and now_ts - last_skip_time > max(
+                        0.8,
+                        (lossy_wait * 0.85) + (0.45 * skip_failures) - (0.60 * recovery_aggr),
+                    )
+                ):
+                    severe_link = bool(
+                        stall_time > 7.0
+                        or backlog_secs > 2.8
+                        or long_stalls_recent >= 4
+                        or recovery_aggr > 0.80
+                    )
+                    if self._allow_lossy_gap_skip:
+                        skip_depth = None
+                    elif severe_link:
+                        skip_depth = None
+                    elif self._adaptive_lossy_gap_skip or lossy_session_mode:
+                        skip_depth = 6
+                    else:
+                        skip_depth = 4
+                    if kcp.skip_gap(max_gaps=skip_depth):
+                        last_skip_time = now_ts
+                        kcp.flush_acks()
+                        drained = _drain_kcp_queue()
+                        if drained:
+                            last_kcp_payload_time = time.time()
+                        audio_catchup_until = now_ts + min(1.0, max(0.4, backlog_secs * 0.30))
+                        audio_catchup_seen = 0
+                        last_skip_video_time = last_video_time
+                        skip_expect_recovery_by = now_ts + 1.2
+                return
+
+            if (
+                gap_pending
+                and now_ts >= skip_backoff_until
+                and stall_time > adaptive_wait
+                and payload_idle > (adaptive_wait * 0.60)
+                and gap_age > adaptive_wait
+                and gap_nudges >= min_nudges
+                and now_ts - last_skip_time > max(4.0 + (skip_failures * 1.5), adaptive_wait)
+            ):
+                if kcp.skip_gap(max_gaps=1):
                     last_skip_time = now_ts
+                    _LOGGER.warning(
+                        "Adaptive KCP skip: stall=%.2fs gap=%d backlog=%d (%.2fs) nudges=%d wait=%.2fs fails=%d next_sn=%d",
+                        stall_time,
+                        gap_size,
+                        backlog,
+                        backlog_secs,
+                        gap_nudges,
+                        adaptive_wait,
+                        skip_failures,
+                        next_sn,
+                    )
                     kcp.flush_acks()
                     drained = _drain_kcp_queue()
                     if drained:
                         last_kcp_payload_time = time.time()
+                    audio_catchup_until = now_ts + min(1.2, max(0.5, backlog_secs * 0.35))
+                    audio_catchup_seen = 0
+                    last_skip_video_time = last_video_time
+                    skip_expect_recovery_by = now_ts + 1.2
+
+            if (
+                gap_pending
+                and skip_failures >= 5
+                and backlog >= 384
+                and stall_time > 14.0
+            ):
+                _LOGGER.warning(
+                    "Persistent KCP gap (stall=%.2fs, backlog=%d, failures=%d), restarting session",
+                    stall_time,
+                    backlog,
+                    skip_failures,
+                )
+                self.request_stop()
+
+            if (
+                gap_pending
+                and long_stalls_recent >= 4
+                and stall_time > 6.0
+            ):
+                _LOGGER.warning(
+                    "Repeated long stalls (%d in 45s, stall=%.2fs), restarting session",
+                    long_stalls_recent,
+                    stall_time,
+                )
+                self.request_stop()
+
+            if (
+                long_stalls_recent >= 6
+                and stall_time > 4.5
+                and (now_ts - stream_start_time) > 20.0
+            ):
+                _LOGGER.warning(
+                    "Repeated long stalls (%d in 45s, current=%.2fs), rolling session",
+                    long_stalls_recent,
+                    stall_time,
+                )
+                self.request_stop()
+
+            if (
+                long_stalls_recent >= 4
+                and stall_time > 3.8
+                and (now_ts - stream_start_time) > 28.0
+            ):
+                _LOGGER.warning(
+                    "Persistent degradation (%d long stalls, current %.2fs), rolling session",
+                    long_stalls_recent,
+                    stall_time,
+                )
+                self.request_stop()
+
+            if (
+                gap_pending
+                and stall_time > 12.0
+                and payload_idle > 4.0
+                and gap_age > 6.0
+            ):
+                _LOGGER.warning(
+                    "Frozen gap persists (stall=%.2fs, idle=%.2fs, gap_age=%.2fs), restarting session",
+                    stall_time,
+                    payload_idle,
+                    gap_age,
+                )
+                self.request_stop()
 
         _packet_buf: deque = deque()
 
@@ -963,7 +1245,7 @@ class P2PStreamer:
                 flow["tx_start_live"] += 1
                 kcp.send_iva_data(start_live)
                 vvp_seq += 1
-                start_live_retry_at = now + 5
+                start_live_retry_at = now + 2.5
 
             if login_ok and now >= iva_heartbeat_at:
                 flow["tx_iva_handshake"] += 1
@@ -1025,7 +1307,7 @@ class P2PStreamer:
                         flow["tx_start_live"] += 1
                         kcp.send_iva_data(start_live)
                         vvp_seq += 1
-                        start_live_retry_at = now + 5
+                        start_live_retry_at = now + 2.5
                     if login_ok and now >= iva_heartbeat_at:
                         flow["tx_iva_handshake"] += 1
                         kcp.send_handshake()
@@ -1154,7 +1436,14 @@ class P2PStreamer:
                 if kcp_seg["cmd"] == 81:
                     flow["kcp_push"] += 1
                     kcp_push_count += 1
-                    last_kcp_data_time = time.time()
+                    now_push = time.time()
+                    if last_push_time > 0.0:
+                        delta = now_push - last_push_time
+                        if 0.002 <= delta <= 0.200:
+                            inst_rate = min(1000.0, 1.0 / delta)
+                            push_rate_ema = (push_rate_ema * 0.92) + (inst_rate * 0.08)
+                    last_push_time = now_push
+                    last_kcp_data_time = now_push
                     if not confirmed_peer[0] and source_addr:
                         cp_ip, cp_port = source_addr
                         is_direct = not via_turn and not remote and _is_private_ip(cp_ip)
@@ -1217,7 +1506,7 @@ class P2PStreamer:
                 # Stall recovery + deadline management
                 if login_ok:
                     now2 = time.time()
-                    kcp_alive = last_kcp_data_time and now2 - last_kcp_data_time < 20
+                    kcp_alive = last_kcp_data_time and now2 - last_kcp_data_time < 12
                     if not kcp_alive and last_kcp_data_time:
                         break
                     if last_video_time and now2 - last_video_time < 10:
@@ -1275,10 +1564,25 @@ class P2PStreamer:
         last_kcp_payload_time = time.time()
         last_nudge_time = 0.0
         last_skip_time = 0.0
+        last_gap_sn = -1
+        last_gap_since = 0.0
+        gap_nudges = 0
+        push_rate_ema = 140.0
+        last_push_time = 0.0
+        audio_catchup_until = 0.0
+        audio_catchup_stride = 4
+        audio_catchup_seen = 0
+        skip_expect_recovery_by = 0.0
+        skip_failures = 0
+        skip_backoff_until = 0.0
+        last_skip_video_time = 0.0
+        long_stall_marks: deque[float] = deque()
+        lossy_session_mode = False
+        recovery_aggr = 0.0
         vvp_seq = vvp_seq_start
         last_heartbeat = time.time()
         last_iva_heartbeat = time.time()
-        start_live_retry_at = time.time() + 5
+        start_live_retry_at = time.time() + 2.5
         last_turn_refresh = time.time()
         recv_flow = {
             "udp_packets": 0,
@@ -1298,6 +1602,7 @@ class P2PStreamer:
         def _process_kcp_message(msg_data):
             nonlocal frame_count, video_frame_count, total_bytes
             nonlocal last_video_time, last_kcp_payload_time
+            nonlocal audio_catchup_until, audio_catchup_seen
             payload = msg_data
             if len(msg_data) >= 20 and msg_data[0] == 0xFF and msg_data[1] == 0x01:
                 iva = parse_iva_frame(msg_data)
@@ -1336,6 +1641,11 @@ class P2PStreamer:
                     continue
                 if ftype == STREAM_TYPE_AUDIO:
                     recv_flow["audio_chunks"] += 1
+                    now_audio = time.time()
+                    if now_audio < audio_catchup_until:
+                        audio_catchup_seen += 1
+                        if (audio_catchup_seen % audio_catchup_stride) != 0:
+                            continue
                     if self.on_audio:
                         self.on_audio(media_data)
             return True
@@ -1347,14 +1657,21 @@ class P2PStreamer:
                 break
             _process_kcp_message(queued)
 
-        def _kcp_gap_pending() -> bool:
+        def _kcp_gap_state() -> tuple[bool, int, int]:
             next_sn = int(getattr(kcp, "next_recv_sn", -1))
             recv_buf = getattr(kcp, "recv_buf", {})
             if next_sn < 0 or not recv_buf:
-                return False
+                return (False, 0, 0)
             if next_sn in recv_buf:
-                return False
-            return any(sn > next_sn for sn in recv_buf)
+                return (False, 0, 0)
+            higher = [sn for sn in recv_buf if sn > next_sn]
+            if not higher:
+                return (False, 0, 0)
+            min_above = min(higher)
+            max_above = max(higher)
+            gap_size = max(1, min_above - next_sn)
+            backlog = (max_above - next_sn) + 1
+            return (True, gap_size, backlog)
 
         def _drain_recv_queue() -> int:
             drained = 0
@@ -1368,23 +1685,273 @@ class P2PStreamer:
 
         def _attempt_kcp_gap_recovery(now_ts: float) -> None:
             nonlocal last_nudge_time, last_skip_time, last_kcp_payload_time
+            nonlocal last_gap_sn, last_gap_since, gap_nudges
+            nonlocal audio_catchup_until, audio_catchup_seen
+            nonlocal push_rate_ema
+            nonlocal skip_expect_recovery_by, skip_failures, skip_backoff_until
+            nonlocal last_skip_video_time
+            nonlocal long_stall_marks
+            nonlocal lossy_session_mode
+            nonlocal recovery_aggr
             if last_kcp_data_time is None:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+                skip_expect_recovery_by = 0.0
+                skip_backoff_until = 0.0
+                skip_failures = 0
+                recovery_aggr = 0.0
                 return
             if last_video_time is None:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+                skip_expect_recovery_by = 0.0
+                skip_backoff_until = 0.0
+                skip_failures = 0
+                recovery_aggr = 0.0
                 return
+
+            if skip_expect_recovery_by > 0.0 and now_ts >= skip_expect_recovery_by:
+                if last_video_time <= last_skip_video_time:
+                    skip_failures = min(skip_failures + 1, 6)
+                    skip_backoff_until = now_ts + min(8.0, 1.0 + (skip_failures * 1.2))
+                else:
+                    skip_failures = max(0, skip_failures - 1)
+                skip_expect_recovery_by = 0.0
+
             stall = now_ts - last_video_time
             if stall <= 0.35:
+                recovery_aggr = max(0.0, recovery_aggr * 0.94)
                 return
-            if now_ts - last_nudge_time > 0.35:
+
+            if stall > 3.0:
+                if not long_stall_marks or (now_ts - long_stall_marks[-1]) > 2.0:
+                    long_stall_marks.append(now_ts)
+            while long_stall_marks and (now_ts - long_stall_marks[0]) > 45.0:
+                long_stall_marks.popleft()
+            long_stalls_recent = len(long_stall_marks)
+
+            gap_pending, gap_size, backlog = _kcp_gap_state()
+            next_sn = int(getattr(kcp, "next_recv_sn", -1))
+            if gap_pending:
+                if next_sn != last_gap_sn:
+                    last_gap_sn = next_sn
+                    last_gap_since = now_ts
+                    gap_nudges = 0
+            else:
+                last_gap_sn = -1
+                last_gap_since = 0.0
+                gap_nudges = 0
+
+            backlog_secs = backlog / max(1.0, push_rate_ema)
+
+            elapsed_s = max(1.0, now_ts - start_time)
+            live_fps = video_frame_count / elapsed_s if video_frame_count > 0 else 0.0
+            fps_pressure = max(0.0, min(1.0, (10.5 - live_fps) / 10.5))
+            stall_pressure = max(0.0, min(1.0, (stall - 1.2) / 4.5))
+            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 4.0))
+            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.5))
+            failure_pressure = max(0.0, min(1.0, skip_failures / 3.0))
+            pressure = (
+                (0.30 * stall_pressure)
+                + (0.25 * long_stall_pressure)
+                + (0.20 * fps_pressure)
+                + (0.15 * backlog_pressure)
+                + (0.10 * failure_pressure)
+            )
+            if self._adaptive_lossy_gap_skip:
+                pressure = min(1.0, pressure + 0.12)
+            recovery_aggr = (recovery_aggr * 0.82) + (pressure * 0.18)
+
+            nudge_interval = max(
+                0.16,
+                min(0.55, (0.18 + (backlog_secs * 0.10)) * (1.0 - (0.25 * recovery_aggr))),
+            )
+
+            if gap_pending and now_ts - last_nudge_time > nudge_interval:
                 if kcp.send_gap_nudge():
                     last_nudge_time = now_ts
-            if stall > 1.2 and now_ts - last_skip_time > 1.0:
-                if kcp.skip_gap():
+                    gap_nudges += 1
+
+            payload_idle = now_ts - last_kcp_payload_time
+            gap_age = (now_ts - last_gap_since) if last_gap_since > 0.0 else 0.0
+            adaptive_wait_base = max(3.8, min(9.0, 6.0 - (0.65 * min(backlog_secs, 2.5))))
+            adaptive_wait = max(1.5, adaptive_wait_base * (1.0 - (0.40 * recovery_aggr)))
+            min_nudges_base = 4 if backlog_secs >= 2.0 else 5 if backlog_secs >= 1.0 else 6
+            min_nudges = max(2, int(round(min_nudges_base - (2.0 * recovery_aggr))))
+
+            if (
+                not self._allow_lossy_gap_skip
+                and not lossy_session_mode
+                and gap_pending
+                and (
+                    (stall > 2.8 and backlog_secs > 1.0)
+                    or (
+                        self._adaptive_lossy_gap_skip
+                        and (now_ts - start_time) > 8.0
+                        and (stall > 2.2 or recovery_aggr > 0.40 or live_fps < 9.0)
+                    )
+                    or long_stalls_recent >= 1
+                )
+            ):
+                lossy_session_mode = True
+                _LOGGER.warning(
+                    "Auto-escalating to lossy recovery for this session (stall=%.2fs, long_stalls=%d)",
+                    stall,
+                    long_stalls_recent,
+                )
+
+            effective_lossy = (
+                self._allow_lossy_gap_skip
+                or lossy_session_mode
+                or (self._adaptive_lossy_gap_skip and gap_pending and recovery_aggr >= 0.30)
+                or skip_failures >= 1
+                or (stall > 8.0 and gap_pending and backlog_secs > 1.6)
+                or long_stalls_recent >= 2
+            )
+            if effective_lossy:
+                lossy_scale = 0.60 if self._allow_lossy_gap_skip else 0.72
+                lossy_scale = max(0.45, lossy_scale - (0.16 * recovery_aggr))
+                lossy_wait = max(1.2, min(3.2, adaptive_wait * lossy_scale))
+                nudge_gate = max(
+                    1,
+                    min_nudges - (2 if self._adaptive_lossy_gap_skip else 1),
+                )
+                idle_gate = lossy_wait * (0.35 if self._adaptive_lossy_gap_skip else 0.45)
+                age_gate = lossy_wait * (0.40 if self._adaptive_lossy_gap_skip else 0.50)
+                if (
+                    gap_pending
+                    and now_ts >= skip_backoff_until
+                    and stall > lossy_wait
+                    and payload_idle > idle_gate
+                    and gap_age > age_gate
+                    and gap_nudges >= nudge_gate
+                    and now_ts - last_skip_time > max(
+                        0.8,
+                        (lossy_wait * 0.85) + (0.45 * skip_failures) - (0.60 * recovery_aggr),
+                    )
+                ):
+                    severe_link = bool(
+                        stall > 7.0
+                        or backlog_secs > 2.8
+                        or long_stalls_recent >= 4
+                        or recovery_aggr > 0.80
+                    )
+                    if self._allow_lossy_gap_skip:
+                        skip_depth = None
+                    elif severe_link:
+                        skip_depth = None
+                    elif self._adaptive_lossy_gap_skip or lossy_session_mode:
+                        skip_depth = 6
+                    else:
+                        skip_depth = 4
+                    if kcp.skip_gap(max_gaps=skip_depth):
+                        last_skip_time = now_ts
+                        kcp.flush_acks()
+                        drained = _drain_recv_queue()
+                        if drained:
+                            last_kcp_payload_time = time.time()
+                        audio_catchup_until = now_ts + min(1.0, max(0.4, backlog_secs * 0.30))
+                        audio_catchup_seen = 0
+                        last_skip_video_time = last_video_time
+                        skip_expect_recovery_by = now_ts + 1.2
+                return
+
+            if (
+                gap_pending
+                and now_ts >= skip_backoff_until
+                and stall > adaptive_wait
+                and payload_idle > (adaptive_wait * 0.60)
+                and gap_age > adaptive_wait
+                and gap_nudges >= min_nudges
+                and now_ts - last_skip_time > max(4.0 + (skip_failures * 1.5), adaptive_wait)
+            ):
+                if kcp.skip_gap(max_gaps=1):
                     last_skip_time = now_ts
+                    _LOGGER.warning(
+                        "Adaptive KCP skip: stall=%.2fs gap=%d backlog=%d (%.2fs) nudges=%d wait=%.2fs fails=%d next_sn=%d",
+                        stall,
+                        gap_size,
+                        backlog,
+                        backlog_secs,
+                        gap_nudges,
+                        adaptive_wait,
+                        skip_failures,
+                        next_sn,
+                    )
                     kcp.flush_acks()
                     drained = _drain_recv_queue()
                     if drained:
                         last_kcp_payload_time = time.time()
+                    audio_catchup_until = now_ts + min(1.2, max(0.5, backlog_secs * 0.35))
+                    audio_catchup_seen = 0
+                    last_skip_video_time = last_video_time
+                    skip_expect_recovery_by = now_ts + 1.2
+
+            if (
+                gap_pending
+                and skip_failures >= 5
+                and backlog >= 384
+                and stall > 14.0
+            ):
+                _LOGGER.warning(
+                    "Persistent KCP gap (stall=%.2fs, backlog=%d, failures=%d), restarting session",
+                    stall,
+                    backlog,
+                    skip_failures,
+                )
+                self.request_stop()
+
+            if (
+                gap_pending
+                and long_stalls_recent >= 4
+                and stall > 6.0
+            ):
+                _LOGGER.warning(
+                    "Repeated long stalls (%d in 45s, stall=%.2fs), restarting session",
+                    long_stalls_recent,
+                    stall,
+                )
+                self.request_stop()
+
+            if (
+                long_stalls_recent >= 6
+                and stall > 4.5
+                and (now_ts - start_time) > 20.0
+            ):
+                _LOGGER.warning(
+                    "Repeated long stalls (%d in 45s, current=%.2fs), rolling session",
+                    long_stalls_recent,
+                    stall,
+                )
+                self.request_stop()
+
+            if (
+                long_stalls_recent >= 4
+                and stall > 3.8
+                and (now_ts - start_time) > 28.0
+            ):
+                _LOGGER.warning(
+                    "Persistent degradation (%d long stalls, current %.2fs), rolling session",
+                    long_stalls_recent,
+                    stall,
+                )
+                self.request_stop()
+
+            if (
+                gap_pending
+                and stall > 12.0
+                and payload_idle > 4.0
+                and gap_age > 6.0
+            ):
+                _LOGGER.warning(
+                    "Frozen gap persists (stall=%.2fs, idle=%.2fs, gap_age=%.2fs), restarting session",
+                    stall,
+                    payload_idle,
+                    gap_age,
+                )
+                self.request_stop()
 
         # Send initial heartbeat
         if host_key:
@@ -1443,7 +2010,7 @@ class P2PStreamer:
                         )
                         kcp.send_iva_data(start_live)
                         vvp_seq += 1
-                        start_live_retry_at = now + 5
+                        start_live_retry_at = now + 2.5
                     if now - last_iva_heartbeat >= 3:
                         kcp.send_handshake()
                         last_iva_heartbeat = now
@@ -1469,8 +2036,8 @@ class P2PStreamer:
                             no_video_restart_sec,
                         )
                         break
-                    if last_kcp_data_time and now - last_kcp_data_time > 20:
-                        _LOGGER.debug("No KCP data for 20s, ending session")
+                    if last_kcp_data_time and now - last_kcp_data_time > 12:
+                        _LOGGER.debug("No KCP data for 12s, ending session")
                         break
                     _attempt_kcp_gap_recovery(now)
                     continue
@@ -1531,8 +2098,14 @@ class P2PStreamer:
                 recv_flow["kcp_segments"] += 1
                 if seg["cmd"] == 81:
                     recv_flow["kcp_push"] += 1
-                if seg["cmd"] == 81:
-                    last_kcp_data_time = time.time()
+                    now_push = time.time()
+                    if last_push_time > 0.0:
+                        delta = now_push - last_push_time
+                        if 0.002 <= delta <= 0.200:
+                            inst_rate = min(1000.0, 1.0 / delta)
+                            push_rate_ema = (push_rate_ema * 0.92) + (inst_rate * 0.08)
+                    last_push_time = now_push
+                    last_kcp_data_time = now_push
                 result = kcp.process_input(data)
                 kcp.flush_acks()
                 if result:
@@ -1544,7 +2117,7 @@ class P2PStreamer:
                 # Stall recovery
                 now = time.time()
                 _attempt_kcp_gap_recovery(now)
-                if last_kcp_data_time and now - last_kcp_data_time > 20:
+                if last_kcp_data_time and now - last_kcp_data_time > 12:
                     break
             elif data[0] == 0xFF and data[1] == 0x01:
                 kcp.process_input(data)
@@ -1579,7 +2152,7 @@ class P2PStreamer:
                 )
                 kcp.send_iva_data(start_live)
                 vvp_seq += 1
-                start_live_retry_at = now + 5
+                start_live_retry_at = now + 2.5
             if now - last_iva_heartbeat >= 3:
                 kcp.send_handshake()
                 last_iva_heartbeat = now
