@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
-import json
 import logging
 import os
 import signal
@@ -102,9 +101,6 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
     modules = {
         "const": _load_module("custom_components.cloudplus.const", base / "const.py"),
         "api": _load_module("custom_components.cloudplus.api", base / "api.py"),
-        "motion_event": _load_module(
-            "custom_components.cloudplus.motion_event", base / "motion_event.py"
-        ),
         "kcp_tunnel": _load_module(
             "custom_components.cloudplus.kcp_tunnel", base / "kcp_tunnel.py"
         ),
@@ -146,39 +142,6 @@ def _select_device(
         raise RuntimeError(f"No device found with sn={sn}")
 
     return devices[0]
-
-
-def _decode_mqtt_publish(packet: bytes) -> tuple[str, bytes]:
-    if not packet:
-        raise ValueError("Empty packet")
-    packet_type = (packet[0] >> 4) & 0x0F
-    if packet_type != 3:
-        raise ValueError(f"Not a PUBLISH packet (type={packet_type})")
-
-    rem_len = 0
-    mul = 1
-    idx = 1
-    for _ in range(4):
-        enc = packet[idx]
-        idx += 1
-        rem_len += (enc & 0x7F) * mul
-        if (enc & 0x80) == 0:
-            break
-        mul *= 128
-    else:
-        raise ValueError("Malformed MQTT remaining length")
-
-    body = packet[idx : idx + rem_len]
-    if len(body) < 2:
-        raise ValueError("MQTT body too short")
-
-    topic_len = int.from_bytes(body[0:2], "big")
-    if len(body) < 2 + topic_len:
-        raise ValueError("MQTT topic truncated")
-
-    topic = body[2 : 2 + topic_len].decode("utf-8", errors="replace")
-    payload = body[2 + topic_len :]
-    return topic, payload
 
 
 class CpuSampler:
@@ -239,6 +202,130 @@ class CpuSampler:
         }
 
 
+class StreamHealthTracker:
+    """Track live video cadence and report freeze windows."""
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        *,
+        label: str = "Video",
+        frame_ts_reader: Callable[[Any], float] | None = None,
+        frame_count_reader: Callable[[Any], int] | None = None,
+        emit_logs: bool = True,
+    ):
+        self._logger = logger
+        self._label = label
+        self._frame_ts_reader = frame_ts_reader or self._default_frame_ts_reader
+        self._frame_count_reader = frame_count_reader or self._default_frame_count_reader
+        self._emit_logs = bool(emit_logs)
+        self._first_frame_ts: float = 0.0
+        self._last_frame_ts: float = 0.0
+        self._last_frame_count: int = 0
+        self._stall_start_ts: float | None = None
+        self._last_stall_log_mono: float = 0.0
+        self._stalls_over_1s: int = 0
+        self._stalls_over_3s: int = 0
+        self._recovered_stalls: int = 0
+        self._max_gap_s: float = 0.0
+
+    @staticmethod
+    def _default_frame_ts_reader(coord: Any) -> float:
+        return float(
+            getattr(coord, "_last_p2p_video_time", getattr(coord, "_last_video_time", 0.0))
+        )
+
+    @staticmethod
+    def _default_frame_count_reader(coord: Any) -> int:
+        return int(getattr(coord, "_p2p_video_frames", 0))
+
+    def _record_stall(self, stall_s: float) -> None:
+        self._max_gap_s = max(self._max_gap_s, stall_s)
+        self._recovered_stalls += 1
+        if stall_s >= 1.0:
+            self._stalls_over_1s += 1
+        if stall_s >= 3.0:
+            self._stalls_over_3s += 1
+
+    def tick(self, coord: Any) -> None:
+        now_mono = time.monotonic()
+        frame_ts = float(self._frame_ts_reader(coord))
+        frame_count = int(self._frame_count_reader(coord))
+        if frame_ts <= 0.0:
+            return
+
+        if self._first_frame_ts <= 0.0:
+            self._first_frame_ts = frame_ts
+
+        progressed = (frame_ts > self._last_frame_ts) or (frame_count > self._last_frame_count)
+        if progressed:
+            if self._last_frame_ts > 0.0:
+                self._max_gap_s = max(self._max_gap_s, max(0.0, frame_ts - self._last_frame_ts))
+            if self._stall_start_ts is not None:
+                stall_s = max(0.0, frame_ts - self._stall_start_ts)
+                self._record_stall(stall_s)
+                if self._emit_logs:
+                    self._logger.warning(
+                        "%s stall recovered after %.2fs (video_frames=%d)",
+                        self._label,
+                        stall_s,
+                        frame_count,
+                    )
+                self._stall_start_ts = None
+                self._last_stall_log_mono = 0.0
+            self._last_frame_ts = frame_ts
+            self._last_frame_count = frame_count
+            return
+
+        if self._last_frame_ts <= 0.0:
+            return
+        if self._stall_start_ts is None:
+            self._stall_start_ts = self._last_frame_ts
+
+        stall_s = max(0.0, now_mono - self._stall_start_ts)
+        if stall_s >= 1.0 and (
+            self._last_stall_log_mono <= 0.0 or (now_mono - self._last_stall_log_mono) >= 2.0
+        ):
+            if self._emit_logs:
+                self._logger.warning(
+                    "%s stall ongoing %.2fs (video_frames=%d)",
+                    self._label,
+                    stall_s,
+                    frame_count,
+                )
+            self._last_stall_log_mono = now_mono
+
+    def summary(self, coord: Any) -> dict[str, float | int]:
+        now_mono = time.monotonic()
+        frame_count = int(self._frame_count_reader(coord))
+        last_frame_ts = float(self._frame_ts_reader(coord))
+
+        active_span = 0.0
+        if self._first_frame_ts > 0.0 and last_frame_ts >= self._first_frame_ts:
+            active_span = max(0.0, last_frame_ts - self._first_frame_ts)
+
+        avg_fps = 0.0
+        if active_span > 0.0 and frame_count > 1:
+            avg_fps = (frame_count - 1) / active_span
+
+        unresolved_stall_s = 0.0
+        if self._stall_start_ts is not None:
+            unresolved_stall_s = max(0.0, now_mono - self._stall_start_ts)
+
+        max_gap_s = max(self._max_gap_s, unresolved_stall_s)
+
+        return {
+            "video_frames": frame_count,
+            "avg_fps": avg_fps,
+            "active_span_s": active_span,
+            "max_gap_s": max_gap_s,
+            "recovered_stalls": self._recovered_stalls,
+            "recovered_stalls_over_1s": self._stalls_over_1s,
+            "recovered_stalls_over_3s": self._stalls_over_3s,
+            "unresolved_stall_s": unresolved_stall_s,
+        }
+
+
 async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
     mods = _bootstrap_integration_modules()
     MeariApiClient = mods["api"].MeariApiClient
@@ -269,14 +356,9 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
         phone_code=args.phone_code,
         app_profile=args.profile,
         initial_frame_grab=not bool(getattr(args, "skip_initial_grab", False)),
-        initial_grab_timeout=int(getattr(args, "initial_grab_timeout", 12)),
-        snapshot_conversion_enabled=bool(getattr(args, "enable_snapshots", True)),
+        initial_grab_timeout=12,
+        snapshot_conversion_enabled=True,
     )
-
-    audio_gain_db = getattr(args, "audio_gain_db", None)
-    if audio_gain_db is not None:
-        # Apply CLI override before coordinator starts ffmpeg muxing.
-        coord._audio_gain_db = float(audio_gain_db)
 
     await coord.async_start()
     for _ in range(100):
@@ -412,41 +494,6 @@ async def cmd_list(args) -> int:
     return 0
 
 
-async def cmd_motion(args) -> int:
-    mods = _bootstrap_integration_modules()
-    parse_motion_event = mods["motion_event"].parse_motion_event
-
-    packet_path = (REPO_ROOT / args.packet).resolve()
-    packet = packet_path.read_bytes()
-    topic, payload = _decode_mqtt_publish(packet)
-    parsed = parse_motion_event(payload)
-
-    print("=" * 78)
-    print(f"Packet: {packet_path}")
-    print(f"Topic:  {topic}")
-    print("=" * 78)
-
-    if not parsed:
-        print("FAIL: payload is not a valid alarm event")
-        return 1
-
-    print(
-        json.dumps(
-            {
-                "event": parsed.get("event"),
-                "evt_raw": parsed.get("evt_raw"),
-                "evt_int": parsed.get("evt_int"),
-                "evt_name": parsed.get("evt_name"),
-                "is_motion": parsed.get("is_motion"),
-                "device_id": parsed.get("device_id"),
-                "license_id": parsed.get("license_id"),
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
 async def _run_probe(url: str, duration: int) -> tuple[int, list[str]]:
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg",
@@ -479,43 +526,6 @@ async def _run_probe(url: str, duration: int) -> tuple[int, list[str]]:
 
     rc = await proc.wait()
     return rc, lines
-
-
-async def _wait_for_mux_video_stream(url: str, timeout: int = 15) -> bool:
-    """Wait until the stream URL exposes a video track via ffprobe.
-
-    H264 sessions can briefly restart the muxer on codec switch. Launching
-    ffplay too early can result in audio-only startup with no preview window.
-    """
-    deadline = time.monotonic() + max(1, int(timeout))
-    while time.monotonic() < deadline:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_streams",
-            "-of",
-            "compact=p=0:nk=1",
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=6)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            await asyncio.sleep(0.4)
-            continue
-
-        if proc.returncode == 0 and out:
-            txt = out.decode(errors="replace")
-            if "|video|" in txt:
-                return True
-
-        await asyncio.sleep(0.4)
-
-    return False
 
 
 async def _run_idle_client_probe(url: str, duration: int) -> tuple[int, list[str]]:
@@ -580,42 +590,97 @@ async def _run_idle_client_probe(url: str, duration: int) -> tuple[int, list[str
 
 def _build_stream_player_cmd(
     url: str,
+    duration: int = 0,
+    codec: str = "hevc",
 ) -> list[str]:
     """Build ffplay command for visible live playback."""
     if not shutil.which("ffplay"):
         raise RuntimeError("ffplay not found")
 
-    return [
+    codec_l = (codec or "hevc").lower()
+    if codec_l == "h264":
+        analyzeduration = "250000"
+        probesize = "131072"
+    else:
+        analyzeduration = "1000000"
+        probesize = "524288"
+
+    cmd = [
         "ffplay",
         "-hide_banner",
-        "-nostats",
+        "-stats",
+        "-loglevel",
+        "info",
         "-window_title",
         "CloudEdge live",
         "-fflags",
         "+discardcorrupt",
         "-sync",
-        "audio",
+        "video",
         "-analyzeduration",
-        "3000000",
+        analyzeduration,
         "-probesize",
-        "1000000",
+        probesize,
         "-f",
         "mpegts",
-        url,
     ]
+    if int(duration) > 0:
+        cmd.extend(["-t", str(int(duration))])
+    cmd.append(url)
+    return cmd
+
+
+def _stop_player_process(proc: subprocess.Popen | None) -> None:
+    """Terminate ffplay reliably so CLI exits without manual Ctrl+C."""
+    if proc is None or proc.poll() is not None:
+        return
+
+    attempts: list[tuple[str, Callable[[], None], float]] = [
+        ("SIGINT", lambda: proc.send_signal(signal.SIGINT), 1.0),
+        ("terminate", proc.terminate, 1.5),
+        ("kill", proc.kill, 1.0),
+    ]
+    for label, action, timeout_s in attempts:
+        if proc.poll() is not None:
+            return
+        try:
+            action()
+        except Exception:
+            continue
+        try:
+            proc.wait(timeout=timeout_s)
+            return
+        except subprocess.TimeoutExpired:
+            logging.getLogger(__name__).debug(
+                "ffplay did not exit after %s, escalating", label
+            )
+        except Exception:
+            return
 
 
 async def cmd_stream(args) -> int:
     coord = None
     player_proc = None
     try:
-        if args.wake and args.play and not args.skip_initial_grab:
+        setattr(args, "skip_initial_grab", bool(args.wake and args.play))
+        if args.wake and args.play:
             logging.getLogger(__name__).info(
                 "Auto-disabling startup frame grab for player wake mode"
             )
-            args.skip_initial_grab = True
 
         coord, dev, mods = await _create_coordinator(args)
+        if args.play:
+            # Keep a light gap-fill profile in player mode so short transport
+            # hiccups do not look like repeated pause/resume jitter.
+            setattr(coord, "_live_gap_fill_after_seconds", 1.2)
+            setattr(coord, "_live_gap_fill_fps", 1.5)
+        auto_lossy_for_player = bool(args.wake and args.play)
+        setattr(coord, "_p2p_allow_lossy_gap_skip", False)
+        setattr(coord, "_p2p_adaptive_lossy_gap_skip", auto_lossy_for_player)
+        if auto_lossy_for_player:
+            logging.getLogger(__name__).info(
+                "Auto-enabling adaptive lossy recovery for wake+play stability"
+            )
         url = await _camera_stream_source(mods, coord)
 
         print("=" * 78)
@@ -628,19 +693,21 @@ async def cmd_stream(args) -> int:
                 coord, "_last_p2p_video_time", getattr(coord, "_last_video_time", 0.0)
             )
         )
-        # When a local player is requested, default to waiting for live frames
+        health_source = StreamHealthTracker(
+            logging.getLogger(__name__),
+            label="Source video",
+        )
+        # When a local player is requested, wait for live frames before launch
         # to avoid opening a persistent black window.
-        effective_wait_live = bool(args.wait_live or args.play)
-        effective_stall_timeout = int(args.restart_stall_timeout)
-        effective_wake_retry_interval = int(args.wake_retry_interval)
+        effective_wait_live = bool(args.play)
+        effective_stall_timeout = 0
+        effective_wake_retry_interval = 0
         if args.wake and args.play:
             # In player mode, a first keyframe may appear before a stable live
             # session is established. Keep self-healing enabled by default so
             # playback does not freeze on a static frame.
-            if effective_stall_timeout <= 0:
-                effective_stall_timeout = 12
-            if effective_wake_retry_interval <= 0:
-                effective_wake_retry_interval = 8
+            effective_stall_timeout = 15
+            effective_wake_retry_interval = 8
             logging.getLogger(__name__).info(
                 "Player wake recovery enabled: stall_timeout=%ss wake_retry=%ss",
                 effective_stall_timeout,
@@ -665,17 +732,12 @@ async def cmd_stream(args) -> int:
                     )
 
         if args.play:
-            probe_timeout = max(8, min(25, int(args.wake_timeout)))
-            mux_video_ready = await _wait_for_mux_video_stream(
+            active_codec = str(getattr(coord, "_video_codec", "hevc")).lower()
+            player_cmd = _build_stream_player_cmd(
                 url,
-                timeout=probe_timeout,
+                duration=int(args.duration),
+                codec=active_codec,
             )
-            if not mux_video_ready:
-                raise RuntimeError(
-                    "Video track not ready on stream source; refusing to launch ffplay audio-only."
-                )
-
-            player_cmd = _build_stream_player_cmd(url)
             logging.getLogger(__name__).info("Launching ffplay player")
             player_proc = subprocess.Popen(
                 player_cmd,
@@ -690,13 +752,10 @@ async def cmd_stream(args) -> int:
                 )
 
         end_at = time.time() + args.duration if args.duration > 0 else None
-        next_wake_retry = (
-            time.monotonic() + float(effective_wake_retry_interval)
-            if effective_wake_retry_interval > 0
-            else float("inf")
-        )
         stall_started_at: float | None = None
         while end_at is None or time.time() < end_at:
+            health_source.tick(coord)
+
             if effective_stall_timeout > 0:
                 stall_started_at = _maybe_restart_stalled_stream(
                     coord,
@@ -704,22 +763,31 @@ async def cmd_stream(args) -> int:
                     stall_started_at,
                     effective_stall_timeout,
                 )
-            if (
-                args.wake
-                and effective_wake_retry_interval > 0
-                and time.monotonic() >= next_wake_retry
-            ):
-                # Keep nudging wake until real live frames arrive.
-                if not _has_live_video(coord, baseline_video_time):
-                    coord.wake_camera()
-                next_wake_retry = time.monotonic() + float(
-                    effective_wake_retry_interval
-                )
             await asyncio.sleep(1)
+
+        if player_proc is not None and player_proc.poll() is None:
+            _stop_player_process(player_proc)
+
+        source_summary = health_source.summary(coord)
+
+        print("\nStream health (source ingress)")
+        print("-" * 78)
+        print(f"video_frames: {int(source_summary['video_frames'])}")
+        print(f"avg_fps: {float(source_summary['avg_fps']):.2f}")
+        print(f"max_video_gap_s: {float(source_summary['max_gap_s']):.2f}")
+        print(f"recovered_stalls: {int(source_summary['recovered_stalls'])}")
+        print(
+            f"recovered_stalls_over_1s: {int(source_summary['recovered_stalls_over_1s'])}"
+        )
+        print(
+            f"recovered_stalls_over_3s: {int(source_summary['recovered_stalls_over_3s'])}"
+        )
+        unresolved = float(source_summary["unresolved_stall_s"])
+        if unresolved > 0.0:
+            print(f"unresolved_stall_s: {unresolved:.2f}")
         return 0
     finally:
-        if player_proc and player_proc.poll() is None:
-            player_proc.send_signal(signal.SIGINT)
+        _stop_player_process(player_proc)
         if coord:
             await coord.async_stop()
 
@@ -727,11 +795,11 @@ async def cmd_stream(args) -> int:
 async def cmd_bench(args) -> int:
     coord = None
     try:
-        if args.idle_still and not args.skip_initial_grab:
+        setattr(args, "skip_initial_grab", bool(args.idle_still))
+        if args.idle_still:
             logging.getLogger(__name__).info(
                 "Auto-disabling startup frame grab for idle-still benchmark"
             )
-            args.skip_initial_grab = True
 
         coord, dev, mods = await _create_coordinator(args)
         bench_mode = "idle-still" if args.idle_still else "live"
@@ -741,7 +809,7 @@ async def cmd_bench(args) -> int:
             live_ok = await _await_live_stream(
                 coord,
                 timeout=args.wake_timeout,
-                stall_timeout=args.restart_stall_timeout,
+                stall_timeout=0,
             )
 
         url = await _camera_stream_source(mods, coord)
@@ -845,13 +913,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", help="Login and list devices")
 
-    p_motion = sub.add_parser("motion", help="Parse motion packet from capture")
-    p_motion.add_argument(
-        "--packet",
-        default="record-cloudedge-streaming/66/5.bin",
-        help="Path to MQTT publish packet (.bin)",
-    )
-
     p_stream = sub.add_parser(
         "stream", help="Start stream server using integration coordinator"
     )
@@ -867,59 +928,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stream.add_argument("--wake", action="store_true", help="Wake camera immediately")
     p_stream.add_argument(
-        "--wait-live",
-        action="store_true",
-        help="Wait for live frames before launching local player",
-    )
-    p_stream.add_argument(
         "--wake-timeout",
         type=int,
         default=45,
-        help="Seconds to wait for live frames when --wait-live is used",
+        help="Seconds to wait for live frames before playback/stream readiness checks",
     )
-    p_stream.add_argument(
-        "--restart-stall-timeout",
-        type=int,
-        default=0,
-        help="Seconds without live video before forcing P2P restart (0 disables, but --wake --play auto-uses 12)",
-    )
-    p_stream.add_argument(
-        "--wake-retry-interval",
-        type=int,
-        default=0,
-        help="Repeat wake every N seconds during stream (0 disables, but --wake --play auto-uses 8)",
-    )
-    p_stream.add_argument(
-        "--skip-initial-grab",
-        action="store_true",
-        help="Skip coordinator startup frame-grab (faster start, less reliable wake)",
-    )
-    p_stream.add_argument(
-        "--initial-grab-timeout",
-        type=int,
-        default=12,
-        help="Seconds to wait for startup frame-grab before continuing",
-    )
-    p_stream.add_argument(
-        "--audio-gain-db",
-        type=float,
-        default=None,
-        help="Override ffmpeg audio gain in dB (e.g. 12, 18, 24)",
-    )
-    p_stream_snapshots = p_stream.add_mutually_exclusive_group()
-    p_stream_snapshots.add_argument(
-        "--enable-snapshots",
-        dest="enable_snapshots",
-        action="store_true",
-        help="Enable HEVC->JPEG snapshot conversion during stream (default)",
-    )
-    p_stream_snapshots.add_argument(
-        "--disable-snapshots",
-        dest="enable_snapshots",
-        action="store_false",
-        help="Disable HEVC->JPEG snapshot conversion during stream",
-    )
-    p_stream.set_defaults(enable_snapshots=True)
     p_stream.add_argument(
         "--play",
         dest="play",
@@ -948,51 +961,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=45,
         help="Seconds to wait for live frames before benchmarking (live mode)",
     )
-    p_bench.add_argument(
-        "--restart-stall-timeout",
-        type=int,
-        default=0,
-        help="Seconds without live video before forcing P2P restart (0 disables, live mode)",
-    )
-    p_bench.add_argument(
-        "--skip-initial-grab",
-        action="store_true",
-        help="Skip coordinator startup frame-grab (faster start, less reliable wake)",
-    )
-    p_bench.add_argument(
-        "--initial-grab-timeout",
-        type=int,
-        default=12,
-        help="Seconds to wait for startup frame-grab before continuing",
-    )
-    p_bench.add_argument(
-        "--audio-gain-db",
-        type=float,
-        default=None,
-        help="Override ffmpeg audio gain in dB during benchmark",
-    )
-    p_bench_snapshots = p_bench.add_mutually_exclusive_group()
-    p_bench_snapshots.add_argument(
-        "--enable-snapshots",
-        dest="enable_snapshots",
-        action="store_true",
-        help="Enable HEVC->JPEG snapshot conversion during benchmark (default)",
-    )
-    p_bench_snapshots.add_argument(
-        "--disable-snapshots",
-        dest="enable_snapshots",
-        action="store_false",
-        help="Disable HEVC->JPEG snapshot conversion during benchmark",
-    )
-    p_bench.set_defaults(enable_snapshots=True)
     return p
 
 
 async def _async_main(args) -> int:
     if args.command == "list":
         return await cmd_list(args)
-    if args.command == "motion":
-        return await cmd_motion(args)
     if args.command == "stream":
         return await cmd_stream(args)
     if args.command == "bench":
