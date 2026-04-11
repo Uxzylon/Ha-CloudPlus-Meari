@@ -13,6 +13,7 @@ import fcntl
 import logging
 import os
 import queue
+import re
 import socket
 import ssl
 import subprocess
@@ -100,6 +101,7 @@ class CloudEdgeMeariCoordinator:
         self._last_p2p_video_time: float = 0.0  # monotonic timestamp of last camera video frame
         self._last_p2p_audio_time: float = 0.0  # monotonic timestamp of last camera audio frame
         self._last_video_time: float = 0.0  # monotonic timestamp of last video write
+        self._p2p_video_frames: int = 0
         self._p2p_audio_frames: int = 0
         self._p2p_audio_bytes: int = 0
         self._p2p_audio_non_ff_bytes: int = 0
@@ -169,20 +171,43 @@ class CloudEdgeMeariCoordinator:
         self._audio_writer_thread: threading.Thread | None = None
         self._audio_real_started: bool = False
         # Keep audio buffering shallow and realtime-friendly.
-        self._audio_queue: queue.Queue = queue.Queue(maxsize=48)
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=256)
         self._audio_queue_drops: int = 0
+        self._audio_throttle_drops: int = 0
+        self._audio_realtime_next_ts: float = 0.0
+        self._audio_soft_queue_limit: int = 160
 
-        # Video pacing queue — smooths network jitter for wallclock PTS.
-        # Keep this queue bounded to limit end-to-end live delay.
-        self._video_queue: queue.Queue = queue.Queue(maxsize=18)
-        self._video_lag_drop_threshold: int = 4
+        # Video write queue to decouple P2P receive from ffmpeg stdin backpressure.
+        self._video_queue: queue.Queue = queue.Queue(maxsize=192)
+        self._video_lag_drop_threshold: int = 24
         self._video_queue_drops: int = 0
+        self._video_mux_target_fps: float = 15.0
+        self._video_fps_ema: float = 15.0
+        self._video_fps_samples: int = 0
+        self._video_fps_last_frame_time: float = 0.0
+        self._video_size_hint: tuple[int, int] | None = None
+        self._video_size_codec: str | None = None
+        self._video_size_probe_after: float = 0.0
+        self._video_size_probe_inflight: bool = False
+        self._video_size_probe_lock = threading.Lock()
+        self._black_keyframe_lock = threading.Lock()
+        self._h264_sps_nal: bytes | None = None
+        self._h264_pps_nal: bytes | None = None
+        self._hevc_vps_nal: bytes | None = None
+        self._hevc_sps_nal: bytes | None = None
+        self._hevc_pps_nal: bytes | None = None
 
         # P2P streamer
         self._p2p_streamer: P2PStreamer | None = None
         self._stream_thread: threading.Thread | None = None
         self._stream_grab_only = False
         self._live_stream_requested = False
+        # Lossy KCP gap skip trades continuity for liveness; keep it off by
+        # default to avoid visible pause->jump artifacts.
+        self._p2p_allow_lossy_gap_skip: bool = False
+        # Adaptive lossy mode ramps recovery aggressiveness from observed
+        # live-link behavior without forcing deepest skip from frame 1.
+        self._p2p_adaptive_lossy_gap_skip: bool = False
 
         # Keep idle video alive so Frigate clients always see
         # continuous video packets even while battery cameras sleep.
@@ -483,16 +508,20 @@ class CloudEdgeMeariCoordinator:
         audio_r, audio_w = os.pipe()
         self._audio_write_fd = audio_w
         video_fmt = "h264" if self._video_codec == "h264" else "hevc"
+        video_input_fps = max(5.0, min(60.0, float(self._video_mux_target_fps)))
+        video_setts = (
+            f"setts=pts=N/({video_input_fps:.3f}*TB):"
+            f"dts=N/({video_input_fps:.3f}*TB)"
+        )
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
             # Video input (H264/HEVC NALs from stdin)
             "-fflags", "+genpts+igndts+discardcorrupt",
-            "-use_wallclock_as_timestamps", "1",
             "-err_detect", "ignore_err",
             "-probesize", "131072",
             "-analyzeduration", "500000",
-            "-framerate", "15",
+            "-framerate", f"{video_input_fps:.3f}",
             "-thread_queue_size", "128",
             "-f", video_fmt, "-i", "pipe:0",
             # Audio input (G.711 µ-law from pipe)
@@ -502,13 +531,12 @@ class CloudEdgeMeariCoordinator:
             # Output: pass-through camera video, transcode audio
             "-map", "0:v", "-map", "1:a",
             "-c:v", "copy",
-            # Force monotonic packet timestamps for copy-mux output.
-            "-bsf:v", "setts=pts=N/(15*TB):dts=N/(15*TB)",
-            # Camera audio is often near digital silence (mu-law around 0xFF);
-            # boost output level so speech/environmental sound stays audible.
-            "-filter:a", f"volume={self._audio_gain_db:.1f}dB,alimiter=limit=0.92",
-            # Upsample audio for broader player/browser compatibility.
-            "-c:a", "aac", "-profile:a", "aac_low", "-ar", "16000", "-b:a", "64k",
+            # Stabilize output timestamps from raw Annex-B input to avoid
+            # burst/pause playback patterns caused by transport jitter.
+            "-bsf:v", video_setts,
+            # Keep camera audio in original G.711 µ-law format (no transcode)
+            # to reduce CPU and avoid codec conversion artifacts.
+            "-c:a", "copy",
             "-max_delay", "0",
             "-muxpreload", "0",
             "-muxdelay", "0",
@@ -543,8 +571,10 @@ class CloudEdgeMeariCoordinator:
                 except queue.Empty:
                     break
             self._audio_queue_drops = 0
+            self._audio_throttle_drops = 0
             self._video_queue_drops = 0
             self._audio_real_started = False
+            self._audio_realtime_next_ts = 0.0
 
             # Serialize all writes through a dedicated writer thread so
             # partial non-blocking writes never corrupt realtime audio flow.
@@ -633,7 +663,9 @@ class CloudEdgeMeariCoordinator:
             self._ffmpeg_proc = None
 
         if self._audio_writer_thread:
-            self._audio_writer_thread.join(timeout=2)
+            self._audio_writer_thread.join(timeout=0.8)
+            if self._audio_writer_thread.is_alive():
+                _LOGGER.debug("Audio writer thread still alive after stop timeout")
             self._audio_writer_thread = None
 
         while True:
@@ -643,7 +675,9 @@ class CloudEdgeMeariCoordinator:
                 break
 
         if self._ffmpeg_reader_thread:
-            self._ffmpeg_reader_thread.join(timeout=5)
+            self._ffmpeg_reader_thread.join(timeout=1.5)
+            if self._ffmpeg_reader_thread.is_alive():
+                _LOGGER.debug("ffmpeg reader thread still alive after stop timeout")
             self._ffmpeg_reader_thread = None
 
     def _close_audio_fd(self) -> None:
@@ -704,37 +738,29 @@ class CloudEdgeMeariCoordinator:
                 self._video_queue_drops += 1
 
     def _video_pacer(self, proc_ref: subprocess.Popen) -> None:
-        """Write queued video frames to ffmpeg at a steady 1/15 s cadence.
+        """Write queued video frames to ffmpeg at steady realtime cadence.
 
-        use_wallclock_as_timestamps stamps each frame when it hits
-        ffmpeg's demuxer.  Network jitter causes frames to arrive in
-        bursts, producing irregular PTS → fast/slow/pause playback.
-        This thread smooths delivery so wallclock PTS are regular.
+        Cadence follows the live-estimated source FPS so cameras with
+        different frame rates remain smooth without static assumptions.
         """
-        INTERVAL = 1.0 / 15
         last_write = 0.0
         while self._ffmpeg_proc is proc_ref and proc_ref.poll() is None:
             try:
                 data = self._video_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            # If backlog grows, drop stale queued frames and keep cadence.
-            # This avoids fast-forward bursts that trigger client buffering UI.
-            dropped = 0
-            while self._video_queue.qsize() > self._video_lag_drop_threshold:
-                try:
-                    data = self._video_queue.get_nowait()
-                    dropped += 1
-                except queue.Empty:
-                    break
-            if dropped:
-                self._video_queue_drops += dropped
 
-            # Ensure minimum spacing between writes for stable realtime playback.
+            interval = 1.0 / max(1.0, float(self._video_mux_target_fps))
+            qsize = self._video_queue.qsize()
+            if qsize > (self._video_lag_drop_threshold * 2):
+                # If backlog grows, drain slightly faster to avoid stale frames.
+                interval = max(interval * 0.9, 1.0 / 60.0)
+
             now = time.monotonic()
             elapsed = now - last_write
-            if elapsed < INTERVAL:
-                time.sleep(INTERVAL - elapsed)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+
             if proc_ref.stdin is None:
                 break
             try:
@@ -829,11 +855,49 @@ class CloudEdgeMeariCoordinator:
         """Queue audio without ever blocking the P2P receive thread."""
         if self._audio_write_fd < 0 or not data:
             return
+        is_silence = all(b == 0xFF for b in data)
+
+        # During catch-up bursts, camera audio can arrive far faster than
+        # realtime and flood the queue. Keep only a bounded lead so video
+        # transport stays prioritized and audio avoids long stale lag.
+        if self._camera_awake and not is_silence:
+            now_mono = time.monotonic()
+            if self._audio_realtime_next_ts <= 0.0:
+                self._audio_realtime_next_ts = now_mono
+            chunk_secs = max(0.005, len(data) / 8000.0)
+            queued = self._audio_queue.qsize()
+            if queued >= max(40, self._audio_soft_queue_limit // 2) and (
+                now_mono + 0.60 < self._audio_realtime_next_ts
+            ):
+                self._audio_throttle_drops += 1
+                self._audio_realtime_next_ts = (
+                    max(now_mono, self._audio_realtime_next_ts) + chunk_secs
+                )
+                return
+            self._audio_realtime_next_ts = (
+                max(now_mono, self._audio_realtime_next_ts) + chunk_secs
+            )
+
+        # Prefer trimming stale backlog before hitting hard queue full drops.
+        while self._audio_queue.qsize() > self._audio_soft_queue_limit:
+            try:
+                self._audio_queue.get_nowait()
+                self._audio_throttle_drops += 1
+            except queue.Empty:
+                break
+
+        if is_silence and self._audio_queue.qsize() >= max(24, self._audio_soft_queue_limit // 3):
+            return
+
         while True:
             try:
                 self._audio_queue.put_nowait(data)
                 return
             except queue.Full:
+                # Under pressure, discard pure silence chunks first so
+                # real microphone content is less likely to be dropped.
+                if is_silence:
+                    return
                 # Preserve low latency under pressure by dropping oldest audio.
                 self._audio_queue_drops += 1
                 try:
@@ -871,6 +935,7 @@ class CloudEdgeMeariCoordinator:
             if not self._audio_real_started:
                 # Drop queued bootstrap silence so first real audio is not delayed.
                 self._audio_real_started = True
+                self._audio_realtime_next_ts = time.monotonic()
                 while True:
                     try:
                         self._audio_queue.get_nowait()
@@ -889,47 +954,254 @@ class CloudEdgeMeariCoordinator:
         keepalive thread has a frame to inject even before the camera
         has sent any real video.
         """
-        fmt = (codec or self._video_codec or "hevc").lower()
-        if fmt == "h264":
-            video_args = [
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-pix_fmt", "yuv420p",
-                "-x264-params", "keyint=1:min-keyint=1:scenecut=0",
-                "-f", "h264", "pipe:1",
-            ]
-        else:
-            fmt = "hevc"
-            video_args = [
-                "-c:v", "libx265",
-                "-x265-params", "log-level=error",
-                "-f", "hevc", "pipe:1",
-            ]
-
+        if not self._black_keyframe_lock.acquire(blocking=False):
+            return
         try:
-            result = subprocess.run(
-                [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi",
-                    "-i", "color=c=black:s=1920x1080:r=1:d=0.1",
-                    "-frames:v", "1",
-                    *video_args,
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-            if result.returncode == 0 and result.stdout:
-                self._idle_video_kf = result.stdout
+            size = self._video_size_hint
+            if not size or size[0] <= 0 or size[1] <= 0:
+                self._idle_video_kf = None
                 _LOGGER.debug(
-                    "Generated black %s keyframe (%d bytes)",
-                    fmt,
-                    len(result.stdout),
+                    "Skipping synthetic black keyframe: source resolution unknown for %s",
+                    self._sn_num,
                 )
+                return
+
+            width, height = size
+            fmt = (codec or self._video_codec or "hevc").lower()
+            if fmt == "h264":
+                video_args = [
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-pix_fmt", "yuv420p",
+                    "-x264-params", "keyint=1:min-keyint=1:scenecut=0",
+                    "-f", "h264", "pipe:1",
+                ]
             else:
-                _LOGGER.warning("Failed to generate black %s keyframe", fmt)
-        except Exception as e:
-            _LOGGER.warning("Failed to generate black %s keyframe: %s", fmt, e)
+                fmt = "hevc"
+                video_args = [
+                    "-c:v", "libx265",
+                    "-x265-params", "log-level=error",
+                    "-f", "hevc", "pipe:1",
+                ]
+
+            try:
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi",
+                        "-i", f"color=c=black:s={width}x{height}:r=1:d=0.1",
+                        "-frames:v", "1",
+                        *video_args,
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout:
+                    self._idle_video_kf = result.stdout
+                    _LOGGER.debug(
+                        "Generated black %s keyframe (%dx%d, %d bytes)",
+                        fmt,
+                        width,
+                        height,
+                        len(result.stdout),
+                    )
+                else:
+                    _LOGGER.warning("Failed to generate black %s keyframe", fmt)
+            except Exception as e:
+                _LOGGER.warning("Failed to generate black %s keyframe: %s", fmt, e)
+        finally:
+            self._black_keyframe_lock.release()
+
+    def _reset_video_cadence_state(self) -> None:
+        self._video_fps_samples = 0
+        self._video_fps_last_frame_time = 0.0
+        self._video_fps_ema = max(5.0, min(60.0, float(self._video_mux_target_fps)))
+
+    @staticmethod
+    def _default_video_fps_for_codec(codec: str) -> float:
+        codec_l = (codec or "hevc").lower()
+        if codec_l == "h264":
+            # H264 streams from these cameras are typically ~10 fps.
+            # Using a higher startup FPS compresses PTS (setts) and can look
+            # like 2x playback followed by pauses in downstream players.
+            return 10.0
+        return 15.0
+
+    def _observe_video_cadence(self, frame_ts: float) -> None:
+        prev = self._video_fps_last_frame_time
+        self._video_fps_last_frame_time = frame_ts
+        if prev <= 0.0:
+            return
+
+        dt = frame_ts - prev
+        if dt <= 0.0 or dt > 0.5 or dt < 0.012:
+            return
+
+        inst_fps = max(5.0, min(60.0, 1.0 / dt))
+        if self._video_fps_samples <= 0:
+            self._video_fps_ema = inst_fps
+        else:
+            self._video_fps_ema = (self._video_fps_ema * 0.94) + (inst_fps * 0.06)
+        self._video_fps_samples += 1
+
+        if self._video_codec == "hevc":
+            min_fps, max_fps = 13.5, 17.0
+        else:
+            # Keep H264 cadence centered around realtime source ingress.
+            min_fps, max_fps = 8.5, 12.0
+
+        target = max(min_fps, min(max_fps, self._video_fps_ema))
+        alpha = 0.25 if self._video_fps_samples <= 15 else 0.08
+        blended = (self._video_mux_target_fps * (1.0 - alpha)) + (target * alpha)
+        self._video_mux_target_fps = max(min_fps, min(max_fps, blended))
+
+    def _probe_keyframe_resolution(self, frame: bytes, codec: str) -> tuple[int, int] | None:
+        fmt = "h264" if codec == "h264" else "hevc"
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-f", fmt,
+                    "-show_entries", "stream=width,height",
+                    "-of", "csv=p=0:s=x",
+                    "pipe:0",
+                ],
+                input=frame,
+                capture_output=True,
+                timeout=3,
+            )
+        except Exception:
+            return None
+
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+
+        out = proc.stdout.decode(errors="replace").strip().splitlines()
+        if not out:
+            return None
+
+        m = re.search(r"(\d+)x(\d+)", out[0])
+        if not m:
+            return None
+
+        w = int(m.group(1))
+        h = int(m.group(2))
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h)
+
+    def _refresh_video_resolution_hint(self, frame: bytes, codec: str) -> None:
+        now_mono = time.monotonic()
+        if now_mono < self._video_size_probe_after:
+            return
+        if self._video_size_hint and self._video_size_codec == codec:
+            return
+
+        with self._video_size_probe_lock:
+            if self._video_size_probe_inflight:
+                return
+            self._video_size_probe_inflight = True
+
+        frame_copy = bytes(frame)
+
+        def _probe_worker() -> None:
+            try:
+                size = self._probe_keyframe_resolution(frame_copy, codec)
+                now_probe = time.monotonic()
+                if not size:
+                    self._video_size_probe_after = now_probe + 10.0
+                    return
+
+                prev = self._video_size_hint
+                self._video_size_hint = size
+                self._video_size_codec = codec
+                self._video_size_probe_after = now_probe + 30.0
+                if prev != size:
+                    _LOGGER.info(
+                        "Detected %s stream geometry for %s: %dx%d",
+                        codec.upper(),
+                        self._sn_num,
+                        size[0],
+                        size[1],
+                    )
+                    self._generate_black_keyframe(codec)
+                    if (
+                        self._camera_awake
+                        and self._idle_video_kf
+                        and self._ffmpeg_proc is not None
+                        and self._ffmpeg_proc.poll() is None
+                    ):
+                        # Prime mux output immediately after geometry discovery
+                        # so local players do not wait for the next real IDR.
+                        self._feed_video(self._idle_video_kf)
+            finally:
+                with self._video_size_probe_lock:
+                    self._video_size_probe_inflight = False
+
+        threading.Thread(target=_probe_worker, daemon=True).start()
+
+    def _update_parameter_set_cache(self, data: bytes, codec: str) -> None:
+        """Cache latest parameter-set NAL units for decoder recovery."""
+        codec = (codec or "hevc").lower()
+        if codec == "h264" and self._h264_sps_nal and self._h264_pps_nal:
+            return
+        if codec != "h264" and self._hevc_vps_nal and self._hevc_sps_nal and self._hevc_pps_nal:
+            return
+
+        for off, unit in self._iter_annexb_nal_units(data):
+            b0 = data[off]
+            if codec == "h264":
+                nal_type = b0 & 0x1F
+                if nal_type not in (7, 8):
+                    continue
+                if nal_type == 7:
+                    self._h264_sps_nal = unit
+                else:
+                    self._h264_pps_nal = unit
+                continue
+
+            if off + 1 >= len(data):
+                continue
+            b1 = data[off + 1]
+            if (b1 & 0x07) == 0:
+                continue
+            nal_type = (b0 >> 1) & 0x3F
+            if nal_type == 32:
+                self._hevc_vps_nal = unit
+            elif nal_type == 33:
+                self._hevc_sps_nal = unit
+            elif nal_type == 34:
+                self._hevc_pps_nal = unit
+
+    def _prepend_parameter_sets_if_needed(
+        self,
+        data: bytes,
+        codec: str,
+        nal_types: set[int],
+    ) -> bytes:
+        """Prepend cached VPS/SPS/PPS when a keyframe arrives without them."""
+        codec = (codec or "hevc").lower()
+        if codec == "h264":
+            prefix: list[bytes] = []
+            if 7 not in nal_types and self._h264_sps_nal:
+                prefix.append(self._h264_sps_nal)
+            if 8 not in nal_types and self._h264_pps_nal:
+                prefix.append(self._h264_pps_nal)
+            if prefix:
+                return b"".join(prefix) + data
+            return data
+
+        prefix = []
+        if 32 not in nal_types and self._hevc_vps_nal:
+            prefix.append(self._hevc_vps_nal)
+        if 33 not in nal_types and self._hevc_sps_nal:
+            prefix.append(self._hevc_sps_nal)
+        if 34 not in nal_types and self._hevc_pps_nal:
+            prefix.append(self._hevc_pps_nal)
+        if prefix:
+            return b"".join(prefix) + data
+        return data
 
     def _build_idle_scene_keyframe(self) -> None:
         """Cache an idle keyframe from the latest real camera scene.
@@ -1032,10 +1304,14 @@ class CloudEdgeMeariCoordinator:
         self._stop_ffmpeg_muxer()
         self._stop_stream_server()
         if self._stream_thread:
-            self._stream_thread.join(timeout=15)
+            self._stream_thread.join(timeout=4)
+            if self._stream_thread.is_alive():
+                _LOGGER.debug("Stream worker still alive after stop timeout")
             self._stream_thread = None
         if self._thread:
-            self._thread.join(timeout=15)
+            self._thread.join(timeout=4)
+            if self._thread.is_alive():
+                _LOGGER.debug("Coordinator watch loop still alive after stop timeout")
             self._thread = None
         self._available = False
         _LOGGER.info("Stopped CloudEdge / Meari coordinator for %s", self._sn_num)
@@ -1181,6 +1457,30 @@ class CloudEdgeMeariCoordinator:
                     continue
             i += 1
 
+    @staticmethod
+    def _iter_annexb_nal_units(data: bytes):
+        """Yield (nal_header_offset, full_nal_unit_with_start_code)."""
+        marks: list[tuple[int, int]] = []
+        i = 0
+        n = len(data)
+        while i < n - 3:
+            if data[i] == 0 and data[i + 1] == 0:
+                if data[i + 2] == 1:
+                    marks.append((i, i + 3))
+                    i += 3
+                    continue
+                if i + 3 < n and data[i + 2] == 0 and data[i + 3] == 1:
+                    marks.append((i, i + 4))
+                    i += 4
+                    continue
+            i += 1
+
+        for idx, (unit_start, nal_start) in enumerate(marks):
+            next_start = marks[idx + 1][0] if (idx + 1) < len(marks) else n
+            if nal_start >= next_start:
+                continue
+            yield nal_start, bytes(data[unit_start:next_start])
+
     def _detect_video_codec(self, data: bytes) -> str | None:
         """Detect camera payload codec from Annex-B NAL units."""
         h264_ps = 0
@@ -1237,6 +1537,23 @@ class CloudEdgeMeariCoordinator:
                     return True
         return False
 
+    def _collect_nal_types(self, data: bytes, codec: str) -> set[int]:
+        """Return NAL unit types present in a bytestream payload."""
+        codec = (codec or "hevc").lower()
+        types: set[int] = set()
+        for off in self._iter_nal_headers(data):
+            b0 = data[off]
+            if codec == "h264":
+                types.add(b0 & 0x1F)
+                continue
+            if off + 1 >= len(data):
+                continue
+            b1 = data[off + 1]
+            if (b1 & 0x07) == 0:
+                continue
+            types.add((b0 >> 1) & 0x3F)
+        return types
+
     def _switch_video_codec(self, codec: str) -> None:
         """Switch muxer input codec when camera stream codec changes."""
         new_codec = (codec or "").lower()
@@ -1261,6 +1578,14 @@ class CloudEdgeMeariCoordinator:
             except queue.Empty:
                 break
 
+        self._video_mux_target_fps = self._default_video_fps_for_codec(new_codec)
+        self._video_size_codec = None
+        self._reset_video_cadence_state()
+        self._h264_sps_nal = None
+        self._h264_pps_nal = None
+        self._hevc_vps_nal = None
+        self._hevc_sps_nal = None
+        self._hevc_pps_nal = None
         self._idle_scene_kf = None
         self._generate_black_keyframe(new_codec)
         self._stop_ffmpeg_muxer()
@@ -1280,6 +1605,7 @@ class CloudEdgeMeariCoordinator:
             # New live session: reset audio priming state so stale idle silence
             # cannot leak into the next live period and drift A/V sync.
             self._audio_real_started = False
+            self._audio_realtime_next_ts = 0.0
             while True:
                 try:
                     self._audio_queue.get_nowait()
@@ -1291,41 +1617,106 @@ class CloudEdgeMeariCoordinator:
         GRAB_HARD_TIMEOUT = 20.0  # max grab session length even without keyframes
 
         got_keyframe = False
+        self._p2p_video_frames = 0
         self._p2p_audio_frames = 0
         self._p2p_audio_bytes = 0
         self._p2p_audio_non_ff_bytes = 0
         self._p2p_audio_all_ff_frames = 0
         self._last_p2p_audio_time = 0.0
+        self._video_mux_target_fps = self._default_video_fps_for_codec(self._video_codec)
+        self._reset_video_cadence_state()
+        self._h264_sps_nal = None
+        self._h264_pps_nal = None
+        self._hevc_vps_nal = None
+        self._hevc_sps_nal = None
+        self._hevc_pps_nal = None
+        have_h264_sps = False
+        have_h264_pps = False
+        have_hevc_vps = False
+        have_hevc_sps = False
+        have_hevc_pps = False
+        bootstrap_injected = False
 
         def on_video(data: bytes):
-            nonlocal grab_start, got_keyframe
-            self._last_p2p_video_time = time.monotonic()
+            nonlocal grab_start
+            nonlocal got_keyframe
+            nonlocal have_h264_sps
+            nonlocal have_h264_pps
+            nonlocal have_hevc_vps
+            nonlocal have_hevc_sps
+            nonlocal have_hevc_pps
+            nonlocal bootstrap_injected
+            now_mono = time.monotonic()
+            self._last_p2p_video_time = now_mono
+            self._p2p_video_frames += 1
+            self._observe_video_cadence(now_mono)
 
             detected_codec = self._detect_video_codec(data)
             if detected_codec and detected_codec != self._video_codec:
                 self._switch_video_codec(detected_codec)
                 got_keyframe = False
+                have_h264_sps = False
+                have_h264_pps = False
+                have_hevc_vps = False
+                have_hevc_sps = False
+                have_hevc_pps = False
+                bootstrap_injected = False
 
             codec = self._video_codec
-            is_kf = self._is_video_keyframe(data, codec)
+            self._update_parameter_set_cache(data, codec)
+            nal_types = self._collect_nal_types(data, codec)
+            has_param_payload = False
+            params_ready = False
+            if codec == "h264":
+                have_h264_sps = have_h264_sps or (self._h264_sps_nal is not None) or (7 in nal_types)
+                have_h264_pps = have_h264_pps or (self._h264_pps_nal is not None) or (8 in nal_types)
+                has_param_payload = (7 in nal_types) or (8 in nal_types)
+                params_ready = have_h264_sps and have_h264_pps
+            else:
+                have_hevc_vps = have_hevc_vps or (self._hevc_vps_nal is not None) or (32 in nal_types)
+                have_hevc_sps = have_hevc_sps or (self._hevc_sps_nal is not None) or (33 in nal_types)
+                have_hevc_pps = have_hevc_pps or (self._hevc_pps_nal is not None) or (34 in nal_types)
+                has_param_payload = (32 in nal_types) or (33 in nal_types) or (34 in nal_types)
+                params_ready = have_hevc_vps and have_hevc_sps and have_hevc_pps
 
-            # Drop frames until the first keyframe for the active codec.
-            # Decoders cannot recover from P-frames without references.
+            is_kf = self._is_video_keyframe(data, codec)
+            if is_kf or has_param_payload:
+                self._refresh_video_resolution_hint(data, codec)
+
+            # Wait until codec parameter sets are seen and then first keyframe.
+            # H264/H265 streams may deliver SPS/PPS/VPS separately.
             if not got_keyframe:
+                if not params_ready:
+                    return
+                if not bootstrap_injected and self._idle_video_kf:
+                    self._feed_video(self._idle_video_kf)
+                    bootstrap_injected = True
+                if has_param_payload and not is_kf:
+                    self._feed_video(data)
+                    return
                 if is_kf:
                     got_keyframe = True
-                    _LOGGER.debug("First %s keyframe, feeding muxer", codec.upper())
+                    _LOGGER.debug(
+                        "First %s keyframe after parameter sets, feeding muxer",
+                        codec.upper(),
+                    )
                 else:
                     return
 
-            # Feed video to ffmpeg muxer
-            self._feed_video(data)
+            # Feed video to ffmpeg muxer. For keyframes, prepend cached
+            # parameter sets if the camera did not include them in-band.
+            feed_data = (
+                self._prepend_parameter_sets_if_needed(data, codec, nal_types)
+                if is_kf
+                else data
+            )
+            self._feed_video(feed_data)
 
             if is_kf:
                 # Save raw keyframe; convert to JPEG in a
                 # separate thread so we never block the recv loop
                 # (subprocess spawn takes 1-2 s per call).
-                self._latest_video_kf = bytes(data)
+                self._latest_video_kf = bytes(feed_data)
                 self._latest_hevc_kf = self._latest_video_kf
                 if self._snapshot_conversion_enabled:
                     now_mono = time.monotonic()
@@ -1369,6 +1760,8 @@ class CloudEdgeMeariCoordinator:
             on_audio=on_audio,
             on_login=on_login,
             on_disconnect=on_disconnect,
+            allow_lossy_gap_skip=bool(self._p2p_allow_lossy_gap_skip),
+            adaptive_lossy_gap_skip=bool(self._p2p_adaptive_lossy_gap_skip),
         )
         self._p2p_streamer = streamer
         self._stream_grab_only = grab_only
@@ -1400,7 +1793,7 @@ class CloudEdgeMeariCoordinator:
             try:
                 v, b = streamer.run_session()
                 _LOGGER.info(
-                    "P2P session done for %s: %d video frames, %d bytes, %d audio frames, %d audio bytes (non_ff=%d, all_ff_frames=%d, audio_q_drops=%d, video_q_drops=%d)",
+                    "P2P session done for %s: %d video frames, %d bytes, %d audio frames, %d audio bytes (non_ff=%d, all_ff_frames=%d, audio_q_drops=%d, audio_throttle_drops=%d, video_q_drops=%d)",
                     self._sn_num,
                     v,
                     b,
@@ -1409,12 +1802,19 @@ class CloudEdgeMeariCoordinator:
                     self._p2p_audio_non_ff_bytes,
                     self._p2p_audio_all_ff_frames,
                     self._audio_queue_drops,
+                    self._audio_throttle_drops,
                     self._video_queue_drops,
                 )
                 if self._audio_queue_drops:
                     _LOGGER.warning(
                         "Audio queue dropped %d chunks for %s (writer backpressure)",
                         self._audio_queue_drops,
+                        self._sn_num,
+                    )
+                if self._audio_throttle_drops:
+                    _LOGGER.info(
+                        "Audio burst shaper dropped %d stale chunks for %s",
+                        self._audio_throttle_drops,
                         self._sn_num,
                     )
                 if (
