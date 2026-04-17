@@ -30,7 +30,8 @@ async def async_setup_entry(
     for coord in coordinators:
         entities.append(CloudEdgeMeariMotionSensor(coord, entry))
         entities.append(CloudEdgeMeariAwakeSensor(coord, entry))
-        entities.append(CloudEdgeMeariChargingSensor(coord, entry))
+        if coord.is_battery_camera:
+            entities.append(CloudEdgeMeariChargingSensor(coord, entry))
     async_add_entities(entities)
 
 
