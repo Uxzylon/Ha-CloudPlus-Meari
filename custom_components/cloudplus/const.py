@@ -43,6 +43,9 @@ IOT_CODE_CHARGE_STATUS = "156"
 IOT_CODE_WIFI_SIGNAL = "1007"
 BATTERY_CODES = "153,154,155,156,1007"
 
+# IoT Model codes for device features
+IOT_CODE_LAMP = "167"
+
 # Motion-related alarm types (from motion_detector.py)
 MOTION_ALARM_TYPES = {1, 2, 11, 20}
 
