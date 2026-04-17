@@ -60,6 +60,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         coordinators.append(coord)
 
+    # Pre-fetch battery info so entities have values before platforms load.
+    for coord in coordinators:
+        await hass.async_add_executor_job(coord.prefetch_battery, api)
+
     hass.data[DOMAIN][entry.entry_id] = coordinators
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
