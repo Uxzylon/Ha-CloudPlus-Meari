@@ -29,9 +29,14 @@ async def async_setup_entry(
 ) -> None:
     """Set up CloudEdge / Meari select entities from a config entry."""
     coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [CloudEdgeMeariStreamHostSelect(coord, entry) for coord in coordinators]
-    )
+    entities: list[SelectEntity] = [
+        CloudEdgeMeariStreamHostSelect(coord, entry) for coord in coordinators
+    ]
+    for coord in coordinators:
+        profiles = coord.quality_profiles
+        if profiles:
+            entities.append(CloudEdgeMeariStreamQualitySelect(coord, entry))
+    async_add_entities(entities)
 
 
 class CloudEdgeMeariStreamHostSelect(SelectEntity):
@@ -81,4 +86,67 @@ class CloudEdgeMeariStreamHostSelect(SelectEntity):
         key = _OPTION_TO_KEY.get(option)
         if key:
             self._coordinator.set_stream_host_mode(key)
+        self.async_write_ha_state()
+
+
+# ---------------------------------------------------------------------------
+# Stream quality profile selector
+# ---------------------------------------------------------------------------
+
+_AUTO_LABEL = "Auto (highest)"
+
+
+class CloudEdgeMeariStreamQualitySelect(SelectEntity):
+    """Select entity to choose the camera stream quality profile."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Stream Quality"
+    _attr_icon = "mdi:video-high-definition"
+
+    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._attr_unique_id = f"{coordinator.device_uuid}_stream_quality"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, coordinator.device_uuid)},
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
+            "model": coordinator.device_model,
+        }
+        self._unsub_update: Any = None
+        # Build option list from device capabilities
+        self._profiles = coordinator.quality_profiles  # {int: str}
+        self._label_to_id: dict[str, int | None] = {_AUTO_LABEL: None}
+        for pid, label in sorted(self._profiles.items()):
+            self._label_to_id[label] = pid
+        self._attr_options = list(self._label_to_id.keys())
+
+    async def async_added_to_hass(self) -> None:
+        self._unsub_update = self._coordinator.register_update_callback(
+            self._handle_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_update:
+            self._unsub_update()
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return self._coordinator.available
+
+    @property
+    def current_option(self) -> str:
+        quality = self._coordinator.vvp_quality
+        if quality is None:
+            return _AUTO_LABEL
+        return self._profiles.get(quality, _AUTO_LABEL)
+
+    async def async_select_option(self, option: str) -> None:
+        """Change stream quality profile."""
+        quality_id = self._label_to_id.get(option)
+        self._coordinator.set_vvp_quality(quality_id)
         self.async_write_ha_state()

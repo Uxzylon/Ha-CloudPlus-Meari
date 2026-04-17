@@ -6,6 +6,9 @@ record*/
 *.xapk
 fcm_credentials.json
 /*.py
+*.md
+!README.md
 !debug.py
 *_example/
 .idea/
+.vscode/
