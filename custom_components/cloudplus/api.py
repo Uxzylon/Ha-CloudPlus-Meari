@@ -576,6 +576,45 @@ class MeariApiClient:
             _LOGGER.debug("Battery info failed: %s", e)
         return {}
 
+    # ------------------------------------------------------------------
+    # Lamp / LED control via OpenAPI device config
+    # ------------------------------------------------------------------
+
+    def get_device_iot_config(self, sn_num: str) -> dict[str, Any]:
+        """Fetch full IoT config for a device via OpenAPI.
+
+        Returns the ``iot`` dict from the response (code→value mapping).
+        """
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "get", "name": "iot"},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get("/openapi/device/config", {
+            "action": "get",
+            "params": params_b64,
+            "deviceid": dev_uuid,
+            "target": "server",
+        })
+        return resp.get("iot", {})
+
+    def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
+        """Set a single IoT config value on the device via OpenAPI."""
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "set", "name": "iot", "iot": {code: value}},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get("/openapi/device/config", {
+            "action": "set",
+            "params": params_b64,
+            "deviceid": dev_uuid,
+            "target": "server",
+        })
+        return resp.get("action") == "set"
+
     def wake_device(self, sn_num: str, device_id: int) -> bool:
         """Wake a dormant camera using both OpenAPI and HTTP methods."""
         success = False

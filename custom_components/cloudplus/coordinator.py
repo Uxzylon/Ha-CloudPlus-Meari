@@ -79,6 +79,18 @@ class CloudEdgeMeariCoordinator:
         self._device_category = str(device.get("_category", "")).lower()
         self._is_snap = self._device_category == "snap"
         self._host_key = device.get("hostKey", "")
+
+        # Parse device capabilities
+        self._capabilities: dict = {}
+        try:
+            import json as _json
+            cap_raw = device.get("capability", "")
+            if cap_raw:
+                cap = _json.loads(cap_raw) if isinstance(cap_raw, str) else cap_raw
+                self._capabilities = cap.get("caps", {})
+        except Exception:
+            pass
+        self._has_lamp = self._capabilities.get("led") == 1
         self._motion_timeout = DEFAULT_MOTION_TIMEOUT
         self._initial_frame_grab = initial_frame_grab
         self._initial_grab_timeout = max(3, min(initial_grab_timeout, 45))
@@ -127,6 +139,9 @@ class CloudEdgeMeariCoordinator:
         # Battery state
         self._battery_percent: int | None = None
         self._battery_charging: bool = False
+
+        # Lamp state
+        self._lamp_on: bool = False
 
         # Background thread
         self._thread: threading.Thread | None = None
@@ -262,6 +277,20 @@ class CloudEdgeMeariCoordinator:
         except Exception as exc:
             _LOGGER.warning("Prefetch battery failed for %s: %s", self._sn_num, exc)
 
+    def prefetch_lamp(self, api: "MeariApiClient") -> None:
+        """Pre-load lamp state using an already-authenticated API client."""
+        if not self._has_lamp:
+            return
+        try:
+            iot = api.get_device_iot_config(self._sn_num)
+            if not iot:
+                return
+            lamp_val = iot.get("167")
+            if lamp_val is not None:
+                self._lamp_on = int(lamp_val) == 1
+        except Exception as exc:
+            _LOGGER.warning("Prefetch lamp failed for %s: %s", self._sn_num, exc)
+
     @property
     def available(self) -> bool:
         return self._available
@@ -328,6 +357,14 @@ class CloudEdgeMeariCoordinator:
     @property
     def battery_charging(self) -> bool:
         return self._battery_charging
+
+    @property
+    def has_lamp(self) -> bool:
+        return self._has_lamp
+
+    @property
+    def lamp_on(self) -> bool:
+        return self._lamp_on
 
     @property
     def stream_host_mode(self) -> str:
@@ -2951,6 +2988,10 @@ class CloudEdgeMeariCoordinator:
         if self._is_snap:
             self._poll_battery()
 
+        # Initial lamp state poll
+        if self._has_lamp:
+            self._poll_lamp()
+
         # Optional startup frame grab (enabled by default for HA integration).
         # Dev/test tooling can disable this to reduce startup-to-live latency.
         if not self._is_snap:
@@ -3007,6 +3048,7 @@ class CloudEdgeMeariCoordinator:
         _LOGGER.info("Connected and listening for %s", self._sn_num)
 
         last_battery_poll = time.time()
+        last_lamp_poll = time.time()
         motion_deadline = 0.0  # Not streaming yet
 
         try:
@@ -3091,6 +3133,11 @@ class CloudEdgeMeariCoordinator:
                         self._live_stream_requested = True
                         self._begin_streaming(api)
 
+                # Periodic lamp state poll (all camera types)
+                if self._has_lamp and now - last_lamp_poll >= BATTERY_POLL_INTERVAL:
+                    self._poll_lamp()
+                    last_lamp_poll = now
+
                 time.sleep(1)
 
         finally:
@@ -3162,3 +3209,35 @@ class CloudEdgeMeariCoordinator:
                         return
                 else:
                     _LOGGER.warning("Battery poll failed for %s: %s", self._sn_num, e)
+
+    def _poll_lamp(self) -> None:
+        """Poll lamp state from the device IoT config."""
+        if not self._has_lamp:
+            return
+        if not self._api:
+            return
+        try:
+            iot = self._api.get_device_iot_config(self._sn_num)
+            if not iot:
+                return
+            lamp_val = iot.get("167")
+            if lamp_val is not None:
+                is_on = int(lamp_val) == 1
+                if self._lamp_on != is_on:
+                    self._lamp_on = is_on
+                    self._fire_update()
+        except Exception as e:
+            _LOGGER.debug("Lamp poll failed for %s: %s", self._sn_num, e)
+
+    def set_lamp(self, on: bool) -> None:
+        """Turn the lamp on or off via the API."""
+        if not self._has_lamp:
+            return
+        if not self._api:
+            return
+        try:
+            self._api.set_device_iot_value(self._sn_num, "167", 1 if on else 0)
+            self._lamp_on = on
+            self._fire_update()
+        except Exception as e:
+            _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
