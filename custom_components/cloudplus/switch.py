@@ -24,7 +24,8 @@ async def async_setup_entry(
     """Set up CloudEdge / Meari switches from a config entry."""
     coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [CloudEdgeMeariMotionWakeSwitch(coord, entry) for coord in coordinators]
+        [CloudEdgeMeariMotionWakeSwitch(coord, entry) for coord in coordinators
+         if coord.is_battery_camera]
     )
 
 

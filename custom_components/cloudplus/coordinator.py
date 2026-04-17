@@ -2953,7 +2953,15 @@ class CloudEdgeMeariCoordinator:
 
         # Optional startup frame grab (enabled by default for HA integration).
         # Dev/test tooling can disable this to reduce startup-to-live latency.
-        if self._initial_frame_grab:
+        if not self._is_snap:
+            # IPC cameras: start live streaming immediately (no idle mode).
+            _LOGGER.info(
+                "Starting continuous live stream for IPC camera %s",
+                self._sn_num,
+            )
+            self._live_stream_requested = True
+            self._begin_streaming(api)
+        elif self._initial_frame_grab:
             if self._is_snap:
                 _LOGGER.info("Waking camera for initial frame grab...")
                 self._do_wake(api)
@@ -3005,73 +3013,83 @@ class CloudEdgeMeariCoordinator:
             while self._running:
                 now = time.time()
 
-                # Manual wake check
-                if self._wake_event.is_set():
-                    self._wake_event.clear()
-                    self._live_stream_requested = True
-                    # Set state immediately so UI updates without delay
-                    self._camera_awake = True
-                    self._idle_since = 0.0
-                    self._fire_update()
-                    motion_deadline = now + self._motion_timeout
+                if self._is_snap:
+                    # --- Battery camera: wake / motion / timeout logic ---
 
-                    stream_alive = bool(self._stream_thread and self._stream_thread.is_alive())
-                    stale_live = False
-                    if stream_alive and not self._stream_grab_only:
-                        # If a live session is still "alive" but no fresh
-                        # video has arrived for several seconds, force a
-                        # full rollover so wake can start a fresh session.
-                        stale_live = (time.monotonic() - self._last_p2p_video_time) > 8.0
-
-                    # Manual wake should prioritize a fresh live mode. If a
-                    # grab-only or stale live session is still running,
-                    # preempt it first.
-                    if stream_alive and (self._stream_grab_only or stale_live):
-                        if stale_live:
-                            _LOGGER.warning(
-                                "Manual wake: preempting stale stream for %s", self._sn_num,
-                            )
-                        if self._p2p_streamer:
-                            self._p2p_streamer.request_stop()
-                        if self._stream_thread:
-                            self._stream_thread.join(timeout=4)
-                        stream_alive = bool(self._stream_thread and self._stream_thread.is_alive())
-                        if not stream_alive:
-                            self._stream_thread = None
-
-                    if not stream_alive:
-                        if self._is_snap:
-                            self._do_wake(api)
-                        self._begin_streaming(api)
-
-                # Motion-triggered wake
-                if self._motion_detected and self._motion_wake_enabled:
-                    self._live_stream_requested = True
-                    motion_deadline = max(
-                        motion_deadline,
-                        self._last_motion_time + self._motion_timeout,
-                    )
-                    if not self._camera_awake:
+                    # Manual wake check
+                    if self._wake_event.is_set():
+                        self._wake_event.clear()
+                        self._live_stream_requested = True
                         # Set state immediately so UI updates without delay
                         self._camera_awake = True
                         self._idle_since = 0.0
                         self._fire_update()
-                        if self._is_snap:
+                        motion_deadline = now + self._motion_timeout
+
+                        stream_alive = bool(self._stream_thread and self._stream_thread.is_alive())
+                        stale_live = False
+                        if stream_alive and not self._stream_grab_only:
+                            # If a live session is still "alive" but no fresh
+                            # video has arrived for several seconds, force a
+                            # full rollover so wake can start a fresh session.
+                            stale_live = (time.monotonic() - self._last_p2p_video_time) > 8.0
+
+                        # Manual wake should prioritize a fresh live mode. If a
+                        # grab-only or stale live session is still running,
+                        # preempt it first.
+                        if stream_alive and (self._stream_grab_only or stale_live):
+                            if stale_live:
+                                _LOGGER.warning(
+                                    "Manual wake: preempting stale stream for %s", self._sn_num,
+                                )
+                            if self._p2p_streamer:
+                                self._p2p_streamer.request_stop()
+                            if self._stream_thread:
+                                self._stream_thread.join(timeout=4)
+                            stream_alive = bool(self._stream_thread and self._stream_thread.is_alive())
+                            if not stream_alive:
+                                self._stream_thread = None
+
+                        if not stream_alive:
                             self._do_wake(api)
+                            self._begin_streaming(api)
+
+                    # Motion-triggered wake
+                    if self._motion_detected and self._motion_wake_enabled:
+                        self._live_stream_requested = True
+                        motion_deadline = max(
+                            motion_deadline,
+                            self._last_motion_time + self._motion_timeout,
+                        )
+                        if not self._camera_awake:
+                            # Set state immediately so UI updates without delay
+                            self._camera_awake = True
+                            self._idle_since = 0.0
+                            self._fire_update()
+                            self._do_wake(api)
+                            self._begin_streaming(api)
+
+                    # Streaming timeout — end session when deadline passes
+                    if self._camera_awake and now > motion_deadline:
+                        _LOGGER.info("Stream timeout for %s, going idle", self._sn_num)
+                        self._end_streaming()
+                        self._motion_detected = False
+                        self._motion_type = ""
+                        self._fire_update()
+
+                    # Periodic battery poll
+                    if now - last_battery_poll >= BATTERY_POLL_INTERVAL:
+                        self._poll_battery()
+                        last_battery_poll = now
+
+                else:
+                    # --- IPC camera: keep live stream running ---
+                    stream_alive = bool(self._stream_thread and self._stream_thread.is_alive())
+                    if not stream_alive:
+                        _LOGGER.info("IPC stream not alive, restarting for %s", self._sn_num)
+                        self._stream_thread = None
+                        self._live_stream_requested = True
                         self._begin_streaming(api)
-
-                # Streaming timeout — end session when deadline passes
-                if self._camera_awake and now > motion_deadline:
-                    _LOGGER.info("Stream timeout for %s, going idle", self._sn_num)
-                    self._end_streaming()
-                    self._motion_detected = False
-                    self._motion_type = ""
-                    self._fire_update()
-
-                # Periodic battery poll
-                if self._is_snap and now - last_battery_poll >= BATTERY_POLL_INTERVAL:
-                    self._poll_battery()
-                    last_battery_poll = now
 
                 time.sleep(1)
 

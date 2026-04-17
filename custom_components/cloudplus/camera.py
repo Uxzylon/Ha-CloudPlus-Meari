@@ -40,7 +40,7 @@ class CloudEdgeMeariCamera(Camera):
         super().__init__()
         self._coordinator = coordinator
         self._entry = entry
-        self._attr_entity_registry_enabled_default = coordinator.device_category != "ipc"
+        self._attr_entity_registry_enabled_default = coordinator.is_battery_camera
         self._attr_unique_id = f"{coordinator.device_uuid}_camera"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
@@ -74,6 +74,8 @@ class CloudEdgeMeariCamera(Camera):
     @property
     def is_streaming(self) -> bool:
         """Return True if the camera is actively streaming."""
+        if not self._coordinator.is_battery_camera:
+            return True
         return self._coordinator.camera_awake
 
     async def stream_source(self) -> str | None:
