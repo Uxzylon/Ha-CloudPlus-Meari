@@ -57,6 +57,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             country_code=country_code,
             phone_code=phone_code,
             app_profile=app_profile,
+            entry=entry,
         )
         coordinators.append(coord)
 

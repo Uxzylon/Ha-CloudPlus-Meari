@@ -22,9 +22,14 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from __future__ import annotations
+
+from typing import Any, Callable, TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
 
 from .const import (
     DEFAULT_APP_PROFILE,
@@ -65,8 +70,10 @@ class CloudEdgeMeariCoordinator:
         initial_grab_timeout: int = 12,
         snapshot_conversion_enabled: bool = True,
         snapshot_min_interval: float = 3.0,
+        entry: "ConfigEntry | None" = None,
     ) -> None:
         self.hass = hass
+        self._entry = entry
         self._email = email
         self._password = password
         self._country_code = country_code
@@ -249,6 +256,15 @@ class CloudEdgeMeariCoordinator:
         # VVP quality profile: None = auto (highest from bps2 capability)
         self._vvp_quality: int | None = None
 
+        # Restore persisted settings from config entry options
+        if self._entry is not None:
+            opts = self._entry.options
+            sn = self._sn_num
+            self._motion_timeout = opts.get(f"{sn}_motion_timeout", DEFAULT_MOTION_TIMEOUT)
+            self._motion_wake_enabled = opts.get(f"{sn}_motion_wake_enabled", True)
+            self._stream_host_mode = opts.get(f"{sn}_stream_host_mode", "ip")
+            self._vvp_quality = opts.get(f"{sn}_vvp_quality")
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -390,8 +406,23 @@ class CloudEdgeMeariCoordinator:
     # Setters
     # ------------------------------------------------------------------
 
+    def _persist_option(self, key: str, value) -> None:
+        """Persist a per-device setting to config entry options."""
+        if self._entry is None:
+            return
+        full_key = f"{self._sn_num}_{key}"
+        new_opts = dict(self._entry.options)
+        new_opts[full_key] = value
+        try:
+            self.hass.config_entries.async_update_entry(
+                self._entry, options=new_opts,
+            )
+        except Exception:
+            _LOGGER.debug("Could not persist option %s", full_key, exc_info=True)
+
     def set_motion_wake_enabled(self, enabled: bool) -> None:
         self._motion_wake_enabled = enabled
+        self._persist_option("motion_wake_enabled", enabled)
         _LOGGER.info(
             "Motion wake %s for %s",
             "enabled" if enabled else "disabled",
@@ -401,6 +432,7 @@ class CloudEdgeMeariCoordinator:
 
     def set_motion_timeout(self, timeout: int) -> None:
         self._motion_timeout = max(10, min(timeout, 600))
+        self._persist_option("motion_timeout", self._motion_timeout)
         _LOGGER.info(
             "Motion timeout set to %ds for %s",
             self._motion_timeout, self._sn_num,
@@ -410,6 +442,7 @@ class CloudEdgeMeariCoordinator:
     def set_stream_host_mode(self, mode: str) -> None:
         """Set stream host mode: 'ip' or 'docker'."""
         self._stream_host_mode = mode
+        self._persist_option("stream_host_mode", mode)
         _LOGGER.info(
             "Stream host mode set to %s for %s", mode, self._sn_num,
         )
@@ -429,6 +462,7 @@ class CloudEdgeMeariCoordinator:
     def set_vvp_quality(self, quality: int | None) -> None:
         """Set VVP quality profile for future P2P sessions."""
         self._vvp_quality = quality
+        self._persist_option("vvp_quality", quality)
         _LOGGER.info(
             "VVP quality set to %s for %s",
             quality if quality is not None else "auto",
