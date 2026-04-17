@@ -238,6 +238,30 @@ class CloudEdgeMeariCoordinator:
     # Properties
     # ------------------------------------------------------------------
 
+    def prefetch_battery(self, api: "MeariApiClient") -> None:
+        """Pre-load battery info using an already-authenticated API client.
+
+        Call this during integration setup (before entity platforms load) so
+        battery sensors have a value immediately instead of showing *unknown*
+        until the background thread logs in.
+        """
+        if not self._is_snap:
+            return
+        try:
+            info = api.get_battery_info(self._sn_num)
+            if not info:
+                return
+            pct = info.get("154")
+            charge = info.get("156")
+            if pct is not None:
+                pct_int = int(pct)
+                if 0 <= pct_int <= 100:
+                    self._battery_percent = pct_int
+            if charge is not None:
+                self._battery_charging = int(charge) == 1
+        except Exception as exc:
+            _LOGGER.warning("Prefetch battery failed for %s: %s", self._sn_num, exc)
+
     @property
     def available(self) -> bool:
         return self._available
@@ -3064,39 +3088,59 @@ class CloudEdgeMeariCoordinator:
     # ------------------------------------------------------------------
 
     def _poll_battery(self) -> None:
-        """Poll battery info."""
+        """Poll battery info, re-login once if the call fails."""
         if not self._is_snap:
             return
         if not self._api:
             return
-        try:
-            info = self._api.get_battery_info(self._sn_num)
-            if not info:
-                return
+        for attempt in range(2):
+            try:
+                info = self._api.get_battery_info(self._sn_num)
+                if not info:
+                    if attempt == 0:
+                        _LOGGER.debug(
+                            "Battery poll returned empty for %s, retrying after re-login",
+                            self._sn_num,
+                        )
+                        self._api.login()
+                        continue
+                    return
 
-            pct = info.get("154")
-            charge = info.get("156")
+                pct = info.get("154")
+                charge = info.get("156")
 
-            if pct is not None:
-                try:
-                    pct_int = int(pct)
-                    if 0 <= pct_int <= 100:
-                        changed = self._battery_percent != pct_int
-                        self._battery_percent = pct_int
+                if pct is not None:
+                    try:
+                        pct_int = int(pct)
+                        if 0 <= pct_int <= 100:
+                            changed = self._battery_percent != pct_int
+                            self._battery_percent = pct_int
+                            if changed:
+                                self._fire_update()
+                    except (ValueError, TypeError):
+                        pass
+
+                if charge is not None:
+                    try:
+                        charge_int = int(charge)
+                        is_charging = charge_int == 1
+                        changed = self._battery_charging != is_charging
+                        self._battery_charging = is_charging
                         if changed:
                             self._fire_update()
-                except (ValueError, TypeError):
-                    pass
-
-            if charge is not None:
-                try:
-                    charge_int = int(charge)
-                    is_charging = charge_int == 1
-                    changed = self._battery_charging != is_charging
-                    self._battery_charging = is_charging
-                    if changed:
-                        self._fire_update()
-                except (ValueError, TypeError):
-                    pass
-        except Exception as e:
-            _LOGGER.debug("Battery poll failed: %s", e)
+                    except (ValueError, TypeError):
+                        pass
+                return  # success
+            except Exception as e:
+                if attempt == 0:
+                    _LOGGER.debug(
+                        "Battery poll failed for %s (%s), retrying after re-login",
+                        self._sn_num, e,
+                    )
+                    try:
+                        self._api.login()
+                    except Exception:
+                        _LOGGER.warning("Battery poll re-login failed for %s", self._sn_num)
+                        return
+                else:
+                    _LOGGER.warning("Battery poll failed for %s: %s", self._sn_num, e)
