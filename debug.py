@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -469,6 +470,7 @@ async def _await_live_stream(
 async def cmd_list(args) -> int:
     mods = _bootstrap_integration_modules()
     MeariApiClient = mods["api"].MeariApiClient
+    parse_quality_profiles = mods["p2p_streamer"].parse_quality_profiles
 
     api = MeariApiClient(
         email=args.email,
@@ -487,10 +489,19 @@ async def cmd_list(args) -> int:
         print(f"Camera devices (snap/ipc/doorbell): {len(api.get_camera_devices())}")
     print("=" * 78)
     for i, dev in enumerate(api.devices.values(), start=1):
+        profiles = parse_quality_profiles(dev)
+        profiles_str = ", ".join(
+            f"{k}={v}" for k, v in sorted(profiles.items())
+        ) if profiles else "none"
         print(
             f"{i:2d}. id={dev.get('deviceID')} sn={dev.get('snNum')} "
             f"name={dev.get('deviceName')} category={dev.get('_category')}"
         )
+        print(f"    quality profiles: {profiles_str}")
+        # Show firmware version if available
+        fw = dev.get("deviceVersionID", "")
+        if fw:
+            print(f"    firmware: {fw}")
     return 0
 
 
@@ -597,36 +608,53 @@ def _build_stream_player_cmd(
     if not shutil.which("ffplay"):
         raise RuntimeError("ffplay not found")
 
-    codec_l = (codec or "hevc").lower()
-    if codec_l == "h264":
-        analyzeduration = "250000"
-        probesize = "131072"
-    else:
-        analyzeduration = "1000000"
-        probesize = "524288"
-
     cmd = [
         "ffplay",
         "-hide_banner",
         "-stats",
         "-loglevel",
-        "info",
+        "verbose",
         "-window_title",
         "CloudEdge live",
         "-fflags",
         "+discardcorrupt",
         "-sync",
-        "video",
+        "ext",
+        "-infbuf",
         "-analyzeduration",
-        analyzeduration,
+        "100000",
         "-probesize",
-        probesize,
+        "65536",
         "-f",
         "mpegts",
     ]
     if int(duration) > 0:
         cmd.extend(["-t", str(int(duration))])
     cmd.append(url)
+    return cmd
+
+
+def _build_stream_recorder_cmd(
+    url: str,
+    output_path: str,
+    duration: int = 0,
+) -> list[str]:
+    """Build ffmpeg command to record the TCP stream to a .ts file.
+
+    Connects as a second TCP client to the stream server, so it gets
+    the same data the player sees without interfering with playback.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+discardcorrupt+nobuffer",
+        "-f", "mpegts",
+        "-i", url,
+        "-c", "copy",
+        "-f", "mpegts", "-y", output_path,
+    ]
+    if int(duration) > 0:
+        cmd.insert(-4, "-t")
+        cmd.insert(-4, str(int(duration)))
     return cmd
 
 
@@ -658,9 +686,329 @@ def _stop_player_process(proc: subprocess.Popen | None) -> None:
             return
 
 
+def _build_pcm_recorder_cmd(
+    url: str,
+    output_path: str,
+    duration: int = 0,
+) -> list[str]:
+    """Build ffmpeg command to extract raw PCM audio from the stream.
+
+    Connects as a third TCP client (same TS data) and decodes audio to
+    16-bit signed-LE mono 16 kHz WAV for objective silence analysis.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+discardcorrupt+nobuffer",
+        "-f", "mpegts",
+        "-i", url,
+        "-vn",                     # drop video
+        "-acodec", "pcm_s16le",    # raw PCM
+        "-ar", "16000",            # 16 kHz (matches our AAC encoder)
+        "-ac", "1",                # mono
+        "-f", "wav", "-y", output_path,
+    ]
+    if int(duration) > 0:
+        cmd.insert(-4, "-t")
+        cmd.insert(-4, str(int(duration)))
+    return cmd
+
+
+def _analyze_pcm_audio(
+    wav_path: str,
+    log: logging.Logger,
+    chunk_ms: int = 64,
+    silence_threshold_rms: float = 50.0,
+) -> dict[str, Any]:
+    """Analyse a raw PCM WAV file for silence gaps and audible content.
+
+    Splits the audio into *chunk_ms*-length windows and classifies each
+    as silence (RMS < *silence_threshold_rms*) or audible.
+
+    Returns a dict with:
+      pcm_duration_s, pcm_audible_pct, pcm_silence_pct,
+      pcm_silence_gap_count, pcm_silence_gap_durations_s (top 10),
+      pcm_max_silence_gap_s, pcm_avg_rms, pcm_max_rms,
+      pcm_audible_segments (count of continuous audible runs),
+    """
+    import struct
+    import math
+
+    result: dict[str, Any] = {}
+
+    if not os.path.isfile(wav_path) or os.path.getsize(wav_path) < 100:
+        log.warning("PCM recording missing or too small: %s", wav_path)
+        return result
+
+    # Read WAV — we know it is 16-bit LE mono 16 kHz from our own ffmpeg cmd.
+    with open(wav_path, "rb") as f:
+        header = f.read(44)  # standard WAV header
+        if len(header) < 44 or header[:4] != b"RIFF":
+            log.warning("Not a valid WAV file: %s", wav_path)
+            return result
+        pcm_data = f.read()
+
+    if len(pcm_data) < 2:
+        log.warning("PCM recording has no audio data")
+        return result
+
+    sample_rate = 16000
+    bytes_per_sample = 2  # s16le
+    chunk_samples = int(sample_rate * chunk_ms / 1000)
+    chunk_bytes = chunk_samples * bytes_per_sample
+    total_samples = len(pcm_data) // bytes_per_sample
+    total_duration = total_samples / sample_rate
+
+    result["pcm_duration_s"] = round(total_duration, 2)
+
+    # Classify each chunk
+    chunk_rms_values: list[float] = []
+    is_silence: list[bool] = []
+    offset = 0
+    while offset + chunk_bytes <= len(pcm_data):
+        samples = struct.unpack(
+            f"<{chunk_samples}h", pcm_data[offset : offset + chunk_bytes]
+        )
+        sum_sq = sum(s * s for s in samples)
+        rms = math.sqrt(sum_sq / chunk_samples)
+        chunk_rms_values.append(rms)
+        is_silence.append(rms < silence_threshold_rms)
+        offset += chunk_bytes
+
+    if not chunk_rms_values:
+        return result
+
+    n_chunks = len(chunk_rms_values)
+    n_silent = sum(is_silence)
+    n_audible = n_chunks - n_silent
+    chunk_dur = chunk_ms / 1000.0
+
+    result["pcm_total_chunks"] = n_chunks
+    result["pcm_audible_chunks"] = n_audible
+    result["pcm_silence_chunks"] = n_silent
+    result["pcm_audible_pct"] = round(100.0 * n_audible / n_chunks, 1)
+    result["pcm_silence_pct"] = round(100.0 * n_silent / n_chunks, 1)
+
+    # RMS stats for audible chunks
+    audible_rms = [r for r, s in zip(chunk_rms_values, is_silence) if not s]
+    if audible_rms:
+        result["pcm_avg_rms_audible"] = round(sum(audible_rms) / len(audible_rms), 1)
+        result["pcm_max_rms"] = round(max(audible_rms), 1)
+        result["pcm_min_rms_audible"] = round(min(audible_rms), 1)
+    result["pcm_avg_rms_all"] = round(
+        sum(chunk_rms_values) / len(chunk_rms_values), 1
+    )
+
+    # Detect silence gaps (contiguous silent runs)
+    silence_gaps: list[float] = []
+    audible_segments = 0
+    in_gap = False
+    gap_start = 0
+    for i, silent in enumerate(is_silence):
+        if silent:
+            if not in_gap:
+                in_gap = True
+                gap_start = i
+        else:
+            if in_gap:
+                gap_dur = (i - gap_start) * chunk_dur
+                silence_gaps.append(gap_dur)
+                in_gap = False
+            audible_segments += 1 if (i == 0 or is_silence[i - 1]) else 0
+    # Close trailing gap
+    if in_gap:
+        silence_gaps.append((n_chunks - gap_start) * chunk_dur)
+
+    # Count audible segments (contiguous audible runs)
+    audible_seg_count = 0
+    in_audible = False
+    for silent in is_silence:
+        if not silent:
+            if not in_audible:
+                audible_seg_count += 1
+                in_audible = True
+        else:
+            in_audible = False
+
+    result["pcm_audible_segments"] = audible_seg_count
+    result["pcm_silence_gap_count"] = len(silence_gaps)
+    if silence_gaps:
+        result["pcm_max_silence_gap_s"] = round(max(silence_gaps), 3)
+        result["pcm_avg_silence_gap_s"] = round(
+            sum(silence_gaps) / len(silence_gaps), 3
+        )
+        result["pcm_silence_gap_durations_s"] = [
+            round(g, 3)
+            for g in sorted(silence_gaps, reverse=True)[:10]
+        ]
+
+    # Timeline summary: first/last audible chunk position
+    audible_indices = [i for i, s in enumerate(is_silence) if not s]
+    if audible_indices:
+        result["pcm_first_audible_at_s"] = round(
+            audible_indices[0] * chunk_dur, 2
+        )
+        result["pcm_last_audible_at_s"] = round(
+            audible_indices[-1] * chunk_dur, 2
+        )
+
+    return result
+
+
+def _analyze_recorded_ts(ts_path: str, log: logging.Logger) -> dict[str, Any]:
+    """Analyse a recorded MPEG-TS file for video/audio quality metrics.
+
+    Uses ffprobe to extract per-frame timing, then computes:
+    - total decoded frames (video + audio)
+    - average video FPS
+    - frame-to-frame gap histogram (detects skips/freezes)
+    - duplicate DTS count (indicates frozen output)
+    - decode errors counted by ffmpeg second-pass
+    """
+    result: dict[str, Any] = {}
+    if not os.path.isfile(ts_path) or os.path.getsize(ts_path) < 1000:
+        log.warning("TS recording missing or too small: %s", ts_path)
+        return result
+
+    # --- ffprobe: extract per-frame timestamps for video stream ---
+    # Use best_effort_timestamp_time which is always populated (pkt_pts_time
+    # can be N/A for copy-mode TS recordings).
+    # Output csv: key_frame,best_effort_timestamp_time
+    try:
+        raw = subprocess.check_output(
+            [
+                "ffprobe", "-hide_banner", "-loglevel", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "frame=key_frame,best_effort_timestamp_time",
+                "-of", "csv=p=0",
+                ts_path,
+            ],
+            timeout=30, stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except Exception as e:
+        log.warning("ffprobe frame extraction failed: %s", e)
+        return result
+
+    pts_list: list[float] = []
+    n_keyframes = 0
+    for line in raw.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        # csv order: best_effort_timestamp_time, key_frame
+        # Find the float value (timestamp) and the 0/1 (key_frame)
+        ts_val = None
+        kf_val = None
+        for p in parts:
+            p = p.strip()
+            if p in ("0", "1") and kf_val is None:
+                kf_val = p
+            else:
+                try:
+                    ts_val = float(p)
+                except (ValueError, TypeError):
+                    pass
+        if ts_val is not None:
+            pts_list.append(ts_val)
+            if kf_val == "1":
+                n_keyframes += 1
+
+    result["video_frames_decoded"] = len(pts_list)
+    result["video_keyframes"] = n_keyframes
+
+    if len(pts_list) >= 2:
+        pts_list.sort()
+        span = pts_list[-1] - pts_list[0]
+        result["video_span_s"] = round(span, 3)
+        result["video_avg_fps"] = round((len(pts_list) - 1) / span, 2) if span > 0 else 0
+
+        # Frame gaps
+        gaps = [pts_list[i + 1] - pts_list[i] for i in range(len(pts_list) - 1)]
+        if gaps:
+            median_gap = sorted(gaps)[len(gaps) // 2]
+            result["video_median_frame_gap_ms"] = round(median_gap * 1000, 1)
+            result["video_max_frame_gap_ms"] = round(max(gaps) * 1000, 1)
+            # Count gaps that exceed 3x median (likely skips/stalls)
+            skip_threshold = max(median_gap * 3, 0.15)
+            skips = [g for g in gaps if g > skip_threshold]
+            result["video_skip_count"] = len(skips)
+            if skips:
+                result["video_skip_durations_s"] = [round(g, 3) for g in sorted(skips, reverse=True)[:10]]
+            # Duplicate PTS (frozen frames)
+            n_dup = sum(1 for g in gaps if g < 0.001)
+            result["video_duplicate_pts"] = n_dup
+
+    # --- ffprobe: extract audio frame timestamps ---
+    try:
+        raw_audio = subprocess.check_output(
+            [
+                "ffprobe", "-hide_banner", "-loglevel", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "csv=p=0",
+                ts_path,
+            ],
+            timeout=15, stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except Exception as e:
+        log.warning("ffprobe audio extraction failed: %s", e)
+        raw_audio = ""
+
+    audio_pts: list[float] = []
+    for line in raw_audio.strip().splitlines():
+        try:
+            audio_pts.append(float(line.strip()))
+        except (ValueError, TypeError):
+            continue
+
+    result["audio_frames_decoded"] = len(audio_pts)
+    if len(audio_pts) >= 2:
+        audio_pts.sort()
+        a_span = audio_pts[-1] - audio_pts[0]
+        result["audio_span_s"] = round(a_span, 3)
+        a_gaps = [audio_pts[i + 1] - audio_pts[i] for i in range(len(audio_pts) - 1)]
+        if a_gaps:
+            a_median = sorted(a_gaps)[len(a_gaps) // 2]
+            result["audio_median_gap_ms"] = round(a_median * 1000, 1)
+            result["audio_max_gap_ms"] = round(max(a_gaps) * 1000, 1)
+            a_skip_threshold = max(a_median * 3, 0.15)
+            a_skips = [g for g in a_gaps if g > a_skip_threshold]
+            result["audio_gap_count"] = len(a_skips)
+            if a_skips:
+                result["audio_gap_durations_s"] = [round(g, 3) for g in sorted(a_skips, reverse=True)[:10]]
+
+    # --- ffmpeg decode pass: count errors ---
+    try:
+        err_raw = subprocess.check_output(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", ts_path,
+                "-f", "null", "-",
+            ],
+            timeout=30, stderr=subprocess.STDOUT,
+        ).decode(errors="replace")
+        error_lines = [l for l in err_raw.splitlines() if l.strip()]
+        result["decode_error_lines"] = len(error_lines)
+        if error_lines:
+            result["decode_errors_sample"] = error_lines[:5]
+    except subprocess.CalledProcessError as e:
+        err_out = (e.output or b"").decode(errors="replace")
+        error_lines = [l for l in err_out.splitlines() if l.strip()]
+        result["decode_error_lines"] = len(error_lines)
+        if error_lines:
+            result["decode_errors_sample"] = error_lines[:5]
+    except Exception as e:
+        log.warning("TS decode error check failed: %s", e)
+
+    return result
+
+
 async def cmd_stream(args) -> int:
     coord = None
     player_proc = None
+    recorder_proc: subprocess.Popen | None = None
+    pcm_recorder_proc: subprocess.Popen | None = None
+    ts_record_path = "/tmp/cloudedge_stream_recording.ts"
+    pcm_record_path = "/tmp/cloudedge_audio_recording.wav"
     try:
         setattr(args, "skip_initial_grab", bool(args.wake and args.play))
         if args.wake and args.play:
@@ -669,17 +1017,23 @@ async def cmd_stream(args) -> int:
             )
 
         coord, dev, mods = await _create_coordinator(args)
+        # Apply quality override from CLI
+        quality_arg = getattr(args, "quality", None)
+        if quality_arg is not None:
+            coord.set_vvp_quality(quality_arg)
         if args.play:
-            # Keep a light gap-fill profile in player mode so short transport
-            # hiccups do not look like repeated pause/resume jitter.
-            setattr(coord, "_live_gap_fill_after_seconds", 1.2)
-            setattr(coord, "_live_gap_fill_fps", 1.5)
+            # Gap-fill during stalls must advance PTS at the same rate as
+            # realtime audio so the muxer interleaves cleanly.  The keepalive
+            # loop caps gap-fill FPS to _video_mux_target_fps (which equals
+            # the setts BSF FPS), so we just need a high ceiling here.
+            setattr(coord, "_live_gap_fill_after_seconds", 0.3)
+            setattr(coord, "_live_gap_fill_fps", 30.0)  # capped by mux target FPS
         auto_lossy_for_player = bool(args.wake and args.play)
-        setattr(coord, "_p2p_allow_lossy_gap_skip", False)
+        setattr(coord, "_p2p_allow_lossy_gap_skip", auto_lossy_for_player)
         setattr(coord, "_p2p_adaptive_lossy_gap_skip", auto_lossy_for_player)
         if auto_lossy_for_player:
             logging.getLogger(__name__).info(
-                "Auto-enabling adaptive lossy recovery for wake+play stability"
+                "Auto-enabling lossy gap skip for wake+play stability"
             )
         url = await _camera_stream_source(mods, coord)
 
@@ -738,18 +1092,157 @@ async def cmd_stream(args) -> int:
                 duration=int(args.duration),
                 codec=active_codec,
             )
-            logging.getLogger(__name__).info("Launching ffplay player")
+            logging.getLogger(__name__).info("Delaying player 1s for stream startup")
+            await asyncio.sleep(1)
+            play_env = os.environ.copy()
+            _player_log = open("/tmp/player_test.log", "wb")
+
+            logging.getLogger(__name__).info("Launching player: %s", player_cmd[0])
             player_proc = subprocess.Popen(
                 player_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=_player_log,
+                stderr=subprocess.STDOUT,
+                env=play_env,
+            )
+
+            # Launch a separate ffmpeg recorder as a second TCP client
+            recorder_cmd = _build_stream_recorder_cmd(
+                url, ts_record_path, duration=int(args.duration),
+            )
+            logging.getLogger(__name__).info(
+                "Launching stream recorder: ffmpeg → %s", ts_record_path,
+            )
+            recorder_proc = subprocess.Popen(
+                recorder_cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=play_env,
             )
+
+            # Launch PCM audio recorder as a third TCP client
+            pcm_cmd = _build_pcm_recorder_cmd(
+                url, pcm_record_path, duration=int(args.duration),
+            )
+            logging.getLogger(__name__).info(
+                "Launching PCM audio recorder: ffmpeg → %s", pcm_record_path,
+            )
+            pcm_recorder_proc = subprocess.Popen(
+                pcm_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=play_env,
+            )
+
             # Surface failures quickly instead of silently continuing.
             await asyncio.sleep(1)
             if player_proc.poll() is not None:
                 raise RuntimeError(
-                    f"ffplay exited early with rc={player_proc.returncode}"
+                    f"player exited early with rc={player_proc.returncode}"
                 )
+
+            # --- Audio diagnostic monitor ---
+            def _audio_diag(pid: int) -> None:
+                """Poll PipeWire/PulseAudio to verify ffplay audio output."""
+                log = logging.getLogger(__name__)
+                checked = 0
+                found_stream = False
+                while player_proc.poll() is None:
+                    time.sleep(2)
+                    checked += 1
+                    try:
+                        raw = subprocess.check_output(
+                            ["pactl", "list", "sink-inputs"],
+                            timeout=3, stderr=subprocess.DEVNULL,
+                        ).decode(errors="replace")
+                    except Exception:
+                        if checked <= 2:
+                            log.warning("Audio diag: pactl not available")
+                        break
+                    # Find sink-input belonging to our ffplay.
+                    # ffplay uses SDL, which registers as "SDL Application"
+                    # and may report a different PID (e.g. thread PID).
+                    blocks = raw.split("Sink Input #")
+                    ffplay_block = None
+                    ffplay_idx = None
+                    for block in blocks[1:]:
+                        is_pid = (f"pid = \"{pid}\"" in block
+                                  or f"pid = {pid}" in block)
+                        is_sdl = "SDL Application" in block or "ffplay" in block.lower() or "mpv" in block.lower()
+                        if is_pid or is_sdl:
+                            ffplay_idx = block.split("\n")[0].strip()
+                            ffplay_block = block
+                            break
+                    if ffplay_block is not None:
+                        muted = "UNKNOWN"
+                        vol = "UNKNOWN"
+                        corked = False
+                        app_name = ""
+                        sink_id = "UNKNOWN"
+                        for line in ffplay_block.splitlines():
+                            ls = line.strip()
+                            if ls.startswith("Mute:"):
+                                muted = ls
+                            elif ls.startswith("Volume:") and "Base" not in ls:
+                                vol = ls
+                            elif ls.startswith("Corked:"):
+                                corked = "yes" in ls.lower()
+                            elif "application.name" in ls:
+                                app_name = ls
+                            elif ls.startswith("Sink:"):
+                                sink_id = ls
+                        # Resolve sink name
+                        sink_name = sink_id
+                        if sink_id != "UNKNOWN":
+                            try:
+                                sinks_raw = subprocess.check_output(
+                                    ["pactl", "list", "sinks", "short"],
+                                    timeout=2, stderr=subprocess.DEVNULL,
+                                ).decode(errors="replace")
+                                sid = sink_id.replace("Sink:", "").strip()
+                                for sl in sinks_raw.splitlines():
+                                    parts = sl.split("\t")
+                                    if len(parts) >= 2 and parts[0].strip() == sid:
+                                        sink_name = f"Sink: {sid} ({parts[1]})"
+                                        break
+                            except Exception:
+                                pass
+                        if not found_stream:
+                            log.info(
+                                "Audio diag: FOUND sink-input #%s — %s | "
+                                "%s | %s | %s | corked=%s",
+                                ffplay_idx, app_name, sink_name, muted, vol, corked,
+                            )
+                            found_stream = True
+                        elif checked % 5 == 0:
+                            log.info(
+                                "Audio diag: sink-input #%s — %s | %s | %s | corked=%s",
+                                ffplay_idx, sink_name, muted, vol, corked,
+                            )
+                    elif not found_stream and checked <= 5:
+                        n_blocks = len(blocks) - 1
+                        apps = []
+                        for block in blocks[1:]:
+                            for line in block.splitlines():
+                                if "application.name" in line or "application.process.id" in line:
+                                    apps.append(line.strip())
+                        log.warning(
+                            "Audio diag: no sink-input for PID %d "
+                            "(%d inputs: %s)",
+                            pid, n_blocks, "; ".join(apps[:10]),
+                        )
+                if not found_stream:
+                    log.warning(
+                        "Audio diag: ffplay NEVER registered an audio "
+                        "stream with PipeWire/PulseAudio (PID %d)", pid,
+                    )
+
+            _audio_diag_thread = threading.Thread(
+                target=_audio_diag, args=(player_proc.pid,), daemon=True,
+            )
+            _audio_diag_thread.start()
 
         end_at = time.time() + args.duration if args.duration > 0 else None
         stall_started_at: float | None = None
@@ -765,8 +1258,15 @@ async def cmd_stream(args) -> int:
                 )
             await asyncio.sleep(1)
 
+        _t0 = time.time()
         if player_proc is not None and player_proc.poll() is None:
             _stop_player_process(player_proc)
+        # Stop recorder too
+        _stop_player_process(recorder_proc)
+        _stop_player_process(pcm_recorder_proc)
+        logging.getLogger(__name__).info(
+            "Player/recorder stopped in %.1fs", time.time() - _t0,
+        )
 
         source_summary = health_source.summary(coord)
 
@@ -785,9 +1285,48 @@ async def cmd_stream(args) -> int:
         unresolved = float(source_summary["unresolved_stall_s"])
         if unresolved > 0.0:
             print(f"unresolved_stall_s: {unresolved:.2f}")
+
+        # --- TS recording analysis ---
+        if args.play:
+            log = logging.getLogger(__name__)
+            _t1 = time.time()
+            ts_metrics = _analyze_recorded_ts(ts_record_path, log)
+            log.info("TS analysis completed in %.1fs", time.time() - _t1)
+            if ts_metrics:
+                print("\nTS recording analysis (what the player received)")
+                print("-" * 78)
+                for k, v in ts_metrics.items():
+                    if k == "decode_errors_sample":
+                        print(f"  {k}:")
+                        for line in v:
+                            print(f"    {line}")
+                    elif isinstance(v, list):
+                        print(f"  {k}: {v}")
+                    elif isinstance(v, float):
+                        print(f"  {k}: {v:.2f}")
+                    else:
+                        print(f"  {k}: {v}")
+
+            # --- PCM audio content analysis ---
+            _t2 = time.time()
+            pcm_metrics = _analyze_pcm_audio(pcm_record_path, log)
+            log.info("PCM analysis completed in %.1fs", time.time() - _t2)
+            if pcm_metrics:
+                print("\nPCM audio analysis (actual audible content)")
+                print("-" * 78)
+                for k, v in pcm_metrics.items():
+                    if isinstance(v, list):
+                        print(f"  {k}: {v}")
+                    elif isinstance(v, float):
+                        print(f"  {k}: {v:.2f}")
+                    else:
+                        print(f"  {k}: {v}")
+
         return 0
     finally:
         _stop_player_process(player_proc)
+        _stop_player_process(recorder_proc)
+        _stop_player_process(pcm_recorder_proc)
         if coord:
             await coord.async_stop()
 
@@ -938,6 +1477,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="play",
         action="store_true",
         help="Auto-launch local ffplay preview",
+    )
+    p_stream.add_argument(
+        "--quality",
+        type=int,
+        default=None,
+        help="VVP quality profile ID (from 'list' command, e.g. 0=SD, 2=HD). Default: highest",
     )
 
     p_bench = sub.add_parser(

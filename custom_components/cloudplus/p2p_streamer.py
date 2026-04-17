@@ -80,6 +80,45 @@ def format_licence_id(sn: str) -> str:
     return sn
 
 
+def parse_quality_profiles(device: dict[str, Any]) -> dict[int, str]:
+    """Return ``{profile_id: label}`` from the device ``bps2`` capability.
+
+    Example: ``{0: "640x360", 1: "2304x1296@1Mbps", 2: "2304x1296@2Mbps"}``.
+    Returns an empty dict when no capability information is available.
+    """
+    try:
+        cap_raw = device.get("capability", "")
+        if isinstance(cap_raw, str):
+            cap = json.loads(cap_raw) if cap_raw else {}
+        else:
+            cap = cap_raw
+        caps = cap.get("caps", {})
+        bps2_raw = caps.get("bps2", "")
+        if isinstance(bps2_raw, str):
+            bps2 = json.loads(bps2_raw) if bps2_raw else {}
+        else:
+            bps2 = bps2_raw
+        if not bps2:
+            return {}
+        return {int(k): str(v) for k, v in bps2.items()}
+    except Exception:
+        return {}
+
+
+def _best_quality_from_device(device: dict[str, Any]) -> int:
+    """Pick the highest quality profile from the device capability ``bps2``.
+
+    ``bps2`` is a JSON-encoded dict whose keys are quality profile IDs like
+    ``{"0": "640x360", "1": "2304x1296@1Mbps", "2": "2304x1296@2Mbps"}``.
+    We want the highest numeric key that has the best resolution/bitrate.
+    Returns 0 when no capability information is available (camera default).
+    """
+    profiles = parse_quality_profiles(device)
+    if not profiles:
+        return 0
+    return max(profiles.keys())
+
+
 def _is_private_ip(ip: str) -> bool:
     try:
         parts = ip.split(".")
@@ -334,6 +373,7 @@ class P2PStreamer:
         remote: bool = False,
         allow_lossy_gap_skip: bool = False,
         adaptive_lossy_gap_skip: bool = False,
+        vvp_quality: int | None = None,
     ) -> None:
         self._api = api
         self._device = device
@@ -349,10 +389,17 @@ class P2PStreamer:
         self._remote = remote
         self._allow_lossy_gap_skip = bool(allow_lossy_gap_skip)
         self._adaptive_lossy_gap_skip = bool(adaptive_lossy_gap_skip)
+        self._vvp_quality = vvp_quality if vvp_quality is not None else _best_quality_from_device(device)
+        if self._vvp_quality:
+            _LOGGER.info(
+                "VVP quality profile %d selected for %s",
+                self._vvp_quality, self._sn_num,
+            )
 
         self._running = False
         self._video_count = 0
         self._total_bytes = 0
+        self._audio_decrypt: bool | None = None  # None = auto-detect
         self._active_sock: socket.socket | None = None
         self._active_sig: MsgSvrClient | None = None
 
@@ -385,8 +432,11 @@ class P2PStreamer:
     def _parse_stream_chunk(self, chunk: bytes):
         """Parse one stream chunk.
 
-        Audio frames are always parsed from the decrypted stream payload.
-        Feeding raw encrypted audio bytes to ffmpeg produces audible beeps.
+        Video frames are always 3DES-decrypted.  Audio encryption is
+        firmware-dependent — some cameras encrypt audio, others send it
+        plaintext.  The first audio frame is probed: if the raw
+        ``data_len`` field at 0x30 looks valid the audio is plaintext;
+        otherwise we decrypt and check again.
         """
         if len(chunk) < 4:
             return None
@@ -397,6 +447,37 @@ class P2PStreamer:
             return parse_stream_frame(bytes(decrypted))
 
         if frame_type == STREAM_TYPE_AUDIO:
+            if self._audio_decrypt is True:
+                decrypted = decrypt_stream_frame(bytearray(chunk))
+                return parse_stream_frame(bytes(decrypted))
+            if self._audio_decrypt is False:
+                return parse_stream_frame(chunk)
+
+            # --- auto-detect on first audio frame ---
+            if len(chunk) >= 0x34:
+                remaining = len(chunk) - 0x34
+                raw_dl = struct.unpack_from("<I", chunk, 0x30)[0]
+                if 0 < raw_dl <= remaining and raw_dl < 2000:
+                    self._audio_decrypt = False
+                    _LOGGER.info(
+                        "Audio auto-detect: plaintext (data_len=%d, avail=%d)",
+                        raw_dl, remaining,
+                    )
+                    return parse_stream_frame(chunk)
+
+                decrypted = decrypt_stream_frame(bytearray(chunk))
+                dec_dl = struct.unpack_from("<I", bytes(decrypted), 0x30)[0]
+                if 0 < dec_dl <= remaining and dec_dl < 2000:
+                    self._audio_decrypt = True
+                    _LOGGER.info(
+                        "Audio auto-detect: encrypted (data_len=%d, avail=%d)",
+                        dec_dl, remaining,
+                    )
+                    return parse_stream_frame(bytes(decrypted))
+
+            # fallback — decrypt (backward compat)
+            _LOGGER.warning("Audio auto-detect: ambiguous, defaulting to encrypted")
+            self._audio_decrypt = True
             decrypted = decrypt_stream_frame(bytearray(chunk))
             return parse_stream_frame(bytes(decrypted))
 
@@ -415,6 +496,7 @@ class P2PStreamer:
         self._running = True
         self._video_count = 0
         self._total_bytes = 0
+        self._audio_decrypt = None  # re-detect each session
 
         sig = None
         try:
@@ -748,7 +830,7 @@ class P2PStreamer:
         vvp_seq = 0
         vvp_login = build_vvp_packet(
             cmd=VVP_CMD_START_LIVE, seq=vvp_seq, host_key=host_key,
-            param=8, licence_id=licence_id,
+            param=8, licence_id=licence_id, quality=self._vvp_quality,
         )
         vvp_seq += 1
         kcp.send_handshake()
@@ -772,7 +854,7 @@ class P2PStreamer:
         login_ok_at: float | None = None
         no_video_timeout = False
         direct_addr = None
-        turn.sock.settimeout(0.5)
+        turn.sock.settimeout(0.08)
 
         stream_frame_count = 0
         stream_video_count = 0
@@ -889,11 +971,6 @@ class P2PStreamer:
                     continue
                 if ftype == STREAM_TYPE_AUDIO:
                     flow["audio_chunks"] += 1
-                    now_audio = time.time()
-                    if now_audio < audio_catchup_until:
-                        audio_catchup_seen += 1
-                        if (audio_catchup_seen % audio_catchup_stride) != 0:
-                            continue
                     if self.on_audio:
                         self.on_audio(media_data)
             return True
@@ -965,14 +1042,14 @@ class P2PStreamer:
             if skip_expect_recovery_by > 0.0 and now_ts >= skip_expect_recovery_by:
                 if last_video_time <= last_skip_video_time:
                     skip_failures = min(skip_failures + 1, 6)
-                    skip_backoff_until = now_ts + min(8.0, 1.0 + (skip_failures * 1.2))
+                    skip_backoff_until = now_ts + min(4.0, 0.5 + (skip_failures * 0.6))
                 else:
-                    skip_failures = max(0, skip_failures - 1)
+                    skip_failures = max(0, skip_failures - 2)
                 skip_expect_recovery_by = 0.0
 
             stall_time = now_ts - last_video_time
-            if stall_time <= 0.35:
-                recovery_aggr = max(0.0, recovery_aggr * 0.94)
+            if stall_time <= 0.15:
+                recovery_aggr = max(0.0, recovery_aggr * 0.92)
                 return
 
             if stall_time > 3.0:
@@ -999,9 +1076,9 @@ class P2PStreamer:
             elapsed_s = max(1.0, now_ts - stream_start_time)
             live_fps = stream_video_count / elapsed_s if stream_video_count > 0 else 0.0
             fps_pressure = max(0.0, min(1.0, (10.5 - live_fps) / 10.5))
-            stall_pressure = max(0.0, min(1.0, (stall_time - 1.2) / 4.5))
-            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 4.0))
-            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.5))
+            stall_pressure = max(0.0, min(1.0, (stall_time - 0.8) / 3.0))
+            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 3.0))
+            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.0))
             failure_pressure = max(0.0, min(1.0, skip_failures / 3.0))
             pressure = (
                 (0.30 * stall_pressure)
@@ -1011,12 +1088,12 @@ class P2PStreamer:
                 + (0.10 * failure_pressure)
             )
             if self._adaptive_lossy_gap_skip:
-                pressure = min(1.0, pressure + 0.12)
-            recovery_aggr = (recovery_aggr * 0.82) + (pressure * 0.18)
+                pressure = min(1.0, pressure + 0.15)
+            recovery_aggr = (recovery_aggr * 0.75) + (pressure * 0.25)
 
             nudge_interval = max(
-                0.16,
-                min(0.55, (0.18 + (backlog_secs * 0.10)) * (1.0 - (0.25 * recovery_aggr))),
+                0.03,
+                min(0.25, (0.06 + (backlog_secs * 0.04)) * (1.0 - (0.40 * recovery_aggr))),
             )
 
             if gap_pending and now_ts - last_nudge_time > nudge_interval:
@@ -1026,21 +1103,22 @@ class P2PStreamer:
 
             payload_idle = now_ts - last_kcp_payload_time
             gap_age = (now_ts - last_gap_since) if last_gap_since > 0.0 else 0.0
-            adaptive_wait_base = max(3.8, min(9.0, 6.0 - (0.65 * min(backlog_secs, 2.5))))
-            adaptive_wait = max(1.5, adaptive_wait_base * (1.0 - (0.40 * recovery_aggr)))
-            min_nudges_base = 4 if backlog_secs >= 2.0 else 5 if backlog_secs >= 1.0 else 6
-            min_nudges = max(2, int(round(min_nudges_base - (2.0 * recovery_aggr))))
+            adaptive_wait_base = max(2.5, min(6.0, 4.5 - (0.65 * min(backlog_secs, 2.5))))
+            adaptive_wait = max(1.4, adaptive_wait_base * (1.0 - (0.45 * recovery_aggr)))
+            min_nudges_base = 3 if backlog_secs >= 2.0 else 3 if backlog_secs >= 1.0 else 4
+            min_nudges = max(1, int(round(min_nudges_base - (2.0 * recovery_aggr))))
 
             if (
                 not self._allow_lossy_gap_skip
                 and not lossy_session_mode
                 and gap_pending
                 and (
-                    (stall_time > 2.8 and backlog_secs > 1.0)
+                    (stall_time > 2.5 and backlog_secs > 0.8)
                     or (
                         self._adaptive_lossy_gap_skip
                         and (now_ts - stream_start_time) > 8.0
-                        and (stall_time > 2.2 or recovery_aggr > 0.40 or live_fps < 9.0)
+                        and stall_time > 2.0
+                        and (recovery_aggr > 0.40 or live_fps < 7.0)
                     )
                     or long_stalls_recent >= 1
                 )
@@ -1061,15 +1139,15 @@ class P2PStreamer:
                 or long_stalls_recent >= 2
             )
             if effective_lossy:
-                lossy_scale = 0.60 if self._allow_lossy_gap_skip else 0.72
-                lossy_scale = max(0.45, lossy_scale - (0.16 * recovery_aggr))
-                lossy_wait = max(1.2, min(3.2, adaptive_wait * lossy_scale))
+                lossy_scale = 0.50 if self._allow_lossy_gap_skip else 0.58
+                lossy_scale = max(0.35, lossy_scale - (0.18 * recovery_aggr))
+                lossy_wait = max(1.0, min(3.0, adaptive_wait * lossy_scale))
                 nudge_gate = max(
                     1,
                     min_nudges - (2 if self._adaptive_lossy_gap_skip else 1),
                 )
-                idle_gate = lossy_wait * (0.35 if self._adaptive_lossy_gap_skip else 0.45)
-                age_gate = lossy_wait * (0.40 if self._adaptive_lossy_gap_skip else 0.50)
+                idle_gate = lossy_wait * (0.20 if self._adaptive_lossy_gap_skip else 0.30)
+                age_gate = lossy_wait * (0.25 if self._adaptive_lossy_gap_skip else 0.35)
                 if (
                     gap_pending
                     and now_ts >= skip_backoff_until
@@ -1079,21 +1157,21 @@ class P2PStreamer:
                     and gap_nudges >= nudge_gate
                     and now_ts - last_skip_time > max(
                         0.8,
-                        (lossy_wait * 0.85) + (0.45 * skip_failures) - (0.60 * recovery_aggr),
+                        (lossy_wait * 0.55) + (0.25 * skip_failures) - (0.40 * recovery_aggr),
                     )
                 ):
                     severe_link = bool(
-                        stall_time > 7.0
-                        or backlog_secs > 2.8
-                        or long_stalls_recent >= 4
-                        or recovery_aggr > 0.80
+                        stall_time > 5.0
+                        or backlog_secs > 2.0
+                        or long_stalls_recent >= 3
+                        or recovery_aggr > 0.65
                     )
                     if self._allow_lossy_gap_skip:
                         skip_depth = None
                     elif severe_link:
                         skip_depth = None
                     elif self._adaptive_lossy_gap_skip or lossy_session_mode:
-                        skip_depth = 6
+                        skip_depth = None
                     else:
                         skip_depth = 4
                     if kcp.skip_gap(max_gaps=skip_depth):
@@ -1102,20 +1180,18 @@ class P2PStreamer:
                         drained = _drain_kcp_queue()
                         if drained:
                             last_kcp_payload_time = time.time()
-                        audio_catchup_until = now_ts + min(1.0, max(0.4, backlog_secs * 0.30))
-                        audio_catchup_seen = 0
                         last_skip_video_time = last_video_time
-                        skip_expect_recovery_by = now_ts + 1.2
+                        skip_expect_recovery_by = now_ts + 0.8
                 return
 
             if (
                 gap_pending
                 and now_ts >= skip_backoff_until
                 and stall_time > adaptive_wait
-                and payload_idle > (adaptive_wait * 0.60)
+                and payload_idle > (adaptive_wait * 0.50)
                 and gap_age > adaptive_wait
                 and gap_nudges >= min_nudges
-                and now_ts - last_skip_time > max(4.0 + (skip_failures * 1.5), adaptive_wait)
+                and now_ts - last_skip_time > max(3.0 + (skip_failures * 1.0), adaptive_wait)
             ):
                 if kcp.skip_gap(max_gaps=1):
                     last_skip_time = now_ts
@@ -1134,10 +1210,8 @@ class P2PStreamer:
                     drained = _drain_kcp_queue()
                     if drained:
                         last_kcp_payload_time = time.time()
-                    audio_catchup_until = now_ts + min(1.2, max(0.5, backlog_secs * 0.35))
-                    audio_catchup_seen = 0
                     last_skip_video_time = last_video_time
-                    skip_expect_recovery_by = now_ts + 1.2
+                    skip_expect_recovery_by = now_ts + 0.8
 
             if (
                 gap_pending
@@ -1241,6 +1315,7 @@ class P2PStreamer:
                 start_live = build_vvp_packet(
                     cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                     host_key=host_key, param=8, licence_id=licence_id,
+                    quality=self._vvp_quality,
                 )
                 flow["tx_start_live"] += 1
                 kcp.send_iva_data(start_live)
@@ -1282,7 +1357,7 @@ class P2PStreamer:
                         pass
                     finally:
                         turn.sock.setblocking(True)
-                        turn.sock.settimeout(0.5)
+                        turn.sock.settimeout(0.08)
                 except socket.timeout:
                     if not self._running:
                         break
@@ -1303,6 +1378,7 @@ class P2PStreamer:
                         start_live = build_vvp_packet(
                             cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                             host_key=host_key, param=8, licence_id=licence_id,
+                            quality=self._vvp_quality,
                         )
                         flow["tx_start_live"] += 1
                         kcp.send_iva_data(start_live)
@@ -1493,6 +1569,7 @@ class P2PStreamer:
                                     cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                                     host_key=host_key, param=8,
                                     licence_id=licence_id,
+                                    quality=self._vvp_quality,
                                 )
                                 flow["tx_start_live"] += 1
                                 kcp.send_iva_data(start_live)
@@ -1641,11 +1718,6 @@ class P2PStreamer:
                     continue
                 if ftype == STREAM_TYPE_AUDIO:
                     recv_flow["audio_chunks"] += 1
-                    now_audio = time.time()
-                    if now_audio < audio_catchup_until:
-                        audio_catchup_seen += 1
-                        if (audio_catchup_seen % audio_catchup_stride) != 0:
-                            continue
                     if self.on_audio:
                         self.on_audio(media_data)
             return True
@@ -1715,14 +1787,14 @@ class P2PStreamer:
             if skip_expect_recovery_by > 0.0 and now_ts >= skip_expect_recovery_by:
                 if last_video_time <= last_skip_video_time:
                     skip_failures = min(skip_failures + 1, 6)
-                    skip_backoff_until = now_ts + min(8.0, 1.0 + (skip_failures * 1.2))
+                    skip_backoff_until = now_ts + min(4.0, 0.5 + (skip_failures * 0.6))
                 else:
-                    skip_failures = max(0, skip_failures - 1)
+                    skip_failures = max(0, skip_failures - 2)
                 skip_expect_recovery_by = 0.0
 
             stall = now_ts - last_video_time
-            if stall <= 0.35:
-                recovery_aggr = max(0.0, recovery_aggr * 0.94)
+            if stall <= 0.15:
+                recovery_aggr = max(0.0, recovery_aggr * 0.92)
                 return
 
             if stall > 3.0:
@@ -1749,9 +1821,9 @@ class P2PStreamer:
             elapsed_s = max(1.0, now_ts - start_time)
             live_fps = video_frame_count / elapsed_s if video_frame_count > 0 else 0.0
             fps_pressure = max(0.0, min(1.0, (10.5 - live_fps) / 10.5))
-            stall_pressure = max(0.0, min(1.0, (stall - 1.2) / 4.5))
-            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 4.0))
-            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.5))
+            stall_pressure = max(0.0, min(1.0, (stall - 0.8) / 3.0))
+            long_stall_pressure = max(0.0, min(1.0, long_stalls_recent / 3.0))
+            backlog_pressure = max(0.0, min(1.0, backlog_secs / 2.0))
             failure_pressure = max(0.0, min(1.0, skip_failures / 3.0))
             pressure = (
                 (0.30 * stall_pressure)
@@ -1761,12 +1833,12 @@ class P2PStreamer:
                 + (0.10 * failure_pressure)
             )
             if self._adaptive_lossy_gap_skip:
-                pressure = min(1.0, pressure + 0.12)
-            recovery_aggr = (recovery_aggr * 0.82) + (pressure * 0.18)
+                pressure = min(1.0, pressure + 0.15)
+            recovery_aggr = (recovery_aggr * 0.75) + (pressure * 0.25)
 
             nudge_interval = max(
-                0.16,
-                min(0.55, (0.18 + (backlog_secs * 0.10)) * (1.0 - (0.25 * recovery_aggr))),
+                0.03,
+                min(0.25, (0.06 + (backlog_secs * 0.04)) * (1.0 - (0.40 * recovery_aggr))),
             )
 
             if gap_pending and now_ts - last_nudge_time > nudge_interval:
@@ -1776,21 +1848,22 @@ class P2PStreamer:
 
             payload_idle = now_ts - last_kcp_payload_time
             gap_age = (now_ts - last_gap_since) if last_gap_since > 0.0 else 0.0
-            adaptive_wait_base = max(3.8, min(9.0, 6.0 - (0.65 * min(backlog_secs, 2.5))))
-            adaptive_wait = max(1.5, adaptive_wait_base * (1.0 - (0.40 * recovery_aggr)))
-            min_nudges_base = 4 if backlog_secs >= 2.0 else 5 if backlog_secs >= 1.0 else 6
-            min_nudges = max(2, int(round(min_nudges_base - (2.0 * recovery_aggr))))
+            adaptive_wait_base = max(2.5, min(6.0, 4.5 - (0.65 * min(backlog_secs, 2.5))))
+            adaptive_wait = max(1.4, adaptive_wait_base * (1.0 - (0.45 * recovery_aggr)))
+            min_nudges_base = 3 if backlog_secs >= 2.0 else 3 if backlog_secs >= 1.0 else 4
+            min_nudges = max(1, int(round(min_nudges_base - (2.0 * recovery_aggr))))
 
             if (
                 not self._allow_lossy_gap_skip
                 and not lossy_session_mode
                 and gap_pending
                 and (
-                    (stall > 2.8 and backlog_secs > 1.0)
+                    (stall > 2.5 and backlog_secs > 0.8)
                     or (
                         self._adaptive_lossy_gap_skip
                         and (now_ts - start_time) > 8.0
-                        and (stall > 2.2 or recovery_aggr > 0.40 or live_fps < 9.0)
+                        and stall > 2.0
+                        and (recovery_aggr > 0.40 or live_fps < 7.0)
                     )
                     or long_stalls_recent >= 1
                 )
@@ -1811,15 +1884,15 @@ class P2PStreamer:
                 or long_stalls_recent >= 2
             )
             if effective_lossy:
-                lossy_scale = 0.60 if self._allow_lossy_gap_skip else 0.72
-                lossy_scale = max(0.45, lossy_scale - (0.16 * recovery_aggr))
-                lossy_wait = max(1.2, min(3.2, adaptive_wait * lossy_scale))
+                lossy_scale = 0.50 if self._allow_lossy_gap_skip else 0.58
+                lossy_scale = max(0.35, lossy_scale - (0.18 * recovery_aggr))
+                lossy_wait = max(1.0, min(3.0, adaptive_wait * lossy_scale))
                 nudge_gate = max(
                     1,
                     min_nudges - (2 if self._adaptive_lossy_gap_skip else 1),
                 )
-                idle_gate = lossy_wait * (0.35 if self._adaptive_lossy_gap_skip else 0.45)
-                age_gate = lossy_wait * (0.40 if self._adaptive_lossy_gap_skip else 0.50)
+                idle_gate = lossy_wait * (0.20 if self._adaptive_lossy_gap_skip else 0.30)
+                age_gate = lossy_wait * (0.25 if self._adaptive_lossy_gap_skip else 0.35)
                 if (
                     gap_pending
                     and now_ts >= skip_backoff_until
@@ -1829,21 +1902,21 @@ class P2PStreamer:
                     and gap_nudges >= nudge_gate
                     and now_ts - last_skip_time > max(
                         0.8,
-                        (lossy_wait * 0.85) + (0.45 * skip_failures) - (0.60 * recovery_aggr),
+                        (lossy_wait * 0.55) + (0.25 * skip_failures) - (0.40 * recovery_aggr),
                     )
                 ):
                     severe_link = bool(
-                        stall > 7.0
-                        or backlog_secs > 2.8
-                        or long_stalls_recent >= 4
-                        or recovery_aggr > 0.80
+                        stall > 5.0
+                        or backlog_secs > 2.0
+                        or long_stalls_recent >= 3
+                        or recovery_aggr > 0.65
                     )
                     if self._allow_lossy_gap_skip:
                         skip_depth = None
                     elif severe_link:
                         skip_depth = None
                     elif self._adaptive_lossy_gap_skip or lossy_session_mode:
-                        skip_depth = 6
+                        skip_depth = None
                     else:
                         skip_depth = 4
                     if kcp.skip_gap(max_gaps=skip_depth):
@@ -1852,20 +1925,18 @@ class P2PStreamer:
                         drained = _drain_recv_queue()
                         if drained:
                             last_kcp_payload_time = time.time()
-                        audio_catchup_until = now_ts + min(1.0, max(0.4, backlog_secs * 0.30))
-                        audio_catchup_seen = 0
                         last_skip_video_time = last_video_time
-                        skip_expect_recovery_by = now_ts + 1.2
+                        skip_expect_recovery_by = now_ts + 0.8
                 return
 
             if (
                 gap_pending
                 and now_ts >= skip_backoff_until
                 and stall > adaptive_wait
-                and payload_idle > (adaptive_wait * 0.60)
+                and payload_idle > (adaptive_wait * 0.50)
                 and gap_age > adaptive_wait
                 and gap_nudges >= min_nudges
-                and now_ts - last_skip_time > max(4.0 + (skip_failures * 1.5), adaptive_wait)
+                and now_ts - last_skip_time > max(3.0 + (skip_failures * 1.0), adaptive_wait)
             ):
                 if kcp.skip_gap(max_gaps=1):
                     last_skip_time = now_ts
@@ -1884,10 +1955,8 @@ class P2PStreamer:
                     drained = _drain_recv_queue()
                     if drained:
                         last_kcp_payload_time = time.time()
-                    audio_catchup_until = now_ts + min(1.2, max(0.5, backlog_secs * 0.35))
-                    audio_catchup_seen = 0
                     last_skip_video_time = last_video_time
-                    skip_expect_recovery_by = now_ts + 1.2
+                    skip_expect_recovery_by = now_ts + 0.8
 
             if (
                 gap_pending
@@ -1965,6 +2034,7 @@ class P2PStreamer:
             start_live = build_vvp_packet(
                 cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                 host_key=host_key, param=8, licence_id=licence_id,
+                quality=self._vvp_quality,
             )
             kcp.send_iva_data(start_live)
             vvp_seq += 1
@@ -1976,7 +2046,7 @@ class P2PStreamer:
         while self._running:
             if not _recv_buf:
                 kcp.flush_acks()
-                turn.sock.settimeout(0.5)
+                turn.sock.settimeout(0.08)
                 try:
                     raw, addr = turn.sock.recvfrom(65536)
                     _recv_buf.append((raw, addr))
@@ -1989,7 +2059,7 @@ class P2PStreamer:
                         pass
                     finally:
                         turn.sock.setblocking(True)
-                        turn.sock.settimeout(0.5)
+                        turn.sock.settimeout(0.08)
                 except socket.timeout:
                     now = time.time()
                     if not self._running:
@@ -2007,6 +2077,7 @@ class P2PStreamer:
                         start_live = build_vvp_packet(
                             cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                             host_key=host_key, param=8, licence_id=licence_id,
+                            quality=self._vvp_quality,
                         )
                         kcp.send_iva_data(start_live)
                         vvp_seq += 1
@@ -2149,6 +2220,7 @@ class P2PStreamer:
                 start_live = build_vvp_packet(
                     cmd=VVP_CMD_START_LIVE, seq=vvp_seq,
                     host_key=host_key, param=8, licence_id=licence_id,
+                    quality=self._vvp_quality,
                 )
                 kcp.send_iva_data(start_live)
                 vvp_seq += 1

@@ -297,7 +297,7 @@ class KcpTunnel:
         # Check if there's actually a gap at next_recv_sn
         if self.next_recv_sn in self.recv_buf:
             return False  # No gap — will be assembled on next process_input
-        above_gap = sorted(sn for sn in self.recv_buf if sn > self.next_recv_sn)[:20]
+        above_gap = sorted(sn for sn in self.recv_buf if sn > self.next_recv_sn)[:96]
         if not above_gap:
             return False
         una = max(self.next_recv_sn, 0)
@@ -310,7 +310,11 @@ class KcpTunnel:
                 wnd=KCP_WND,
                 ts=self._ts(),
             )
-        self.send_func(bytes(buf))
+            if len(buf) >= 1200:
+                self.send_func(bytes(buf))
+                buf.clear()
+        if buf:
+            self.send_func(bytes(buf))
         return True
 
     def skip_gap(self, max_gaps: int | None = None):
