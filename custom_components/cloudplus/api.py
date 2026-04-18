@@ -615,6 +615,51 @@ class MeariApiClient:
         })
         return resp.get("action") == "set"
 
+    def ptz_start(self, sn_num: str, direction: str, *, use_ptz2: bool = True) -> bool:
+        """Send a PTZ start command for the given direction.
+
+        Uses IoT code 841 (ptz2) when *use_ptz2* is True, else 807 (ptz).
+        The command is sent WITHOUT ``target=server`` so it reaches the
+        device directly (as the official app does for codes 800-899).
+        """
+        from .const import (
+            IOT_CODE_PTZ_START, IOT_CODE_PTZ2_START, PTZ_DIRECTIONS,
+        )
+        ps, ts = PTZ_DIRECTIONS.get(direction, (0, 0))
+        code = IOT_CODE_PTZ2_START if use_ptz2 else IOT_CODE_PTZ_START
+        value_str = json.dumps({"ps": ps, "ts": ts, "zs": 0}, separators=(",", ":"))
+
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "set", "name": "iot", "iot": {code: value_str}},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get("/openapi/device/config", {
+            "action": "set",
+            "params": params_b64,
+            "deviceid": dev_uuid,
+        })
+        return "errid" not in resp
+
+    def ptz_stop(self, sn_num: str, *, use_ptz2: bool = True) -> bool:
+        """Send a PTZ stop command."""
+        from .const import IOT_CODE_PTZ_STOP, IOT_CODE_PTZ2_STOP
+        code = IOT_CODE_PTZ2_STOP if use_ptz2 else IOT_CODE_PTZ_STOP
+
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "set", "name": "iot", "iot": {code: "{}"}},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get("/openapi/device/config", {
+            "action": "set",
+            "params": params_b64,
+            "deviceid": dev_uuid,
+        })
+        return "errid" not in resp
+
     def wake_device(self, sn_num: str, device_id: int) -> bool:
         """Wake a dormant camera using both OpenAPI and HTTP methods."""
         success = False

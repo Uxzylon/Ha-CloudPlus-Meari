@@ -1,0 +1,33 @@
+ptz:
+  name: PTZ Control
+  description: Control PTZ (Pan-Tilt-Zoom) movement on a CloudEdge / Meari camera.
+  target:
+    entity:
+      integration: cloudplus
+      domain: camera
+  fields:
+    action:
+      name: Action
+      description: The PTZ action to perform.
+      required: true
+      selector:
+        select:
+          options:
+            - label: Move
+              value: move
+            - label: Stop
+              value: stop
+    argument:
+      name: Argument
+      description: Direction for the move action.
+      selector:
+        select:
+          options:
+            - label: Left
+              value: left
+            - label: Right
+              value: right
+            - label: Up
+              value: up
+            - label: Down
+              value: down
