@@ -22,8 +22,6 @@ import struct
 import subprocess
 import threading
 import time
-from __future__ import annotations
-
 from typing import Any, Callable, TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
@@ -98,6 +96,11 @@ class CloudEdgeMeariCoordinator:
         except Exception:
             pass
         self._has_lamp = self._capabilities.get("led") == 1
+        self._has_ptz = (
+            self._capabilities.get("ptz") == 1
+            or self._capabilities.get("ptz2") == 1
+        )
+        self._has_ptz2 = self._capabilities.get("ptz2") == 1
         self._motion_timeout = DEFAULT_MOTION_TIMEOUT
         self._initial_frame_grab = initial_frame_grab
         self._initial_grab_timeout = max(3, min(initial_grab_timeout, 45))
@@ -381,6 +384,10 @@ class CloudEdgeMeariCoordinator:
     @property
     def lamp_on(self) -> bool:
         return self._lamp_on
+
+    @property
+    def has_ptz(self) -> bool:
+        return self._has_ptz
 
     @property
     def stream_host_mode(self) -> str:
@@ -3275,3 +3282,30 @@ class CloudEdgeMeariCoordinator:
             self._fire_update()
         except Exception as e:
             _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
+
+    def ptz_move(self, direction: str) -> None:
+        """Start PTZ movement in the given direction (left/right/up/down)."""
+        if not self._has_ptz:
+            _LOGGER.warning("PTZ not supported on %s", self._sn_num)
+            return
+        if not self._api:
+            return
+        try:
+            self._api.ptz_start(
+                self._sn_num, direction, use_ptz2=self._has_ptz2,
+            )
+            _LOGGER.info("PTZ move %s on %s", direction, self._sn_num)
+        except Exception as e:
+            _LOGGER.warning("PTZ move failed for %s: %s", self._sn_num, e)
+
+    def ptz_stop(self) -> None:
+        """Stop any ongoing PTZ movement."""
+        if not self._has_ptz:
+            return
+        if not self._api:
+            return
+        try:
+            self._api.ptz_stop(self._sn_num, use_ptz2=self._has_ptz2)
+            _LOGGER.info("PTZ stop on %s", self._sn_num)
+        except Exception as e:
+            _LOGGER.warning("PTZ stop failed for %s: %s", self._sn_num, e)

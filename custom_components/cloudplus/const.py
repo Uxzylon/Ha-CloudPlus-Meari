@@ -46,6 +46,20 @@ BATTERY_CODES = "153,154,155,156,1007"
 # IoT Model codes for device features
 IOT_CODE_LAMP = "167"
 
+# PTZ IoT codes
+IOT_CODE_PTZ_START = "807"
+IOT_CODE_PTZ_STOP = "808"
+IOT_CODE_PTZ2_START = "841"
+IOT_CODE_PTZ2_STOP = "842"
+
+# PTZ direction → (pan_speed, tilt_speed) mapping
+PTZ_DIRECTIONS: dict[str, tuple[int, int]] = {
+    "left": (-80, 0),
+    "right": (80, 0),
+    "up": (0, 20),
+    "down": (0, -20),
+}
+
 # Motion-related alarm types (from motion_detector.py)
 MOTION_ALARM_TYPES = {1, 2, 11, 20}
 
