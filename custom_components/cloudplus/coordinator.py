@@ -40,6 +40,14 @@ from .api import MeariApiClient, format_sn
 from .motion_event import parse_motion_event
 from .p2p_streamer import P2PStreamer
 
+from .meari_commands import (
+    BATTERY_PERCENT,
+    CHARGE_STATUS,
+    FLIGHT_LIGHT_SWITCH,
+    SLEEP_MODE
+)
+
+
 _LOGGER = logging.getLogger(__name__)
 
 # Polling intervals
@@ -95,7 +103,52 @@ class CloudEdgeMeariCoordinator:
                 self._capabilities = cap.get("caps", {})
         except Exception:
             pass
+
         self._has_lamp = self._capabilities.get("led") == 1
+
+        self._has_motion_det = self._capabilities.get("md") == 1            # Motion Detection
+        self._has_pir = self._capabilities.get("pir") == 1                  # PIR Sensor
+        self._has_person_det = self._capabilities.get("pdt") == 1           # Person Detection (AI)
+        self._has_noise_det = self._capabilities.get("nst") == 1            # Noise Detection
+        self._has_cry_det = self._capabilities.get("cct") == 1              # Crying Detection
+        self._has_temp_sensor = self._capabilities.get("tmpr") == 1         # Temperature Sensor
+        self._has_hmd_sensor = self._capabilities.get("hmd") == 1           # Humidity Sensor
+        self._has_abnormal_noise = self._capabilities.get("nms") == 1       # Abnormal Noise Detection
+        self._has_face_det = self._capabilities.get("fcd") == 1             # Face Detection
+
+        self._has_ptz = self._capabilities.get("ptz") == 1                  # Pan-Tilt-Zoom
+        self._has_ptz_dual = self._capabilities.get("ptz2") == 1            # Secondary PTZ Camera
+        self._has_sd_card = self._capabilities.get("sd") == 1               # SD Card Slot
+        self._has_sd_card_2 = self._capabilities.get("sd2") == 1            # Secondary SD Card Slot
+        self._is_battery_powered = self._capabilities.get("bat") == 1       # Battery Powered Device
+        self._has_relay = self._capabilities.get("rly") == 1                # Relay/Clean Contact
+        self._has_gps = self._capabilities.get("geo") == 1                  # Geofencing/GPS
+        self._has_doorbell = self._capabilities.get("dor") == 1             # Doorbell Functions
+
+        self._has_status_led = self._capabilities.get("led") == 1           # Status LED
+        self._has_floodlight = self._capabilities.get("flt") == 1           # Floodlight
+        self._has_siren = self._capabilities.get("sir") == 1                # Acoustic Siren
+        self._has_rgb_light = self._capabilities.get("rgb") == 1            # Colored LED Lights
+        self._has_infrared = self._capabilities.get("ir") == 1              # Infrared (IR)
+
+        self._has_microphone = self._capabilities.get("men") == 1           # Microphone Enable
+        self._has_speaker = self._capabilities.get("sen") == 1              # Speaker Enable
+        self._has_music_player = self._capabilities.get("mpc") == 1         # Music Playback Control
+        self._has_voice_alarm = self._capabilities.get("voi") == 1          # Voice Alarm Messages
+
+        self._has_sleep_mode = self._capabilities.get("slp") == 1           # Privacy/Sleep Mode
+        self._has_pet_functions = self._capabilities.get("pet") == 1        # Pet Functions
+        self._has_pet_feeder = self._capabilities.get("pfp") == 1           # Pet Feeder
+        self._has_homekit = self._capabilities.get("hkt") == 1              # Apple HomeKit Support
+        self._has_baby_monitor = self._capabilities.get("mrda") == 1        # Advanced Baby Monitor Functions
+        self._has_ota_updates = self._capabilities.get("ota") == 1          # Firmware Updates
+
+        self._has_onvif = self._capabilities.get("ovf") == 1                # ONVIF Protocol
+        self._has_p2p = self._capabilities.get("p2p") == 1                  # P2P Connection
+        self._has_anti_jamming = self._capabilities.get("ajs") == 1         # Anti-Jamming
+        self._has_video_pwd = self._capabilities.get("vst") == 1            # Video Password (Encryption)
+        self._has_bluetooth = self._capabilities.get("ble") == 1            # Bluetooth Low Energy
+
         self._has_ptz = (
             self._capabilities.get("ptz") == 1
             or self._capabilities.get("ptz2") == 1
@@ -152,6 +205,7 @@ class CloudEdgeMeariCoordinator:
 
         # Lamp state
         self._lamp_on: bool = False
+        self._sleep_mode: bool = False
 
         # Background thread
         self._thread: threading.Thread | None = None
@@ -285,8 +339,8 @@ class CloudEdgeMeariCoordinator:
             info = api.get_battery_info(self._sn_num)
             if not info:
                 return
-            pct = info.get("154")
-            charge = info.get("156")
+            pct = info.get(BATTERY_PERCENT)
+            charge = info.get(CHARGE_STATUS)
             if pct is not None:
                 pct_int = int(pct)
                 if 0 <= pct_int <= 100:
@@ -296,17 +350,23 @@ class CloudEdgeMeariCoordinator:
         except Exception as exc:
             _LOGGER.warning("Prefetch battery failed for %s: %s", self._sn_num, exc)
 
-    def prefetch_lamp(self, api: "MeariApiClient") -> None:
-        """Pre-load lamp state using an already-authenticated API client."""
-        if not self._has_lamp:
-            return
+    def prefetch_status(self, api: "MeariApiClient") -> None:
+        """Pre-load status using an already-authenticated API client."""
         try:
             iot = api.get_device_iot_config(self._sn_num)
             if not iot:
                 return
-            lamp_val = iot.get("167")
-            if lamp_val is not None:
-                self._lamp_on = int(lamp_val) == 1
+
+            if self._has_lamp:
+                lamp_val = iot.get(FLIGHT_LIGHT_SWITCH)
+                if lamp_val is not None:
+                    self._lamp_on = int(lamp_val) == 1
+
+            if self._has_sleep_mode:
+                sleep_val = iot.get(SLEEP_MODE)
+                if sleep_val is not None:
+                    self._sleep_mode = int(sleep_val) == 1
+
         except Exception as exc:
             _LOGGER.warning("Prefetch lamp failed for %s: %s", self._sn_num, exc)
 
@@ -384,6 +444,14 @@ class CloudEdgeMeariCoordinator:
     @property
     def lamp_on(self) -> bool:
         return self._lamp_on
+
+    @property
+    def has_sleep_mode(self) -> bool:
+        return self._has_sleep_mode
+
+    @property
+    def sleep_mode(self) -> bool:
+        return self._sleep_mode
 
     @property
     def has_ptz(self) -> bool:
@@ -3029,9 +3097,8 @@ class CloudEdgeMeariCoordinator:
         if self._is_snap:
             self._poll_battery()
 
-        # Initial lamp state poll
-        if self._has_lamp:
-            self._poll_lamp()
+        # Initial state poll
+        self._poll_status()
 
         # Optional startup frame grab (enabled by default for HA integration).
         # Dev/test tooling can disable this to reduce startup-to-live latency.
@@ -3089,7 +3156,7 @@ class CloudEdgeMeariCoordinator:
         _LOGGER.info("Connected and listening for %s", self._sn_num)
 
         last_battery_poll = time.time()
-        last_lamp_poll = time.time()
+        last_status_poll = time.time()
         motion_deadline = 0.0  # Not streaming yet
 
         try:
@@ -3175,9 +3242,9 @@ class CloudEdgeMeariCoordinator:
                         self._begin_streaming(api)
 
                 # Periodic lamp state poll (all camera types)
-                if self._has_lamp and now - last_lamp_poll >= BATTERY_POLL_INTERVAL:
-                    self._poll_lamp()
-                    last_lamp_poll = now
+                if now - last_status_poll >= BATTERY_POLL_INTERVAL:
+                    self._poll_status()
+                    last_status_poll = now
 
                 time.sleep(1)
 
@@ -3212,8 +3279,8 @@ class CloudEdgeMeariCoordinator:
                         continue
                     return
 
-                pct = info.get("154")
-                charge = info.get("156")
+                pct = info.get(BATTERY_PERCENT)
+                charge = info.get(CHARGE_STATUS)
 
                 if pct is not None:
                     try:
@@ -3251,22 +3318,38 @@ class CloudEdgeMeariCoordinator:
                 else:
                     _LOGGER.warning("Battery poll failed for %s: %s", self._sn_num, e)
 
-    def _poll_lamp(self) -> None:
-        """Poll lamp state from the device IoT config."""
-        if not self._has_lamp:
-            return
+    def _poll_status(self) -> None:
+        """Poll status from the device IoT config."""
+        #if not self._has_lamp:
+        #    return
         if not self._api:
             return
         try:
             iot = self._api.get_device_iot_config(self._sn_num)
             if not iot:
                 return
-            lamp_val = iot.get("167")
-            if lamp_val is not None:
-                is_on = int(lamp_val) == 1
-                if self._lamp_on != is_on:
-                    self._lamp_on = is_on
-                    self._fire_update()
+
+            need_update = False
+
+            if self._has_lamp:
+                lamp_val = iot.get(FLIGHT_LIGHT_SWITCH)
+                if lamp_val is not None:
+                    is_on = int(lamp_val) == 1
+                    if self._lamp_on != is_on:
+                        self._lamp_on = is_on
+                        need_update = True
+
+            if self._has_sleep_mode:
+                sleep_val = iot.get(SLEEP_MODE)
+                if sleep_val is not None:
+                    is_on = int(sleep_val) == 1
+                    if self._sleep_mode != is_on:
+                        self._lamp_sleep_mode_on = is_on
+                        need_update = True
+
+            if need_update:
+                self._fire_update()
+
         except Exception as e:
             _LOGGER.debug("Lamp poll failed for %s: %s", self._sn_num, e)
 
@@ -3277,11 +3360,25 @@ class CloudEdgeMeariCoordinator:
         if not self._api:
             return
         try:
-            self._api.set_device_iot_value(self._sn_num, "167", 1 if on else 0)
+            self._api.set_device_iot_value(self._sn_num, FLIGHT_LIGHT_SWITCH, 1 if on else 0)
             self._lamp_on = on
             self._fire_update()
         except Exception as e:
             _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
+
+    def set_sleep_mode(self, on: bool) -> None:
+        """Turn the lamp on or off via the API."""
+        if not self._has_lamp:
+            return
+        if not self._api:
+            return
+        try:
+            self._api.set_device_iot_value(self._sn_num, SLEEP_MODE, 1 if on else 0)
+            self._sleep_mode = on
+            self._fire_update()
+        except Exception as e:
+            _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
+
 
     def ptz_move(self, direction: str) -> None:
         """Start PTZ movement in the given direction (left/right/up/down)."""
