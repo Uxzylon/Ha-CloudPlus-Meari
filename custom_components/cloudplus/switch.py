@@ -29,6 +29,8 @@ async def async_setup_entry(
             entities.append(CloudEdgeMeariMotionWakeSwitch(coord, entry))
         if coord.has_lamp:
             entities.append(CloudEdgeMeariLampSwitch(coord, entry))
+        if coord.has_sleep_mode:
+            entities.append(CloudEdgeMeariSleepModeSwitch(coord, entry))
     async_add_entities(entities)
 
 
@@ -131,4 +133,55 @@ class CloudEdgeMeariLampSwitch(SwitchEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the lamp."""
         await self.hass.async_add_executor_job(self._coordinator.set_lamp, False)
+        self.async_write_ha_state()
+
+
+class CloudEdgeMeariSleepModeSwitch(SwitchEntity):
+    """Switch to control the camera's sleep mode."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Sleep Mode"
+    _attr_icon = "mdi:sleep"
+
+    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._attr_unique_id = f"{coordinator.device_uuid}_sleep_mode"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, coordinator.device_uuid)},
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
+            "model": coordinator.device_model,
+        }
+        self._unsub_update: Any = None
+
+    async def async_added_to_hass(self) -> None:
+        self._unsub_update = self._coordinator.register_update_callback(
+            self._handle_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_update:
+            self._unsub_update()
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return self._coordinator.available and self._coordinator.has_sleep_mode
+
+    @property
+    def is_on(self) -> bool:
+        return self._coordinator.sleep_mode
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn on the lamp."""
+        await self.hass.async_add_executor_job(self._coordinator.set_sleep_mode, True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn off the lamp."""
+        await self.hass.async_add_executor_job(self._coordinator.set_sleep_mode, False)
         self.async_write_ha_state()
