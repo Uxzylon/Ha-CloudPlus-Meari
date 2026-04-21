@@ -55,6 +55,14 @@ APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
         "partner_id": "8",
         "ttid": TTID,
     },
+    "iegeek": {
+        "source_app": "81",
+        "app_ver": "5.5.2",
+        "app_ver_code": "552",
+        "redirect_url": REDIRECT_URL,
+        "partner_id": "81",
+        "ttid": TTID,
+    },
 }
 
 
