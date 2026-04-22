@@ -11,23 +11,12 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import (
-    SensorDeviceClass,
-    SensorEntity,
-    SensorStateClass,
-)
-from homeassistant.const import PERCENTAGE, UnitOfTemperature
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
-from .meari_commands import (
-    BATTERY_PERCENT,
-    CHARGE_STATUS,
-    HUMIDITY,
-    TEMPERATURE,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,160 +28,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up CloudEdge / Meari sensors from a config entry."""
     coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
-    entities: list[SensorEntity] = []
-    for coord in coordinators:
-        if coord._is_battery_powered:
-            entities.append(CloudEdgeMeariBatterySensor(coord, entry))
-            entities.append(CloudEdgeMeariChargeStatusSensor(coord, entry))
-
-        # Generic IoT Sensors
-        if coord._has_temp_sensor:
-            entities.append(CloudEdgeMeariTemperatureSensor(coord, entry))
-        if coord._has_hmd_sensor:
-            entities.append(CloudEdgeMeariHumiditySensor(coord, entry))
-
-    async_add_entities(entities)
-
-
-class CloudEdgeMeariTemperatureSensor(SensorEntity):
-    """Sensor for camera temperature."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Temperature"
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
-        self._attr_unique_id = f"{coordinator.device_uuid}_temperature"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available and self._coordinator.get_iot_value(TEMPERATURE) is not None
-
-    @property
-    def native_value(self) -> float | None:
-        val = self._coordinator.get_iot_value(TEMPERATURE)
-        if val is None:
-            return None
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
-
-
-class CloudEdgeMeariHumiditySensor(SensorEntity):
-    """Sensor for camera humidity."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Humidity"
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_device_class = SensorDeviceClass.HUMIDITY
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
-        self._attr_unique_id = f"{coordinator.device_uuid}_humidity"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available and self._coordinator.get_iot_value(HUMIDITY) is not None
-
-    @property
-    def native_value(self) -> float | None:
-        val = self._coordinator.get_iot_value(HUMIDITY)
-        if val is None:
-            return None
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
-
-
-class CloudEdgeMeariChargeStatusSensor(SensorEntity):
-    """Sensor for battery charge status."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Charge Status"
-    _attr_icon = "mdi:battery-charging"
-
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
-        self._attr_unique_id = f"{coordinator.device_uuid}_charge_status"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available
-
-    @property
-    def native_value(self) -> str:
-        if self._coordinator.battery_charging:
-            return "Charging"
-        return "Not Charging"
+    async_add_entities(
+        [
+            CloudEdgeMeariBatterySensor(coord, entry)
+            for coord in coordinators
+            if coord.is_battery_camera
+        ]
+    )
 
 
 class CloudEdgeMeariBatterySensor(SensorEntity):
@@ -205,7 +47,9 @@ class CloudEdgeMeariBatterySensor(SensorEntity):
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_icon = "mdi:battery"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_battery"

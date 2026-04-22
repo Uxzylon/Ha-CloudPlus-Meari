@@ -32,7 +32,9 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_PASSWORD): str,
         vol.Optional(CONF_COUNTRY_CODE, default=DEFAULT_COUNTRY_CODE): str,
         vol.Optional(CONF_PHONE_CODE, default=DEFAULT_PHONE_CODE): str,
-        vol.Optional(CONF_APP_PROFILE, default=DEFAULT_APP_PROFILE): selector.SelectSelector(
+        vol.Optional(
+            CONF_APP_PROFILE, default=DEFAULT_APP_PROFILE
+        ): selector.SelectSelector(
             selector.SelectSelectorConfig(
                 options=[
                     selector.SelectOptionDict(value=profile, label=profile.capitalize())
@@ -59,8 +61,14 @@ class CloudEdgeMeariConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             email = user_input[CONF_EMAIL].strip()
             password = user_input[CONF_PASSWORD]
-            country_code = user_input.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE).strip().upper()
-            phone_code = str(user_input.get(CONF_PHONE_CODE, DEFAULT_PHONE_CODE)).strip().lstrip("+")
+            country_code = (
+                user_input.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE).strip().upper()
+            )
+            phone_code = (
+                str(user_input.get(CONF_PHONE_CODE, DEFAULT_PHONE_CODE))
+                .strip()
+                .lstrip("+")
+            )
             app_profile = user_input.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE)
 
             client = MeariApiClient(
