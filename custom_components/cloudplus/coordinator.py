@@ -41,10 +41,91 @@ from .motion_event import parse_motion_event
 from .p2p_streamer import P2PStreamer
 
 from .meari_commands import (
+    ABNORMAL_NOISE_ENABLE,
+    ALARM_FREQUENCY,
+    ANTI_JAMMING,
+    AUTO_UPDATE,
     BATTERY_PERCENT,
+    BELL_PHONE,
+    BLE_SWITCH,
     CHARGE_STATUS,
+    CHIME_PRO_MOTION_VOLUME,
+    CHIME_PRO_RING_TYPE,
+    CHIME_PRO_RING_VOLUME,
+    COME_DEVICE_VOLUME,
+    CRY_DET_ENABLE,
+    DAY_NIGHT_MODE,
+    FACE_RECOGNITION_SWITCH,
+    FLIGHT_BRIGHTNESS,
     FLIGHT_LIGHT_SWITCH,
-    SLEEP_MODE
+    FLIGHT_LINK_LIGHTING_ENABLE,
+    FLIGHT_LINK_SIREN_ENABLE,
+    FLIGHT_MANUAL_LIGHTING_DURATION,
+    FLIGHT_PIR_DURATION,
+    FRAME_RATE,
+    FULL_COLOR_MODE,
+    H265_ENABLE,
+    HOMEKIT_ENABLE,
+    HUMAN_DET_ENABLE,
+    HUMAN_FRAME_ENABLE,
+    HUMAN_SENSITIVITY_LEVEL,
+    HUMAN_TRACK_ENABLE,
+    INFRARED_LIGHT,
+    JINGLE_VOLUME,
+    LANGUAGE,
+    LASER_SWITCH,
+    LED_ENABLE,
+    LOGO_SWITCH,
+    MEN_PHONE,
+    MONITOR_TIME_SWITCH,
+    MOTION_DET_ENABLE,
+    MOTION_DET_SENSITIVITY,
+    MUSIC_PLAY_MODE,
+    MUSIC_VOLUME,
+    NO_FLK,
+    ONVIF_ENABLE,
+    OSD_ENABLE,
+    OSD_STYLE,
+    PET_ALARM,
+    PET_ALARM_ENABLE,
+    PET_THROW_WARNING,
+    PIR_DET_ENABLE,
+    PIR_DET_SENSITIVITY,
+    PIR_JIM,
+    PIR_TRIGGER_INTERVAL,
+    PLUG_LOW_POWER_MODE,
+    POWER_ON_VOLUME,
+    RAE_SOUND,
+    RECORD_RESOLUTION,
+    RECORD_SWITCH,
+    RELAY_ENABLE,
+    RGB_LIGHT_MODE,
+    RGB_LIGHT_SWITCH,
+    SD_RECORD_TYPE,
+    SEN_SOUND,
+    SHOT_RESOLUTION,
+    SHOT_TYPE,
+    SLEEP_MODE,
+    SMART_DET,
+    SMART_DET_FRAME,
+    SMART_DET_SENSITIVITY,
+    SOT_TIME,
+    SOUND_DET_ENABLE,
+    SOUND_DET_SENSITIVITY,
+    SOUND_LIGHT_ENABLE,
+    SOUND_LIGHT_TYPE,
+    SOUND_SWITCH,
+    SPEAK_VOLUME,
+    TEASE_DURATION,
+    TEASE_MODE,
+    TIME_FORMAT_SWITCH,
+    TIMED_PTZ_PATROL,
+    TIMING_SHOT,
+    TIMING_SHOT_SWITCH,
+    UPLOAD_VIDEO,
+    WARM_LIGHT_BRI,
+    WIRELESS_CHIME_ENABLE,
+    WIRELESS_CHIME_VOLUME,
 )
 
 
@@ -104,56 +185,106 @@ class CloudEdgeMeariCoordinator:
         except Exception:
             pass
 
-        self._has_lamp = self._capabilities.get("led") == 1
+        # Detection Capabilities (Refined from MeariDeviceUtil.java)
+        self._has_motion_det = self._capabilities.get("md", 0) > 0
+        self._has_person_det = self._capabilities.get("pdt", 0) > 0
+        self._has_noise_det = self._capabilities.get("nst", 0) > 0
+        self._has_cry_det = self._capabilities.get("cct", 0) > 0
+        self._has_face_det = self._capabilities.get("fcd", 0) > 0
+        self._has_pet_alarm = self._capabilities.get("pet", 0) > 0
+        self._has_abnormal_noise = self._capabilities.get("nms", 0) > 0
 
-        self._has_motion_det = self._capabilities.get("md") == 1            # Motion Detection
-        self._has_pir = self._capabilities.get("pir") == 1                  # PIR Sensor
-        self._has_person_det = self._capabilities.get("pdt") == 1           # Person Detection (AI)
-        self._has_noise_det = self._capabilities.get("nst") == 1            # Noise Detection
-        self._has_cry_det = self._capabilities.get("cct") == 1              # Crying Detection
-        self._has_temp_sensor = self._capabilities.get("tmpr") == 1         # Temperature Sensor
-        self._has_hmd_sensor = self._capabilities.get("hmd") == 1           # Humidity Sensor
-        self._has_abnormal_noise = self._capabilities.get("nms") == 1       # Abnormal Noise Detection
-        self._has_face_det = self._capabilities.get("fcd") == 1             # Face Detection
+        # PIR Logic from isSupportPir
+        pir = self._capabilities.get("pir", 0)
+        flt = self._capabilities.get("flt", 0)
+        plv = self._capabilities.get("plv", 0)  # MultiLevelPir
+        self._has_pir = (pir != 5 and pir != 7 and flt != 1) and (pir > 0 or plv > 0)
+        self._has_double_pir = (pir == 5 or pir == 6)
 
-        self._has_ptz = self._capabilities.get("ptz") == 1                  # Pan-Tilt-Zoom
-        self._has_ptz_dual = self._capabilities.get("ptz2") == 1            # Secondary PTZ Camera
-        self._has_sd_card = self._capabilities.get("sd") == 1               # SD Card Slot
-        self._has_sd_card_2 = self._capabilities.get("sd2") == 1            # Secondary SD Card Slot
-        self._is_battery_powered = self._capabilities.get("bat") == 1       # Battery Powered Device
-        self._has_relay = self._capabilities.get("rly") == 1                # Relay/Clean Contact
-        self._has_gps = self._capabilities.get("geo") == 1                  # Geofencing/GPS
-        self._has_doorbell = self._capabilities.get("dor") == 1             # Doorbell Functions
+        # Power & Low Power
+        dev_type = device.get("devTypeID", 0)
+        ver = self._capabilities.get("ver", 0)
+        pwm = self._capabilities.get("pwm", 0)
+        bat = self._capabilities.get("bat", 0)
+        if ver >= 6:
+            self._is_low_power = pwm > 0 or dev_type == 6
+        else:
+            self._is_low_power = dev_type == 4 or dev_type == 5
+        self._is_battery_powered = bat == 1 or self._is_low_power
 
-        self._has_status_led = self._capabilities.get("led") == 1           # Status LED
-        self._has_floodlight = self._capabilities.get("flt") == 1           # Floodlight
-        self._has_siren = self._capabilities.get("sir") == 1                # Acoustic Siren
-        self._has_rgb_light = self._capabilities.get("rgb") == 1            # Colored LED Lights
-        self._has_infrared = self._capabilities.get("ir") == 1              # Infrared (IR)
+        # PTZ Logic from isSupportPtz
+        ptz = self._capabilities.get("ptz", 0)
+        ptz2 = self._capabilities.get("ptz2", 0)
+        self._has_ptz = ptz > 0 or ptz2 > 0
+        self._has_ptz2 = ptz2 > 0 or not self._device.get("msc", "") == ""
+        pcr = self._capabilities.get("pcr", 0)
+        self._has_ptz_patrol = (pcr & 4) == 4
+        self._has_ptz_presets = (pcr & 1) == 1
+        self._has_ptz_calibration = self._capabilities.get("ptc", 0) == 1
 
-        self._has_microphone = self._capabilities.get("men") == 1           # Microphone Enable
-        self._has_speaker = self._capabilities.get("sen") == 1              # Speaker Enable
-        self._has_music_player = self._capabilities.get("mpc") == 1         # Music Playback Control
-        self._has_voice_alarm = self._capabilities.get("voi") == 1          # Voice Alarm Messages
+        # Audio Logic
+        self._has_microphone = self._capabilities.get("men", 0) > 0
+        ovc = self._capabilities.get("ovc", 0)
+        if ver >= 18:
+            self._has_speaker = ovc > 0
+        else:
+            self._has_speaker = dev_type == 4 or dev_type == 5
 
-        self._has_sleep_mode = self._capabilities.get("slp") == 1           # Privacy/Sleep Mode
-        self._has_pet_functions = self._capabilities.get("pet") == 1        # Pet Functions
-        self._has_pet_feeder = self._capabilities.get("pfp") == 1           # Pet Feeder
-        self._has_homekit = self._capabilities.get("hkt") == 1              # Apple HomeKit Support
-        self._has_baby_monitor = self._capabilities.get("mrda") == 1        # Advanced Baby Monitor Functions
-        self._has_ota_updates = self._capabilities.get("ota") == 1          # Firmware Updates
+        # Storage
+        if ver >= 6:
+            self._has_sd_card = self._capabilities.get("sd", 0) > 0
+        else:
+            self._has_sd_card = dev_type != 6
+        self._has_sd_card_2 = self._capabilities.get("sd2", 0) > 0
 
-        self._has_onvif = self._capabilities.get("ovf") == 1                # ONVIF Protocol
-        self._has_p2p = self._capabilities.get("p2p") == 1                  # P2P Connection
-        self._has_anti_jamming = self._capabilities.get("ajs") == 1         # Anti-Jamming
-        self._has_video_pwd = self._capabilities.get("vst") == 1            # Video Password (Encryption)
-        self._has_bluetooth = self._capabilities.get("ble") == 1            # Bluetooth Low Energy
+        # Lighting & Siren
+        self._has_status_led = self._capabilities.get("led", 0) > 0
+        self._has_floodlight = self._capabilities.get("flt", 0) > 0
+        ltl = self._capabilities.get("ltl", 0)
+        if flt == 2:
+            self._has_light_brightness = (ltl > 0) if ver >= 41 else True
+        else:
+            self._has_light_brightness = ltl > 0
 
-        self._has_ptz = (
-            self._capabilities.get("ptz") == 1
-            or self._capabilities.get("ptz2") == 1
-        )
-        self._has_ptz2 = self._capabilities.get("ptz2") == 1
+        self._has_siren = self._capabilities.get("sir", 0) > 0
+        sla = self._capabilities.get("sla", 0)
+        self._has_siren_alarm = (sla & 8) == 8 or (sla & 16) == 16
+        self._has_rgb_light = self._capabilities.get("rgb", 0) > 0
+        self._has_infrared = self._capabilities.get("ir", 0) > 0
+        self._has_warm_light = self._capabilities.get("wml", 0) > 0
+        self._has_white_light = self._capabilities.get("wtl", 0) > 0
+        self._has_laser = self._capabilities.get("las", 0) > 0
+
+        # Doorbell / Chime Logic (RNG field)
+        rng = self._capabilities.get("rng", -1)
+        self._has_mechanical_bell = rng != -1 and (rng & 1) == 1
+        self._has_wireless_bell = rng != -1 and (rng & 62) != 0  # 2|4|8|16|32
+        self._has_doorbell = self._capabilities.get("dor", 0) > 0
+
+        # System & AI
+        if ver >= 9:
+            self._has_sleep_mode = self._capabilities.get("slp", 0) > 0
+        else:
+            self._has_sleep_mode = not self._is_low_power
+
+        self._has_human_track = self._capabilities.get("ptr", 0) > 0
+        self._has_homekit = self._capabilities.get("hkt", 0) > 0
+        self._has_baby_monitor = self._capabilities.get("mrda", 0) > 0
+        self._has_ota_updates = self._capabilities.get("ota", 0) > 0
+        self._has_onvif = self._capabilities.get("ovf", 0) > 0
+        self._has_p2p = self._capabilities.get("p2p", 0) > 0
+        self._has_anti_jamming = self._capabilities.get("ajs", 0) > 0
+        self._has_bluetooth = self._capabilities.get("ble", 0) > 0
+        self._has_auto_update = self._capabilities.get("aup", 0) > 0
+        self._has_full_color = self._capabilities.get("fld", 0) > 0
+        self._has_alarm_plan = self._capabilities.get("alp", 0) > 0
+        self._has_alarm_frequency = self._capabilities.get("afq", 0) > 0
+        self._has_temp_sensor = self._capabilities.get("tmpr", 0) > 0
+        self._has_hmd_sensor = self._capabilities.get("hmd", 0) > 0
+
+        # IOT Data Storage
+        self._iot_data: dict[int, Any] = {}
+
         self._motion_timeout = DEFAULT_MOTION_TIMEOUT
         self._initial_frame_grab = initial_frame_grab
         self._initial_grab_timeout = max(3, min(initial_grab_timeout, 45))
@@ -202,10 +333,6 @@ class CloudEdgeMeariCoordinator:
         # Battery state
         self._battery_percent: int | None = None
         self._battery_charging: bool = False
-
-        # Lamp state
-        self._lamp_on: bool = False
-        self._sleep_mode: bool = False
 
         # Background thread
         self._thread: threading.Thread | None = None
@@ -357,18 +484,16 @@ class CloudEdgeMeariCoordinator:
             if not iot:
                 return
 
-            if self._has_lamp:
-                lamp_val = iot.get(FLIGHT_LIGHT_SWITCH)
-                if lamp_val is not None:
-                    self._lamp_on = int(lamp_val) == 1
-
-            if self._has_sleep_mode:
-                sleep_val = iot.get(SLEEP_MODE)
-                if sleep_val is not None:
-                    self._sleep_mode = int(sleep_val) == 1
+            new_iot_data = {}
+            for k, v in iot.items():
+                try:
+                    new_iot_data[int(k)] = v
+                except (ValueError, TypeError):
+                    new_iot_data[k] = v
+            self._iot_data = new_iot_data
 
         except Exception as exc:
-            _LOGGER.warning("Prefetch lamp failed for %s: %s", self._sn_num, exc)
+            _LOGGER.warning("Prefetch status failed for %s: %s", self._sn_num, exc)
 
     @property
     def available(self) -> bool:
@@ -436,22 +561,6 @@ class CloudEdgeMeariCoordinator:
     @property
     def battery_charging(self) -> bool:
         return self._battery_charging
-
-    @property
-    def has_lamp(self) -> bool:
-        return self._has_lamp
-
-    @property
-    def lamp_on(self) -> bool:
-        return self._lamp_on
-
-    @property
-    def has_sleep_mode(self) -> bool:
-        return self._has_sleep_mode
-
-    @property
-    def sleep_mode(self) -> bool:
-        return self._sleep_mode
 
     @property
     def has_ptz(self) -> bool:
@@ -1138,11 +1247,11 @@ class CloudEdgeMeariCoordinator:
                     hdr[3] = 0x30 | (cc & 0x0F)
                     af = bytearray([1 + stuff_len, 0x00])
                     af += bytearray([0xFF] * stuff_len)
-                payload = pes[offset : offset + remaining]
+                payload = pes[offset: offset + remaining]
                 pkt = bytes(hdr) + bytes(af) + payload
             else:
                 hdr[3] = 0x10 | (cc & 0x0F)
-                payload = pes[offset : offset + 184]
+                payload = pes[offset: offset + 184]
                 pkt = bytes(hdr) + payload
 
             assert len(pkt) == PKT
@@ -1209,7 +1318,7 @@ class CloudEdgeMeariCoordinator:
         pkt[2] = PMT_PID & 0xFF
         pkt[3] = 0x10 | (cc & 0x0F)
         pkt[4] = 0x00                          # pointer field
-        pkt[5 : 5 + len(section)] = section
+        pkt[5: 5 + len(section)] = section
         for i in range(5 + len(section), 188):
             pkt[i] = 0xFF
         return bytes(pkt)
@@ -1235,7 +1344,7 @@ class CloudEdgeMeariCoordinator:
         pkt[2] = 0x00
         pkt[3] = 0x10 | (cc & 0x0F)          # payload only + CC
         pkt[4] = 0x00                         # pointer field
-        pkt[5 : 5 + len(section)] = section
+        pkt[5: 5 + len(section)] = section
         for i in range(5 + len(section), 188):
             pkt[i] = 0xFF
         return bytes(pkt)
@@ -1295,7 +1404,7 @@ class CloudEdgeMeariCoordinator:
 
             # While collecting, include every packet (video + audio)
             if self._stream_idr_collecting:
-                self._stream_idr_buf.extend(data[off : off + PKT])
+                self._stream_idr_buf.extend(data[off: off + PKT])
 
     @staticmethod
     def _rewrite_video_ts_timing(
@@ -1321,7 +1430,7 @@ class CloudEdgeMeariCoordinator:
                 if af_flags & 0x10:                   # PCR flag set
                     p = off + 6
                     # PCR_base (33 bits, 90 kHz) + 6 reserved + 9-bit ext
-                    chunk[p]     = (pts >> 25) & 0xFF
+                    chunk[p + 0] = (pts >> 25) & 0xFF
                     chunk[p + 1] = (pts >> 17) & 0xFF
                     chunk[p + 2] = (pts >> 9) & 0xFF
                     chunk[p + 3] = (pts >> 1) & 0xFF
@@ -1344,7 +1453,7 @@ class CloudEdgeMeariCoordinator:
             p = payload_off + 9
             if p + 5 <= off + PKT:
                 marker = 0x03 if pts_dts_flags == 3 else 0x02
-                chunk[p]     = (marker << 4) | ((pts >> 29) & 0x0E) | 0x01
+                chunk[p + 0] = (marker << 4) | ((pts >> 29) & 0x0E) | 0x01
                 chunk[p + 1] = (pts >> 22) & 0xFF
                 chunk[p + 2] = ((pts >> 14) & 0xFE) | 0x01
                 chunk[p + 3] = (pts >> 7) & 0xFF
@@ -1353,7 +1462,7 @@ class CloudEdgeMeariCoordinator:
         if pts_dts_flags == 3:                        # DTS also present
             p = payload_off + 14
             if p + 5 <= off + PKT:
-                chunk[p]     = (0x01 << 4) | ((pts >> 29) & 0x0E) | 0x01
+                chunk[p + 0] = (0x01 << 4) | ((pts >> 29) & 0x0E) | 0x01
                 chunk[p + 1] = (pts >> 22) & 0xFF
                 chunk[p + 2] = ((pts >> 14) & 0xFE) | 0x01
                 chunk[p + 3] = (pts >> 7) & 0xFF
@@ -1408,12 +1517,12 @@ class CloudEdgeMeariCoordinator:
         for _ in range(n_packets):
             if ai < n_audio and (oi >= n_other or oi >= next_audio_at):
                 src = audio_indices[ai] * PKT
-                result[wi : wi + PKT] = buf[src : src + PKT]
+                result[wi: wi + PKT] = buf[src: src + PKT]
                 ai += 1
                 next_audio_at = (ai + 1) * ratio
             else:
                 src = other_indices[oi] * PKT
-                result[wi : wi + PKT] = buf[src : src + PKT]
+                result[wi: wi + PKT] = buf[src: src + PKT]
                 oi += 1
             wi += PKT
 
@@ -1492,7 +1601,7 @@ class CloudEdgeMeariCoordinator:
                                 _frame_acc = bytearray()
                                 if _first_video_time == 0.0:
                                     _first_video_time = now
-                            _frame_acc.extend(chunk[off : off + PKT])
+                            _frame_acc.extend(chunk[off: off + PKT])
 
             # == 2. Release: pop frames at steady pace ==
             # Prime by time elapsed since first video, not frame count.
@@ -3320,8 +3429,6 @@ class CloudEdgeMeariCoordinator:
 
     def _poll_status(self) -> None:
         """Poll status from the device IoT config."""
-        #if not self._has_lamp:
-        #    return
         if not self._api:
             return
         try:
@@ -3330,55 +3437,38 @@ class CloudEdgeMeariCoordinator:
                 return
 
             need_update = False
+            new_iot_data = {}
+            for k, v in iot.items():
+                try:
+                    new_iot_data[int(k)] = v
+                except (ValueError, TypeError):
+                    new_iot_data[k] = v
 
-            if self._has_lamp:
-                lamp_val = iot.get(FLIGHT_LIGHT_SWITCH)
-                if lamp_val is not None:
-                    is_on = int(lamp_val) == 1
-                    if self._lamp_on != is_on:
-                        self._lamp_on = is_on
-                        need_update = True
-
-            if self._has_sleep_mode:
-                sleep_val = iot.get(SLEEP_MODE)
-                if sleep_val is not None:
-                    is_on = int(sleep_val) == 1
-                    if self._sleep_mode != is_on:
-                        self._lamp_sleep_mode_on = is_on
-                        need_update = True
+            if new_iot_data != self._iot_data:
+                self._iot_data = new_iot_data
+                need_update = True
 
             if need_update:
                 self._fire_update()
 
         except Exception as e:
-            _LOGGER.debug("Lamp poll failed for %s: %s", self._sn_num, e)
+            _LOGGER.debug("Status poll failed for %s: %s", self._sn_num, e)
 
-    def set_lamp(self, on: bool) -> None:
-        """Turn the lamp on or off via the API."""
-        if not self._has_lamp:
-            return
+    def get_iot_value(self, code: int) -> Any:
+        """Get a value from the cached IOT data."""
+        return self._iot_data.get(code)
+
+    def set_iot_value(self, code: int, value: Any) -> None:
+        """Set an IOT value via the API and update cache."""
         if not self._api:
             return
         try:
-            self._api.set_device_iot_value(self._sn_num, FLIGHT_LIGHT_SWITCH, 1 if on else 0)
-            self._lamp_on = on
+            # Most values are integers, but some might be strings or JSON strings.
+            self._api.set_device_iot_value(self._sn_num, str(code), value)
+            self._iot_data[code] = int(value) == 1
             self._fire_update()
         except Exception as e:
-            _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
-
-    def set_sleep_mode(self, on: bool) -> None:
-        """Turn the lamp on or off via the API."""
-        if not self._has_lamp:
-            return
-        if not self._api:
-            return
-        try:
-            self._api.set_device_iot_value(self._sn_num, SLEEP_MODE, 1 if on else 0)
-            self._sleep_mode = on
-            self._fire_update()
-        except Exception as e:
-            _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
-
+            _LOGGER.warning("Set IOT value %s failed for %s: %s", code, self._sn_num, e)
 
     def ptz_move(self, direction: str) -> None:
         """Start PTZ movement in the given direction (left/right/up/down)."""
