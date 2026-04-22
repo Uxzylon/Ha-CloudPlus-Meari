@@ -157,7 +157,9 @@ class CloudEdgeMeariStreamHostSelect(SelectEntity):
     _attr_icon = "mdi:ip-network"
     _attr_options = list(STREAM_HOST_OPTIONS.values())
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_stream_host_mode"
@@ -213,7 +215,9 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
     _attr_name = "Stream Quality"
     _attr_icon = "mdi:video-high-definition"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_stream_quality"

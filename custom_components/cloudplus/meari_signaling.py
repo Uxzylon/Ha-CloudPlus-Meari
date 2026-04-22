@@ -67,7 +67,7 @@ def _des3_decrypt(data: bytes) -> bytes:
     if len(data) == 0:
         return b""
     # Truncate to block boundary
-    data = data[:len(data) - (len(data) % 8)]
+    data = data[: len(data) - (len(data) % 8)]
     if len(data) == 0:
         return b""
     cipher = DES3.new(MSGSVR_KEY, DES3.MODE_ECB)
@@ -75,12 +75,12 @@ def _des3_decrypt(data: bytes) -> bytes:
     pad_len = decrypted[-1]
     if 1 <= pad_len <= 8 and all(b == pad_len for b in decrypted[-pad_len:]):
         return decrypted[:-pad_len]
-    return decrypted.rstrip(b'\x00')
+    return decrypted.rstrip(b"\x00")
 
 
 def _build_frame(node, method, cmd, payload_json, encrypt=True):
     """Build a complete msgsvr wire frame."""
-    payload = payload_json.encode('utf-8')
+    payload = payload_json.encode("utf-8")
 
     if encrypt:
         payload = _des3_encrypt(payload)
@@ -135,16 +135,16 @@ def _recv_frame(sock):
         payload = _des3_decrypt(payload)
 
     try:
-        json_data = json.loads(payload.decode('utf-8'))
+        json_data = json.loads(payload.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         json_data = {"_raw": payload.hex()[:200]}
 
     return {
-        'node': node,
-        'method': method,
-        'cmd': cmd,
-        'encrypted': is_encrypted,
-        'json': json_data,
+        "node": node,
+        "method": method,
+        "cmd": cmd,
+        "encrypted": is_encrypted,
+        "json": json_data,
     }
 
 
@@ -207,8 +207,7 @@ class MsgSvrClient:
 
         msg["content"] = content
         method = METHOD_ROUTED if to_webrtcsvr and self.webrtcsvr else METHOD_DIRECT
-        self._send(method, CMD_WEBRTC,
-                   json.dumps(msg, separators=(",", ":")))
+        self._send(method, CMD_WEBRTC, json.dumps(msg, separators=(",", ":")))
 
     def _recv_webrtc_content(self):
         """Receive a webrtcsvr response and decode the inner content."""
@@ -222,19 +221,22 @@ class MsgSvrClient:
 
     def register(self, client_id, brand="77", app_ver="5.9.2a16", country="FR"):
         """Step 1: Register with signaling server. Returns uuid and token."""
-        msg = json.dumps({
-            "action": "register",
-            "transport": "tcp",
-            "type": "binary",
-            "ver": 15340,
-            "runtime": 0,
-            "extra_params": {
-                "brand": brand,
-                "clientid": str(client_id),
-                "v": app_ver,
-                "c": country,
+        msg = json.dumps(
+            {
+                "action": "register",
+                "transport": "tcp",
+                "type": "binary",
+                "ver": 15340,
+                "runtime": 0,
+                "extra_params": {
+                    "brand": brand,
+                    "clientid": str(client_id),
+                    "v": app_ver,
+                    "c": country,
+                },
             },
-        }, separators=(",", ":"))
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_REGISTER, msg)
         resp = self._recv()
@@ -262,16 +264,19 @@ class MsgSvrClient:
     def webrtc_hello_full(self):
         """Step 2: Hello to webrtcsvr, capturing full response."""
         content = base64.b64encode(b'{"cmd":"hello"}').decode()
-        msg = json.dumps({
-            "from": {
-                "node": "client",
-                "domain": self.uuid,
-                "transport": "tcp",
-                "type": "binary",
+        msg = json.dumps(
+            {
+                "from": {
+                    "node": "client",
+                    "domain": self.uuid,
+                    "transport": "tcp",
+                    "type": "binary",
+                },
+                "node": "webrtcsvr",
+                "content": content,
             },
-            "node": "webrtcsvr",
-            "content": content,
-        }, separators=(",", ":"))
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_WEBRTC, msg)
         resp = self._recv()
@@ -292,11 +297,14 @@ class MsgSvrClient:
     def query_device_status(self, device_uuid):
         """Step 3: Query device status. Returns status dict."""
         sid = uuid_mod.uuid4().hex[:16]
-        msg = json.dumps({
-            "action": "status",
-            "uuid": device_uuid,
-            "sid": sid,
-        }, separators=(",", ":"))
+        msg = json.dumps(
+            {
+                "action": "status",
+                "uuid": device_uuid,
+                "sid": sid,
+            },
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_STATUS, msg)
         resp = self._recv()
@@ -305,21 +313,24 @@ class MsgSvrClient:
     def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
         sid = uuid_mod.uuid4().hex[:16]
-        msg = json.dumps({
-            "sid": sid,
-            "uuid": self.uuid,
-            "params": {
-                "sid": uuid_mod.uuid4().hex[:8] + "00000001",
-                "local": {
-                    "ip": local_ips,
-                    "port": local_port,
+        msg = json.dumps(
+            {
+                "sid": sid,
+                "uuid": self.uuid,
+                "params": {
+                    "sid": uuid_mod.uuid4().hex[:8] + "00000001",
+                    "local": {
+                        "ip": local_ips,
+                        "port": local_port,
+                    },
+                    "attach": {
+                        "awaken_type": 1,
+                    },
                 },
-                "attach": {
-                    "awaken_type": 1,
-                },
+                "contact": device_contact,
             },
-            "contact": device_contact,
-        }, separators=(",", ":"))
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_CONNECT, msg)
         resp = self._recv()
@@ -328,13 +339,15 @@ class MsgSvrClient:
     def request_coturn(self, device_uuid):
         """Step 5: Request TURN credentials via webrtcsvr."""
         sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "option",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "method": "coturn",
-        })
+        self._send_webrtc(
+            {
+                "cmd": "option",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "method": "coturn",
+            }
+        )
         return self._recv_webrtc_content()
 
     def send_offer(self, device_uuid, sdp):
@@ -342,43 +355,49 @@ class MsgSvrClient:
         sid = f"{self.uuid}:01"
         tag = self.webrtcsvr["tag"] + "01"
 
-        self._send_webrtc({
-            "cmd": "offer",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "channel": 0,
-            "stream_type": 1,
-            "sdp": sdp,
-            "tag": tag,
-        })
+        self._send_webrtc(
+            {
+                "cmd": "offer",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "channel": 0,
+                "stream_type": 1,
+                "sdp": sdp,
+                "tag": tag,
+            }
+        )
         return self._recv_webrtc_content()
 
     def send_candidate_complete(self, device_uuid):
         """Step 7: Signal ICE candidate negotiation complete."""
         sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "candidate",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "candidate": {
-                "cmd": "nego",
-                "state": "completed",
-                "mode": 1,
-            },
-        })
+        self._send_webrtc(
+            {
+                "cmd": "candidate",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "candidate": {
+                    "cmd": "nego",
+                    "state": "completed",
+                    "mode": 1,
+                },
+            }
+        )
         return self._recv_webrtc_content()
 
     def send_logout(self, device_uuid):
         """Disconnect session."""
         sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "logout",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-        })
+        self._send_webrtc(
+            {
+                "cmd": "logout",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+            }
+        )
 
     def wait_for_status(self, device_uuid, target="online", timeout=30):
         """Wait for device status to change (e.g., dormancy -> online)."""
@@ -388,8 +407,7 @@ class MsgSvrClient:
             try:
                 resp = self._recv()
                 data = resp["json"]
-                if (data.get("action") == "status" and
-                        data.get("uuid") == device_uuid):
+                if data.get("action") == "status" and data.get("uuid") == device_uuid:
                     status = data.get("status", "")
                     if status == target:
                         return data

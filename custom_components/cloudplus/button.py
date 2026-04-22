@@ -24,8 +24,11 @@ async def async_setup_entry(
     """Set up CloudEdge / Meari buttons from a config entry."""
     coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [CloudEdgeMeariWakeButton(coord, entry) for coord in coordinators
-         if coord.is_battery_camera]
+        [
+            CloudEdgeMeariWakeButton(coord, entry)
+            for coord in coordinators
+            if coord.is_battery_camera
+        ]
     )
 
 
@@ -36,7 +39,9 @@ class CloudEdgeMeariWakeButton(ButtonEntity):
     _attr_name = "Wake Camera"
     _attr_icon = "mdi:alarm-light-outline"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_wake"

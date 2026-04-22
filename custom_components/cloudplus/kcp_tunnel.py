@@ -30,17 +30,17 @@ import struct
 import time
 
 # KCP constants
-KCP_CONV = 0x0000000c  # Meari hardcoded conversation ID
-KCP_CMD_PUSH = 81   # 0x51 - data
-KCP_CMD_ACK = 82    # 0x52 - acknowledgment
-KCP_CMD_WASK = 83   # 0x53 - window probe request
-KCP_CMD_WINS = 84   # 0x54 - window probe response
+KCP_CONV = 0x0000000C  # Meari hardcoded conversation ID
+KCP_CMD_PUSH = 81  # 0x51 - data
+KCP_CMD_ACK = 82  # 0x52 - acknowledgment
+KCP_CMD_WASK = 83  # 0x53 - window probe request
+KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
-KCP_MSS = 1176      # 0x498 - max segment size
-KCP_WND = 4096      # Advertised receive window (large to avoid flow control throttle)
+KCP_MSS = 1176  # 0x498 - max segment size
+KCP_WND = 4096  # Advertised receive window (large to avoid flow control throttle)
 
 # IVA frame constants
-IVA_MAGIC = b'\xFF\x01'
+IVA_MAGIC = b"\xff\x01"
 IVA_FRAME_SIZE = 20
 IVA_TYPE_HANDSHAKE = 0x7012
 IVA_TYPE_DATA = 0x7010
@@ -55,10 +55,15 @@ def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
         session_id1 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
     if session_id2 is None:
         session_id2 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
-    header = struct.pack("<BBHI I HH I",
-        0xFF, 0x01, 0, session_id1,
+    header = struct.pack(
+        "<BBHI I HH I",
+        0xFF,
+        0x01,
+        0,
+        session_id1,
         session_id2,
-        0, type_marker,
+        0,
+        type_marker,
         len(data),
     )
     return header + data
@@ -84,13 +89,14 @@ def parse_iva_frame(data):
     session_id2 = struct.unpack_from("<I", data, 0x08)[0]
     type_marker = struct.unpack_from("<H", data, 0x0E)[0]
     data_len = struct.unpack_from("<I", data, 0x10)[0]
-    payload = data[IVA_FRAME_SIZE:IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
+    payload = data[IVA_FRAME_SIZE : IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
     return type_marker, session_id1, session_id2, payload
 
 
 def build_kcp_segment(cmd, sn=0, una=0, wnd=KCP_WND, ts=0, frg=0, data=b""):
     """Build a KCP segment."""
-    header = struct.pack("<IBBHIIII",
+    header = struct.pack(
+        "<IBBHIIII",
         KCP_CONV,
         cmd,
         frg,
@@ -107,11 +113,10 @@ def parse_kcp_segment(raw):
     """Parse a KCP segment. Returns dict or None."""
     if len(raw) < KCP_HEADER_SIZE:
         return None
-    conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
-        "<IBBHIIII", raw, 0)
+    conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from("<IBBHIIII", raw, 0)
     if conv != KCP_CONV:
         return None
-    payload = raw[KCP_HEADER_SIZE:KCP_HEADER_SIZE + length]
+    payload = raw[KCP_HEADER_SIZE : KCP_HEADER_SIZE + length]
     return {
         "conv": conv,
         "cmd": cmd,
@@ -141,8 +146,8 @@ class KcpTunnel:
                        Function to send raw UDP data to peer.
         """
         self.send_func = send_func
-        self.sn_send = 0           # Next outgoing sequence number
-        self.una_recv = 0          # Highest SN seen + 1 (internal tracking)
+        self.sn_send = 0  # Next outgoing sequence number
+        self.una_recv = 0  # Highest SN seen + 1 (internal tracking)
         self.ts_base = int(time.time() * 1000) & 0xFFFFFFFF
         self.handshake_done = False
 
@@ -194,7 +199,7 @@ class KcpTunnel:
         offset = 0
         fragments = []
         while offset < len(data):
-            chunk = data[offset:offset + KCP_MSS]
+            chunk = data[offset : offset + KCP_MSS]
             fragments.append(chunk)
             offset += KCP_MSS
 
@@ -372,9 +377,11 @@ class KcpTunnel:
             # Otherwise there's another gap — loop and skip it too
 
         if any_skipped:
-            print(f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
-                  f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
-                  f"queued={len(self.recv_queue)}")
+            print(
+                f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
+                f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
+                f"queued={len(self.recv_queue)}"
+            )
         return any_skipped
 
     def process_input(self, raw):

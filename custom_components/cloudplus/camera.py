@@ -23,9 +23,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up CloudEdge / Meari camera from a config entry."""
     coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [CloudEdgeMeariCamera(coord, entry) for coord in coordinators]
-    )
+    async_add_entities([CloudEdgeMeariCamera(coord, entry) for coord in coordinators])
 
 
 class CloudEdgeMeariCamera(Camera):
@@ -35,7 +33,9 @@ class CloudEdgeMeariCamera(Camera):
     _attr_name = "Camera"
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         """Initialize the camera."""
         super().__init__()
         self._coordinator = coordinator

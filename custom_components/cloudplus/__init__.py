@@ -26,7 +26,15 @@ from .api import MeariApiClient
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["camera", "binary_sensor", "button", "sensor", "number", "select", "switch"]
+PLATFORMS = [
+    "camera",
+    "binary_sensor",
+    "button",
+    "sensor",
+    "number",
+    "select",
+    "switch",
+]
 
 SERVICE_PTZ = "ptz"
 SERVICE_PTZ_SCHEMA = vol.Schema(
@@ -127,7 +135,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.async_add_executor_job(coord.ptz_stop)
 
         hass.services.async_register(
-            DOMAIN, SERVICE_PTZ, _handle_ptz, schema=SERVICE_PTZ_SCHEMA,
+            DOMAIN,
+            SERVICE_PTZ,
+            _handle_ptz,
+            schema=SERVICE_PTZ_SCHEMA,
         )
 
     return True
