@@ -73,6 +73,7 @@ class CloudEdgeMeariCoordinator(
         email: str,
         password: str,
         device: dict[str, Any],
+        video_password: str | None = None,
         country_code: str = DEFAULT_COUNTRY_CODE,
         phone_code: str = DEFAULT_PHONE_CODE,
         app_profile: str = DEFAULT_APP_PROFILE,
@@ -86,6 +87,7 @@ class CloudEdgeMeariCoordinator(
         self._entry = entry
         self._email = email
         self._password = password
+        self._video_password = (video_password or "").strip()
         self._country_code = country_code
         self._phone_code = phone_code
         self._app_profile = app_profile
@@ -96,6 +98,7 @@ class CloudEdgeMeariCoordinator(
         self._device_category = str(device.get("_category", "")).lower()
         self._is_snap = self._device_category == "snap"
         self._host_key = device.get("hostKey", "")
+        self._video_encryption_enabled: bool = False
 
         # Parse device capabilities
         self._capabilities: dict = {}
@@ -343,13 +346,10 @@ class CloudEdgeMeariCoordinator(
         # Restore persisted settings from config entry options
         if self._entry is not None:
             opts = self._entry.options
-            sn = self._sn_num
-            self._motion_timeout = opts.get(
-                f"{sn}_motion_timeout", DEFAULT_MOTION_TIMEOUT
-            )
-            self._motion_wake_enabled = opts.get(f"{sn}_motion_wake_enabled", True)
-            self._stream_host_mode = opts.get(f"{sn}_stream_host_mode", "ip")
-            self._vvp_quality = opts.get(f"{sn}_vvp_quality")
+            self._motion_timeout = opts.get("motion_timeout", DEFAULT_MOTION_TIMEOUT)
+            self._motion_wake_enabled = opts.get("motion_wake_enabled", True)
+            self._stream_host_mode = opts.get("stream_host_mode", "ip")
+            self._vvp_quality = opts.get("vvp_quality")
 
     # ------------------------------------------------------------------
     # Properties
@@ -500,16 +500,15 @@ class CloudEdgeMeariCoordinator(
         """Persist a per-device setting to config entry options."""
         if self._entry is None:
             return
-        full_key = f"{self._sn_num}_{key}"
         new_opts = dict(self._entry.options)
-        new_opts[full_key] = value
+        new_opts[key] = value
         try:
             self.hass.config_entries.async_update_entry(
                 self._entry,
                 options=new_opts,
             )
         except Exception:
-            _LOGGER.debug("Could not persist option %s", full_key, exc_info=True)
+            _LOGGER.debug("Could not persist option %s", key, exc_info=True)
 
     def set_motion_wake_enabled(self, enabled: bool) -> None:
         self._motion_wake_enabled = enabled
@@ -642,6 +641,33 @@ class CloudEdgeMeariCoordinator(
     # ------------------------------------------------------------------
     # Polling helpers
     # ------------------------------------------------------------------
+
+    def _refresh_video_encryption_state(self) -> None:
+        """Refresh whether device video-password mode is enabled.
+
+        IoT code ``216`` maps to ``videoPwdIsSet`` in the official app.
+        """
+        if not self._api:
+            return
+
+        try:
+            iot = self._api.get_device_iot_config(self._sn_num)
+            raw = iot.get("216") if isinstance(iot, dict) else None
+            enabled = str(raw).strip().lower() in {"1", "true", "yes", "on"}
+            self._video_encryption_enabled = enabled
+            _LOGGER.debug(
+                "Video encryption flag for %s: enabled=%s raw=%r",
+                self._sn_num,
+                enabled,
+                raw,
+            )
+        except Exception as e:
+            self._video_encryption_enabled = False
+            _LOGGER.debug(
+                "Video encryption flag refresh failed for %s: %s",
+                self._sn_num,
+                e,
+            )
 
     def _poll_battery(self) -> None:
         """Poll battery info, re-login once if the call fails."""

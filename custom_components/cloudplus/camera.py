@@ -22,8 +22,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CloudEdge / Meari camera from a config entry."""
-    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([CloudEdgeMeariCamera(coord, entry) for coord in coordinators])
+    coord: CloudEdgeMeariCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([CloudEdgeMeariCamera(coord, entry)])
 
 
 class CloudEdgeMeariCamera(Camera):
