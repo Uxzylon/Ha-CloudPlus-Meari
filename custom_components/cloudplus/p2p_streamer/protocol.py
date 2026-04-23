@@ -92,7 +92,10 @@ def build_vvp_auth_md5(
     licence_id: str | None = None,
     auth_flag: int = 0,
 ) -> str:
-    password = host_key if auth_flag == 1 else host_key[:16]
+    # Legacy cameras expect the first 16 chars of hostKey.
+    # E2EE mode extends auth material to "video_password + hostKey", which
+    # must be used in full
+    password = host_key if (auth_flag == 1 or len(host_key) > 32) else host_key[:16]
     parts = [
         "admin",
         password,

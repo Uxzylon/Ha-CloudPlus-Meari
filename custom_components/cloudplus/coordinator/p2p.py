@@ -246,6 +246,7 @@ class CoordinatorP2PMixin:
             allow_lossy_gap_skip=bool(self._p2p_allow_lossy_gap_skip),
             adaptive_lossy_gap_skip=bool(self._p2p_adaptive_lossy_gap_skip),
             vvp_quality=self._vvp_quality,
+            video_password=(self._video_password or None),
         )
         self._p2p_streamer = streamer
         self._stream_grab_only = grab_only

@@ -203,6 +203,13 @@ class CoordinatorLifecycleMixin:
         self._available = True
         self._fire_update()
         self._start_mqtt()
+        self._refresh_video_encryption_state()
+        if self._video_password:
+            _LOGGER.info(
+                "Using configured video password for %s stream auth (device encryption flag=%s)",
+                self._sn_num,
+                self._video_encryption_enabled,
+            )
 
         if self._is_snap:
             self._poll_battery()
