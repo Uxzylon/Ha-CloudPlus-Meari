@@ -423,7 +423,16 @@ class MeariApiClient:
 
     def _get_iot_config(self) -> None:
         data = self._get("/v2/app/config/pf/init", {"iotType": "4"})
-        if data.get("resultCode") != "1001":
+        result_code = str(data.get("resultCode", ""))
+        if result_code != "1001":
+            # Some accounts/devices intermittently return 1023 for this endpoint
+            # even when auth is valid. Keep defaults and continue.
+            if result_code == "1023":
+                _LOGGER.warning(
+                    "IoT config returned 1023 for %s; continuing with default endpoints",
+                    self.email,
+                )
+                return
             raise RuntimeError(f"IoT config failed: {data}")
         result = data["result"]
         pf = result.get("pfApi", {})

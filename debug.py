@@ -391,6 +391,7 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
         email=args.email,
         password=args.password,
         device=dev,
+        video_password=getattr(args, "video_password", None),
         country_code=args.country_code,
         phone_code=args.phone_code,
         app_profile=args.profile,
@@ -2903,6 +2904,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="VVP quality profile ID (from 'list' command, e.g. 0=SD, 2=HD). Default: highest",
+    )
+    p_stream.add_argument(
+        "--video-password",
+        default=None,
+        help="Optional camera video-encryption password (E2EE)",
     )
 
     p_bench = sub.add_parser(

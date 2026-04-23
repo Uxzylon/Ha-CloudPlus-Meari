@@ -77,12 +77,14 @@ class P2PStreamer:
         allow_lossy_gap_skip: bool = False,
         adaptive_lossy_gap_skip: bool = False,
         vvp_quality: int | None = None,
+        video_password: str | None = None,
     ) -> None:
         self._api = api
         self._device = device
         self._sn_num = device["snNum"]
         self._device_uuid = format_sn(self._sn_num)
         self._host_key = device.get("hostKey", "")
+        self._video_password = (video_password or "").strip()
         self._dev_name = device.get("deviceName", "Camera")
 
         self.on_video = on_video
@@ -112,6 +114,16 @@ class P2PStreamer:
         self._active_sock: socket.socket | None = None
         self._active_sig: MsgSvrClient | None = None
         self._gap_skip_event_seq = 0
+
+    def _auth_host_key(self) -> str:
+        """Return host-key material used for VVP auth.
+
+        CloudEdge video-encryption mode authenticates with
+        ``video_password + hostKey`` instead of plain ``hostKey``.
+        """
+        if self._video_password and self._host_key:
+            return f"{self._video_password}{self._host_key}"
+        return self._host_key
 
     @staticmethod
     def _classify_gap_skip_severity(
@@ -289,9 +301,15 @@ class P2PStreamer:
         """Internal: full P2P pipeline. Returns (video_count, bytes)."""
         api = self._api
         device_uuid = self._device_uuid
-        host_key = self._host_key
+        host_key = self._auth_host_key()
         sn_num = self._sn_num
         remote = self._remote
+
+        if self._video_password:
+            _LOGGER.debug(
+                "Video encryption password supplied for %s (auth key extended)",
+                sn_num,
+            )
 
         # Register
         reg = sig.register(
