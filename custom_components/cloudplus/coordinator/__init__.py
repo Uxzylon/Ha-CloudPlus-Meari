@@ -1,25 +1,6 @@
-"""Coordinator for CloudEdge / Meari camera — manages lifecycle.
-
-Runs MQTT listener, P2P streaming, ffmpeg muxer, TCP stream server,
-and idle stream in background threads. Manages camera wake/sleep state
-and motion detection.
-
-Sub-modules:
-
-    mpegts.py  — MPEG-TS packet building, PTS/PCR parsing, IDR seed utils
-    nal.py     — Annex-B NAL parsing, codec detection, keyframe detection
-    stream.py  — TCP stream server, backlog bootstrap, join diagnostics
-    video.py   — codec switching, cadence tracking, snapshots, IDR validation
-    p2p.py     — P2P session start/stop and restart handling
-    lifecycle.py — MQTT, wake control, and session/watch loop
-    media.py   — ffmpeg muxer/audio pipeline and gap-skip recovery
-"""
-
 from __future__ import annotations
 
-import collections
 import logging
-import queue
 import socket
 import subprocess
 import threading
@@ -31,41 +12,34 @@ from homeassistant.core import HomeAssistant
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
+from ..api import MeariApiClient
 from ..const import (
     DEFAULT_APP_PROFILE,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_MOTION_TIMEOUT,
     DEFAULT_PHONE_CODE,
-    DOMAIN,
+    IOT_CODE_BATTERY_PERCENT,
+    IOT_CODE_CHARGE_STATUS,
+    IOT_CODE_LAMP,
+    IOT_CODE_VIDEO_ENCRYPTION,
+    PTZ_DIRECTIONS,
 )
-from ..api import MeariApiClient, format_sn
-from ..p2p_streamer import P2PStreamer
-from .stream import CoordinatorStreamMixin
-from .p2p import CoordinatorP2PMixin
-from .video import CoordinatorVideoMixin
-from .lifecycle import CoordinatorLifecycleMixin
-from .media import CoordinatorMediaMixin
+from ..p2p_streamer import P2PStreamer, parse_quality_profiles
+from ..p2p_streamer.codecs import detect_codec
+from .motion import MotionEventListener
+from .muxer import FfmpegMuxer
+from .stream_server import StreamServer
 
 _LOGGER = logging.getLogger(__name__)
 
-# Polling intervals
-STATUS_POLL_INTERVAL = 60.0
+IDLE_ADVERTISED_FPS = 15.0
+IDLE_REFRESH_INTERVAL = 1.0
+IDLE_NO_CLIENT_SLEEP = 1.0
 BATTERY_POLL_INTERVAL = 300.0
 
 
-class CloudEdgeMeariCoordinator(
-    CoordinatorMediaMixin,
-    CoordinatorStreamMixin,
-    CoordinatorVideoMixin,
-    CoordinatorP2PMixin,
-    CoordinatorLifecycleMixin,
-):
-    """Manages connection to a single CloudEdge / Meari camera."""
-
-    # Watch states
-    _W_IDLE = 0
-    _W_HANDSHAKING = 1
-    _W_STREAMING = 2
+class CloudEdgeMeariCoordinator:
+    """Small runtime coordinator used by debug.py and camera entity."""
 
     def __init__(
         self,
@@ -78,320 +52,93 @@ class CloudEdgeMeariCoordinator(
         phone_code: str = DEFAULT_PHONE_CODE,
         app_profile: str = DEFAULT_APP_PROFILE,
         initial_frame_grab: bool = True,
-        initial_grab_timeout: int = 12,
+        initial_grab_timeout: int = 45,
         snapshot_conversion_enabled: bool = True,
-        snapshot_min_interval: float = 3.0,
+        snapshot_min_interval: float = 10.0,
         entry: "ConfigEntry | None" = None,
     ) -> None:
         self.hass = hass
         self._entry = entry
         self._email = email
         self._password = password
-        self._video_password = (video_password or "").strip()
+        self._device = device
+        self._configured_video_password = (video_password or "").strip()
+        self._video_password = self._configured_video_password
+        self._video_e2ee_enabled: bool | None = None
         self._country_code = country_code
         self._phone_code = phone_code
         self._app_profile = app_profile
-        self._device = device
-        self._device_id = device["deviceID"]
-        self._sn_num = device.get("snNum", "")
-        self._device_name = device.get("deviceName", self._sn_num)
+
+        self._device_id = int(device.get("deviceID", 0) or 0)
+        self._sn_num = str(device.get("snNum", ""))
+        self._device_name = str(device.get("deviceName", self._sn_num) or self._sn_num)
         self._device_category = str(device.get("_category", "")).lower()
         self._is_snap = self._device_category == "snap"
-        self._host_key = device.get("hostKey", "")
-        self._video_encryption_enabled: bool = False
 
-        # Parse device capabilities
-        self._capabilities: dict = {}
-        try:
-            import json as _json
-
-            cap_raw = device.get("capability", "")
-            if cap_raw:
-                cap = _json.loads(cap_raw) if isinstance(cap_raw, str) else cap_raw
-                self._capabilities = cap.get("caps", {})
-        except Exception:
-            pass
-        self._has_lamp = self._capabilities.get("led") == 1
-        self._has_ptz = (
-            self._capabilities.get("ptz") == 1 or self._capabilities.get("ptz2") == 1
-        )
-        self._has_ptz2 = self._capabilities.get("ptz2") == 1
-        self._motion_timeout = DEFAULT_MOTION_TIMEOUT
-        self._initial_frame_grab = initial_frame_grab
-        self._initial_grab_timeout = max(3, min(initial_grab_timeout, 45))
-        self._snapshot_conversion_enabled = bool(snapshot_conversion_enabled)
-
-        # Shared state
-        self._latest_image: bytes | None = None
-        self._latest_video_kf: bytes | None = (
-            None  # raw Annex-B keyframe for deferred JPEG conversion
-        )
-        self._idle_scene_kf: bytes | None = (
-            None  # cached last scene keyframe for idle keepalive
-        )
-        self._idle_video_kf: bytes | None = (
-            None  # lightweight keyframe used for long idle keepalive
-        )
-        # Backward-compatible alias used by older debug tooling.
-        self._latest_hevc_kf: bytes | None = None
-        self._video_codec: str = "hevc"  # "hevc" or "h264"
-        self._idle_since: float = time.monotonic()
-        self._idle_scene_hold_seconds: float = 3.0
-        self._idle_keepalive_fps_initial: float = 5.0
-        self._idle_keepalive_fps_steady: float = 2.0
-        self._idle_keepalive_fps_with_clients: float = 2.0
-        self._idle_keepalive_settle_seconds: float = 3.0
-        self._live_gap_fill_after_seconds: float = 0.3
-        self._live_gap_fill_fps: float = 30.0
-        self._audio_gain_db: float = 24.0
-        self._last_p2p_video_time: float = (
-            0.0  # monotonic timestamp of last camera video frame
-        )
-        self._last_p2p_audio_time: float = (
-            0.0  # monotonic timestamp of last camera audio frame
-        )
-        self._last_video_time: float = 0.0  # monotonic timestamp of last video write
-        self._p2p_video_frames: int = 0
-        self._p2p_audio_frames: int = 0
-        self._p2p_audio_bytes: int = 0
-        self._p2p_audio_non_ff_bytes: int = 0
-        self._p2p_audio_all_ff_frames: int = 0
-        self._last_snapshot_convert_time: float = 0.0
-        self._snapshot_convert_interval: float = max(0.5, float(snapshot_min_interval))
-        self._snapshot_convert_lock = threading.Lock()
-        self._idle_scene_convert_lock = threading.Lock()
-        self._motion_detected = False
-        self._motion_type: str = ""
-        self._last_motion_time: float = 0.0
         self._available = False
-
-        # Camera awake state
         self._camera_awake = False
-
-        # Motion wake control
+        self._latest_image: bytes | None = None
+        self._latest_video_kf: bytes | None = None
+        self._snapshot_conversion_enabled = bool(snapshot_conversion_enabled)
+        self._snapshot_convert_interval = max(1.0, float(snapshot_min_interval))
+        self._last_snapshot_convert_time = 0.0
+        self._snapshot_convert_lock = threading.Lock()
+        self._motion_type = ""
+        self._motion_detected = False
+        self._last_motion_time = 0.0
         self._motion_wake_enabled = True
+        self._motion_timeout = DEFAULT_MOTION_TIMEOUT
+        self._stream_host_mode = "ip"
+        self._initial_frame_grab = bool(initial_frame_grab)
+        self._initial_grab_timeout = max(30.0, float(initial_grab_timeout))
 
-        # Battery state
         self._battery_percent: int | None = None
-        self._battery_charging: bool = False
+        self._battery_charging = False
+        self._has_lamp = False
+        self._lamp_on = False
+        self._has_ptz = self._detect_ptz_support(device)
 
-        # Lamp state
-        self._lamp_on: bool = False
-
-        # Background thread
-        self._thread: threading.Thread | None = None
         self._running = False
-
-        # API client (created in background thread)
-        self._api: MeariApiClient | None = None
-
-        # Manual wake trigger
-        self._wake_event = threading.Event()
-        # Set after startup frame-grab phase completes for the current session.
-        self._startup_ready = threading.Event()
-
-        # Listeners
-        self._motion_callbacks: list[Callable[[], None]] = []
-        self._update_callbacks: list[Callable[[], None]] = []
-
-        # MQTT client
-        self._mqtt_client: Any = None
-        self._mqtt_connected = False
-
-        # Stream server (MPEG-TS over TCP for HA stream / Frigate)
-        self._stream_port: int = 0
-        self._stream_server_sock: socket.socket | None = None
-        self._stream_clients: list[
-            tuple[socket.socket, collections.deque, threading.Event]
-        ] = []
-        self._pending_stream_clients: collections.deque[
-            tuple[socket.socket, collections.deque, threading.Event, float, str]
-        ] = collections.deque()
-        self._stream_backlog: bytearray = bytearray()
-        # During startup, accumulate all TS data without trimming so
-        # new clients get the complete stream from the beginning
-        # (including PAT/PMT + first keyframe + eventually audio).
-        # Once audio PID is detected in the backlog, switch to a
-        # bounded rolling window.
-        self._stream_backlog_has_audio: bool = False
-        # Keep bootstrap backlog small so newly connected readers lock quickly
-        # without inheriting seconds of old latency.
-        self._stream_backlog_max_bytes: int = 512 * 1024  # 512KB
-        # Per-client write queue depth limit (each item is one flush ~8-32KB).
-        self._stream_client_queue_limit: int = 500
-        # IDR keyframe seed: PAT + PMT + complete IDR frame TS data.
-        # Sent to new clients so the decoder can always initialise
-        # (VPS/SPS/PPS for HEVC, SPS/PPS for H.264).
-        self._stream_idr_seed: bytes = b""
-        self._stream_idr_seed_pts: int = 0  # video PTS when IDR seed was captured
-        self._stream_idr_seed_mono: float = 0.0
-        self._stream_idr_seed_p2p_frame_index: int = 0
-        self._stream_idr_seed_video_bytes: int = 0
-        self._stream_idr_seed_is_strong: bool = False
-        self._stream_idr_seed_strength_reason: str = ""
-        self._stream_idr_seed_generation: int = 0
-        self._startup_safe_min_seed_generation: int = 0
-        self._stream_idr_collecting: bool = False
-        self._stream_idr_buf: bytearray = bytearray()
-        self._stream_broadcast_video_pts: int = (
-            0  # latest video PTS in broadcast output
-        )
-        self._stream_broadcast_audio_pts: int = (
-            0  # latest audio PTS in broadcast output
-        )
-        self._stream_pid_last_cc: dict[int, int] = {}
-        self._gap_skip_reset_seq: int = 0
-        self._p2p_session_generation: int = 0
-        self._gap_skip_event_counter: int = 0
-        self._last_gap_skip_event_id: int = 0
-        self._last_gap_skip_diag: dict[str, Any] | None = None
-        self._gap_skip_seq_to_event_id: dict[int, int] = {}
-        self._gap_skip_events: collections.deque[dict[str, Any]] = collections.deque(
-            maxlen=32
-        )
-        self._gap_skip_events_lock = threading.Lock()
-        self._recent_video_rai_ts_sizes: collections.deque[int] = collections.deque(
-            maxlen=12
-        )
-        self._recovery_decode_probe_cache: collections.OrderedDict[
-            str, tuple[bool, str]
-        ] = collections.OrderedDict()
-        self._recovery_decode_probe_cache_max: int = 96
-        self._stream_join_event_counter: int = 0
-        self._stream_join_events: collections.deque[dict[str, Any]] = collections.deque(
-            maxlen=16
-        )
-        self._stream_join_events_by_client: dict[int, dict[str, Any]] = {}
-        self._seed_probe_reject_streak: int = 0
-        self._seed_probe_first_reject_mono: float = 0.0
-        self._stream_clients_lock = threading.Lock()
-        self._stream_accept_thread: threading.Thread | None = None
-        self._stream_epoch: float = 0.0  # wall-clock anchor for MPEG-TS timestamps
-
-        # ffmpeg muxer (H264/HEVC + G.711 µ-law → MPEG-TS)
-        self._ffmpeg_proc: subprocess.Popen | None = None
-        self._ffmpeg_reader_thread: threading.Thread | None = None
-        self._audio_write_fd: int = -1
-        self._audio_enc_proc: subprocess.Popen | None = None
-        self._audio_aac_deque: collections.deque = (
-            collections.deque()
-        )  # unbounded; trimmed explicitly
-        self._audio_aac_overflow: int = 0  # frames trimmed from deque front
-        self._audio_silence_drops: int = 0  # silence frames dropped in _queue_audio
-        self._audio_flush_silence: int = (
-            0  # silence TS injected because deque was empty
-        )
-        self._audio_flush_real: int = 0  # real AAC frames injected from deque
-        self._audio_primed = threading.Event()  # set when real camera audio arrives
-        self._muxer_video_started = (
-            threading.Event()
-        )  # set after first video write to ffmpeg
-        self._silence_feeder_gen: int = 0  # generation counter to cancel stale feeders
-        self._audio_writer_thread: threading.Thread | None = None
-        self._audio_real_started: bool = False
-        # Keep audio buffering shallow and realtime-friendly.
-        self._audio_queue: queue.Queue = queue.Queue(maxsize=80)
-        self._audio_queue_drops: int = 0
-        self._audio_throttle_drops: int = 0
-        self._audio_realtime_next_ts: float = 0.0
-        self._audio_soft_queue_limit: int = 60
-
-        # Video write queue to decouple P2P receive from ffmpeg stdin backpressure.
-        self._video_queue: queue.Queue = queue.Queue(maxsize=150)
-        self._video_lag_drop_threshold: int = 8
-        self._video_queue_drops: int = 0
-        self._force_param_sets_on_next_keyframe: bool = False
-        self._video_mux_target_fps: float = 15.0
-        self._video_fps_ema: float = 15.0
-        self._video_fps_samples: int = 0
-        self._video_fps_last_frame_time: float = 0.0
-        self._video_size_hint: tuple[int, int] | None = None
-        self._video_size_codec: str | None = None
-        self._video_size_probe_after: float = 0.0
-        self._video_size_probe_inflight: bool = False
-        self._video_size_probe_lock = threading.Lock()
-        self._black_keyframe_lock = threading.Lock()
-        self._h264_sps_nal: bytes | None = None
-        self._h264_pps_nal: bytes | None = None
-        self._hevc_vps_nal: bytes | None = None
-        self._hevc_sps_nal: bytes | None = None
-        self._hevc_pps_nal: bytes | None = None
-
-        # P2P streamer
-        self._p2p_streamer: P2PStreamer | None = None
+        self._thread: threading.Thread | None = None
         self._stream_thread: threading.Thread | None = None
-        self._stream_grab_only = False
-        self._live_stream_requested = False
-        self._session_rebootstrap_requested: bool = False
-        self._consecutive_live_bootstrap_failures: int = 0
-        self._last_rebootstrap_mono: float = 0.0
-        # Default to adaptive recovery instead of unconditional lossy skip.
-        # This preserves continuity on small losses while still allowing
-        # escalation under sustained degradation.
-        self._p2p_allow_lossy_gap_skip: bool = False
-        # Adaptive lossy mode ramps recovery aggressiveness from observed
-        # live-link behavior without forcing deepest skip from frame 1.
-        self._p2p_adaptive_lossy_gap_skip: bool = True
+        self._idle_thread: threading.Thread | None = None
+        self._api: MeariApiClient | None = None
+        self._p2p_streamer: P2PStreamer | None = None
+        self._motion_listener: MotionEventListener | None = None
+        self._wake_event = threading.Event()
+        self._idle_stop = threading.Event()
+        self._idle_frame_ready = threading.Event()
 
-        # Keep idle video alive so Frigate clients always see
-        # continuous video packets even while battery cameras sleep.
-        self._idle_video_keepalive = True
+        self._stream_server = StreamServer()
+        self._muxer = FfmpegMuxer(self._stream_server.broadcast)
 
-        # Stream host mode: "ip" (default) or "docker"
-        self._stream_host_mode: str = "ip"
+        self._video_codec = "hevc"
+        self._video_mux_target_fps = 15.0
+        self._p2p_session_generation = 0
+        self._last_p2p_video_time = 0.0
+        self._last_p2p_audio_time = 0.0
+        self._last_video_time = 0.0
+        self._p2p_video_frames = 0
+        self._live_deadline = 0.0
+        self._idle_video_frame: bytes | None = None
+        self._idle_video_codec = self._video_codec
+        self._idle_frame_lock = threading.Lock()
 
-        # VVP quality profile: None = auto (highest from bps2 capability)
+        self._stream_idr_seed = b""
+        self._stream_idr_collecting = False
+        self._stream_idr_seed_generation = 0
+        self._startup_safe_min_seed_generation = 0
+
         self._vvp_quality: int | None = None
+        self._h264_sps: bytes | None = None
+        self._h264_pps: bytes | None = None
+        self._hevc_vps: bytes | None = None
+        self._hevc_sps: bytes | None = None
+        self._hevc_pps: bytes | None = None
+        self._stream_started_keyframe = False
 
-        # Restore persisted settings from config entry options
-        if self._entry is not None:
-            opts = self._entry.options
-            self._motion_timeout = opts.get("motion_timeout", DEFAULT_MOTION_TIMEOUT)
-            self._motion_wake_enabled = opts.get("motion_wake_enabled", True)
-            self._stream_host_mode = opts.get("stream_host_mode", "ip")
-            self._vvp_quality = opts.get("vvp_quality")
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
-    def prefetch_battery(self, api: "MeariApiClient") -> None:
-        """Pre-load battery info using an already-authenticated API client.
-
-        Call this during integration setup (before entity platforms load) so
-        battery sensors have a value immediately instead of showing *unknown*
-        until the background thread logs in.
-        """
-        if not self._is_snap:
-            return
-        try:
-            info = api.get_battery_info(self._sn_num)
-            if not info:
-                return
-            pct = info.get("154")
-            charge = info.get("156")
-            if pct is not None:
-                pct_int = int(pct)
-                if 0 <= pct_int <= 100:
-                    self._battery_percent = pct_int
-            if charge is not None:
-                self._battery_charging = int(charge) == 1
-        except Exception as exc:
-            _LOGGER.warning("Prefetch battery failed for %s: %s", self._sn_num, exc)
-
-    def prefetch_lamp(self, api: "MeariApiClient") -> None:
-        """Pre-load lamp state using an already-authenticated API client."""
-        if not self._has_lamp:
-            return
-        try:
-            iot = api.get_device_iot_config(self._sn_num)
-            if not iot:
-                return
-            lamp_val = iot.get("167")
-            if lamp_val is not None:
-                self._lamp_on = int(lamp_val) == 1
-        except Exception as exc:
-            _LOGGER.warning("Prefetch lamp failed for %s: %s", self._sn_num, exc)
+        self._update_callbacks: list[Callable[[], None]] = []
+        self._motion_callbacks: list[Callable[[], None]] = []
 
     @property
     def available(self) -> bool:
@@ -402,12 +149,12 @@ class CloudEdgeMeariCoordinator(
         return self._latest_image
 
     @property
-    def motion_detected(self) -> bool:
-        return self._motion_detected
-
-    @property
     def motion_type(self) -> str:
         return self._motion_type
+
+    @property
+    def motion_detected(self) -> bool:
+        return self._motion_detected
 
     @property
     def device_uuid(self) -> str:
@@ -418,39 +165,20 @@ class CloudEdgeMeariCoordinator(
         return self._device_name
 
     @property
-    def is_battery_camera(self) -> bool:
-        return self._is_snap
-
-    @property
-    def device_category(self) -> str:
-        return self._device_category or "unknown"
-
-    @property
     def device_model(self) -> str:
-        if self._is_snap:
-            return "Battery Camera (snap)"
-        return f"Camera ({self.device_category})"
+        return f"Camera ({self._device_category or 'unknown'})"
 
     @property
     def device_id(self) -> int:
         return self._device_id
 
     @property
-    def stream_port(self) -> int:
-        """TCP port for the MPEG-TS stream server."""
-        return self._stream_port
+    def is_battery_camera(self) -> bool:
+        return self._is_snap
 
     @property
     def camera_awake(self) -> bool:
         return self._camera_awake
-
-    @property
-    def motion_wake_enabled(self) -> bool:
-        return self._motion_wake_enabled
-
-    @property
-    def motion_timeout(self) -> int:
-        return self._motion_timeout
 
     @property
     def battery_percent(self) -> int | None:
@@ -459,6 +187,14 @@ class CloudEdgeMeariCoordinator(
     @property
     def battery_charging(self) -> bool:
         return self._battery_charging
+
+    @property
+    def motion_wake_enabled(self) -> bool:
+        return self._motion_wake_enabled
+
+    @property
+    def motion_timeout(self) -> int:
+        return self._motion_timeout
 
     @property
     def has_lamp(self) -> bool:
@@ -473,16 +209,17 @@ class CloudEdgeMeariCoordinator(
         return self._has_ptz
 
     @property
+    def stream_port(self) -> int:
+        return self._stream_server.port
+
+    @property
     def stream_host_mode(self) -> str:
         return self._stream_host_mode
 
     @property
     def stream_host(self) -> str:
-        """Return the host to use in stream URLs."""
         if self._stream_host_mode == "docker":
             return socket.gethostname()
-        # IP mode — open a UDP socket to determine the LAN-facing IP.
-        # No data is actually sent; connect() just selects the interface.
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -492,301 +229,811 @@ class CloudEdgeMeariCoordinator(
         except OSError:
             return "127.0.0.1"
 
-    # ------------------------------------------------------------------
-    # Setters
-    # ------------------------------------------------------------------
-
-    def _persist_option(self, key: str, value) -> None:
-        """Persist a per-device setting to config entry options."""
-        if self._entry is None:
-            return
-        new_opts = dict(self._entry.options)
-        new_opts[key] = value
-        try:
-            self.hass.config_entries.async_update_entry(
-                self._entry,
-                options=new_opts,
-            )
-        except Exception:
-            _LOGGER.debug("Could not persist option %s", key, exc_info=True)
-
-    def set_motion_wake_enabled(self, enabled: bool) -> None:
-        self._motion_wake_enabled = enabled
-        self._persist_option("motion_wake_enabled", enabled)
-        _LOGGER.info(
-            "Motion wake %s for %s",
-            "enabled" if enabled else "disabled",
-            self._sn_num,
-        )
-        self._fire_update()
-
-    def set_motion_timeout(self, timeout: int) -> None:
-        self._motion_timeout = max(10, min(timeout, 600))
-        self._persist_option("motion_timeout", self._motion_timeout)
-        _LOGGER.info(
-            "Motion timeout set to %ds for %s",
-            self._motion_timeout,
-            self._sn_num,
-        )
-        self._fire_update()
-
-    def set_stream_host_mode(self, mode: str) -> None:
-        """Set stream host mode: 'ip' or 'docker'."""
-        self._stream_host_mode = mode
-        self._persist_option("stream_host_mode", mode)
-        _LOGGER.info(
-            "Stream host mode set to %s for %s",
-            mode,
-            self._sn_num,
-        )
-        self._fire_update()
-
     @property
     def quality_profiles(self) -> dict[int, str]:
-        """Return available quality profiles ``{id: label}`` from device caps."""
-        from ..p2p_streamer import parse_quality_profiles
-
         return parse_quality_profiles(self._device)
 
     @property
     def vvp_quality(self) -> int | None:
-        """Current VVP quality override (``None`` = auto/highest)."""
         return self._vvp_quality
 
     def set_vvp_quality(self, quality: int | None) -> None:
-        """Set VVP quality profile for future P2P sessions."""
         self._vvp_quality = quality
-        self._persist_option("vvp_quality", quality)
-        _LOGGER.info(
-            "VVP quality set to %s for %s",
-            quality if quality is not None else "auto",
-            self._sn_num,
-        )
         self._fire_update()
 
-    def wake_camera(self) -> None:
-        """Trigger a manual camera wake."""
-        self._wake_event.set()
-        _LOGGER.info("Manual wake requested for %s", self._sn_num)
+    def set_stream_host_mode(self, mode: str) -> None:
+        if mode not in {"ip", "docker"}:
+            return
+        self._stream_host_mode = mode
+        self._fire_update()
 
-    # ------------------------------------------------------------------
-    # Callback management
-    # ------------------------------------------------------------------
+    def set_motion_wake_enabled(self, enabled: bool) -> None:
+        self._motion_wake_enabled = bool(enabled)
+        if self._motion_wake_enabled and self._motion_detected:
+            self._wake_event.set()
+            self._extend_live_deadline()
+            self._set_camera_awake(True)
+        self._fire_update()
+
+    def set_motion_timeout(self, seconds: int) -> None:
+        self._motion_timeout = max(10, min(600, int(seconds)))
+        if self._camera_awake:
+            self._extend_live_deadline()
+        self._fire_update()
+
+    def prefetch_battery(self, api: MeariApiClient) -> None:
+        self._api = api
+        if not self._is_snap:
+            return
+        try:
+            info = api.get_battery_info(self._sn_num)
+            if not info and api.openapi_server:
+                info = api.get_device_iot_config(self._sn_num)
+            changed = self._apply_battery_info(info)
+            changed = self._apply_video_encryption_info(info) or changed
+            if changed:
+                self._fire_update()
+        except Exception as exc:
+            _LOGGER.warning("Battery prefetch failed for %s: %s", self._sn_num, exc)
+
+    def prefetch_lamp(self, api: MeariApiClient) -> None:
+        self._api = api
+        try:
+            iot = api.get_device_iot_config(self._sn_num)
+        except Exception as exc:
+            _LOGGER.debug("Lamp prefetch failed for %s: %s", self._sn_num, exc)
+            return
+        changed = self._apply_battery_info(iot)
+        changed = self._apply_video_encryption_info(iot) or changed
+        if changed:
+            self._fire_update()
+        if IOT_CODE_LAMP not in iot:
+            return
+        self._has_lamp = True
+        self._lamp_on = self._as_int(iot.get(IOT_CODE_LAMP)) == 1
+
+    def set_lamp(self, enabled: bool) -> bool:
+        api = self._api
+        if api is None:
+            return False
+        ok = api.set_device_iot_value(self._sn_num, IOT_CODE_LAMP, 1 if enabled else 0)
+        if ok:
+            self._has_lamp = True
+            self._lamp_on = bool(enabled)
+            self._fire_update()
+        return ok
+
+    def ptz_move(self, direction: str) -> bool:
+        api = self._api
+        if api is None or direction not in PTZ_DIRECTIONS:
+            return False
+        return api.ptz_start(self._sn_num, direction)
+
+    def ptz_stop(self) -> bool:
+        api = self._api
+        return bool(api and api.ptz_stop(self._sn_num))
+
+    def wake_camera(self) -> None:
+        self._wake_event.set()
+        self._extend_live_deadline()
+        self._set_camera_awake(True)
 
     def register_motion_callback(self, cb: Callable[[], None]) -> Callable[[], None]:
         self._motion_callbacks.append(cb)
-        return lambda: self._motion_callbacks.remove(cb)
+        return lambda: self._remove_callback(self._motion_callbacks, cb)
 
     def register_update_callback(self, cb: Callable[[], None]) -> Callable[[], None]:
         self._update_callbacks.append(cb)
-        return lambda: self._update_callbacks.remove(cb)
+        return lambda: self._remove_callback(self._update_callbacks, cb)
 
-    def _fire_motion(self) -> None:
-        if self.hass.loop.is_closed():
-            return
-        for cb in self._motion_callbacks:
-            self.hass.loop.call_soon_threadsafe(cb)
+    @staticmethod
+    def _remove_callback(
+        callbacks: list[Callable[[], None]],
+        cb: Callable[[], None],
+    ) -> None:
+        try:
+            callbacks.remove(cb)
+        except ValueError:
+            pass
 
     def _fire_update(self) -> None:
         if self.hass.loop.is_closed():
             return
-        for cb in self._update_callbacks:
+        for cb in list(self._update_callbacks):
             self.hass.loop.call_soon_threadsafe(cb)
 
-    # ------------------------------------------------------------------
-    # Start / Stop
-    # ------------------------------------------------------------------
+    def _fire_motion(self) -> None:
+        if self.hass.loop.is_closed():
+            return
+        for cb in list(self._motion_callbacks):
+            self.hass.loop.call_soon_threadsafe(cb)
+
+    def _set_camera_awake(self, awake: bool) -> None:
+        awake = bool(awake)
+        if self._camera_awake == awake:
+            return
+        self._camera_awake = awake
+        self._fire_update()
+
+    def _set_motion(self, detected: bool, motion_type: str = "") -> None:
+        detected = bool(detected)
+        motion_type = motion_type if detected else ""
+        changed = self._motion_detected != detected or self._motion_type != motion_type
+        self._motion_detected = detected
+        self._motion_type = motion_type
+        if changed:
+            self._fire_motion()
+            self._fire_update()
+
+    def _extend_live_deadline(self, seconds: float | None = None) -> None:
+        duration = float(seconds if seconds is not None else self._motion_timeout)
+        self._live_deadline = max(self._live_deadline, time.monotonic() + duration)
+
+    def _note_motion(self, motion_type: str) -> None:
+        self._last_motion_time = time.monotonic()
+        self._set_motion(True, motion_type)
+        if self._is_snap and self._motion_wake_enabled:
+            self._wake_event.set()
+            self._extend_live_deadline()
+            self._set_camera_awake(True)
+
+    @staticmethod
+    def _as_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _iot_value(self, info: dict[str, Any], code: str) -> Any:
+        value = info.get(code)
+        if value is None:
+            value = info.get(self._as_int(code))
+        if isinstance(value, dict):
+            value = value.get("value")
+        return value
+
+    def _apply_battery_info(self, info: dict[str, Any]) -> bool:
+        if not info:
+            return False
+
+        changed = False
+        percent = self._as_int(self._iot_value(info, IOT_CODE_BATTERY_PERCENT))
+        charging = self._as_int(self._iot_value(info, IOT_CODE_CHARGE_STATUS))
+
+        if percent is not None and 0 <= percent <= 100:
+            changed = changed or self._battery_percent != percent
+            self._battery_percent = percent
+        if charging is not None:
+            is_charging = charging == 1
+            changed = changed or self._battery_charging != is_charging
+            self._battery_charging = is_charging
+        return changed
+
+    def _apply_video_encryption_info(self, info: dict[str, Any]) -> bool:
+        state = self._as_int(self._iot_value(info, IOT_CODE_VIDEO_ENCRYPTION))
+        if state is None:
+            return False
+
+        enabled = state == 1
+        changed = self._video_e2ee_enabled != enabled
+        self._video_e2ee_enabled = enabled
+
+        effective_password = self._configured_video_password if enabled else ""
+        if self._video_password != effective_password:
+            changed = True
+            self._video_password = effective_password
+            if self._configured_video_password and not enabled:
+                _LOGGER.debug(
+                    "Ignoring stored video password for %s because E2EE is disabled",
+                    self._sn_num,
+                )
+        return changed
+
+    def _poll_battery(self) -> None:
+        api = self._api
+        if not self._is_snap or api is None:
+            return
+        for attempt in range(2):
+            try:
+                info = api.get_battery_info(self._sn_num)
+                if not info and api.openapi_server:
+                    info = api.get_device_iot_config(self._sn_num)
+                changed = self._apply_battery_info(info)
+                changed = self._apply_video_encryption_info(info) or changed
+                if changed:
+                    self._fire_update()
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    _LOGGER.debug("Battery poll retry for %s: %s", self._sn_num, exc)
+                    try:
+                        api.login()
+                    except Exception:
+                        pass
+                    continue
+                _LOGGER.debug("Battery poll failed for %s: %s", self._sn_num, exc)
+
+    @staticmethod
+    def _detect_ptz_support(device: dict[str, Any]) -> bool:
+        capability = str(device.get("capability") or "").lower()
+        return any(token in capability for token in ("ptz", "ptz2", "pan", "tilt"))
 
     async def async_start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._start_stream_server()
+        self._stream_server.start()
+        self._start_idle_loop()
         self._available = True
-        # Muxer start is deferred until the first real video keyframe
-        # arrives so ffmpeg probes against live data with the correct
-        # codec format.  Starting it eagerly here would use a stale
-        # default codec (hevc) and no video bytes, causing the probe to
-        # time out and the muxer to exit immediately with code 255.
-        self._generate_black_keyframe()
-        self._thread = threading.Thread(
-            target=self._watch_loop,
-            name=f"cloudplus_{self._sn_num}",
-            daemon=True,
-        )
+        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
-        _LOGGER.info("Started CloudEdge / Meari coordinator for %s", self._sn_num)
+        self._fire_update()
 
     async def async_stop(self) -> None:
         self._running = False
-        self._stop_mqtt()
-        # Stop P2P streamer if active
-        if self._p2p_streamer:
-            self._p2p_streamer.request_stop()
-        self._stop_ffmpeg_muxer()
-        self._stop_stream_server()
-        if self._stream_thread:
+        self._stop_motion_listener()
+        self._idle_stop.set()
+        self._stop_streamer(join_timeout=4)
+        if self._idle_thread is not None:
+            self._idle_thread.join(timeout=4)
+            self._idle_thread = None
+        if self._stream_thread is not None:
             self._stream_thread.join(timeout=4)
-            if self._stream_thread.is_alive():
-                _LOGGER.debug("Stream worker still alive after stop timeout")
             self._stream_thread = None
-        if self._thread:
+        if self._thread is not None:
             self._thread.join(timeout=4)
-            if self._thread.is_alive():
-                _LOGGER.debug("Coordinator watch loop still alive after stop timeout")
             self._thread = None
+        self._muxer.stop()
+        self._stream_server.stop()
         self._available = False
-        _LOGGER.info("Stopped CloudEdge / Meari coordinator for %s", self._sn_num)
+        self._set_camera_awake(False)
+        self._fire_update()
 
-    # ------------------------------------------------------------------
-    # Polling helpers
-    # ------------------------------------------------------------------
+    def _watch_loop(self) -> None:
+        while self._running:
+            try:
+                api = MeariApiClient(
+                    email=self._email,
+                    password=self._password,
+                    country_code=self._country_code,
+                    phone_code=self._phone_code,
+                    app_profile=self._app_profile,
+                )
+                api.login()
+                self._api = api
+                self._available = True
+                self._fire_update()
+                self._start_motion_listener(api)
+                try:
+                    self._session_loop()
+                finally:
+                    self._stop_motion_listener()
+                    self._stop_streamer(join_timeout=4)
+                    self._api = None
+            except Exception as exc:
+                _LOGGER.warning("Coordinator session loop failed: %s", exc)
+                self._available = False
+                self._set_camera_awake(False)
+                self._fire_update()
+                time.sleep(2)
 
-    def _refresh_video_encryption_state(self) -> None:
-        """Refresh whether device video-password mode is enabled.
+    def _session_loop(self) -> None:
+        if self._is_snap:
+            self._snap_session_loop()
+        else:
+            self._ipc_session_loop()
 
-        IoT code ``216`` maps to ``videoPwdIsSet`` in the official app.
-        """
-        if not self._api:
+    def _snap_session_loop(self) -> None:
+        self._poll_battery()
+        if self._initial_frame_grab and not self._idle_frame_ready.is_set():
+            self._send_wake()
+            self._run_initial_frame_grab()
+
+        last_battery_poll = time.monotonic()
+        next_grab_retry = time.monotonic() + 30.0
+        while self._running:
+            now = time.monotonic()
+            if now - last_battery_poll >= BATTERY_POLL_INTERVAL:
+                self._poll_battery()
+                last_battery_poll = now
+
+            if (
+                self._initial_frame_grab
+                and not self._idle_frame_ready.is_set()
+                and now >= next_grab_retry
+            ):
+                self._send_wake()
+                self._run_initial_frame_grab()
+                next_grab_retry = time.monotonic() + 60.0
+
+            self._consume_wake_event()
+            if self._motion_detected and self._motion_wake_enabled:
+                self._live_deadline = max(
+                    self._live_deadline,
+                    self._last_motion_time + float(self._motion_timeout),
+                )
+
+            if now < self._live_deadline:
+                self._run_live_until_deadline()
+                continue
+
+            self._set_camera_awake(False)
+            time.sleep(0.2)
+
+    def _ipc_session_loop(self) -> None:
+        self._set_camera_awake(True)
+        while self._running:
+            self._consume_wake_event()
+            should_stream = (
+                self._stream_server.client_count > 0
+                or time.monotonic() < self._live_deadline
+            )
+            if not should_stream:
+                self._stop_streamer(join_timeout=2)
+                self._muxer.stop()
+                time.sleep(1)
+                continue
+
+            if not self._stream_thread or not self._stream_thread.is_alive():
+                self._stream_thread = None
+                self._start_streamer_once()
+
+            worker = self._stream_thread
+            if worker is None:
+                time.sleep(1)
+                continue
+            worker.join(timeout=1)
+            if not worker.is_alive() and self._stream_thread is worker:
+                self._stream_thread = None
+
+    def _run_initial_frame_grab(self) -> None:
+        self._set_camera_awake(True)
+        self._idle_frame_ready.clear()
+        self._start_streamer_once(grab_only=True)
+        deadline = time.monotonic() + self._initial_grab_timeout
+        while self._running and time.monotonic() < deadline:
+            if self._idle_frame_ready.wait(timeout=0.2):
+                break
+        self._stop_streamer(join_timeout=4)
+        self._set_camera_awake(False)
+
+    def _run_live_until_deadline(self) -> None:
+        self._set_camera_awake(True)
+        while self._running and time.monotonic() < self._live_deadline:
+            self._consume_wake_event()
+            if not self._stream_thread or not self._stream_thread.is_alive():
+                self._stream_thread = None
+                self._muxer.stop()
+                self._start_streamer_once()
+
+            worker = self._stream_thread
+            if worker is None:
+                time.sleep(0.5)
+                continue
+            worker.join(timeout=0.5)
+            if not worker.is_alive() and self._stream_thread is worker:
+                self._stream_thread = None
+                time.sleep(0.5)
+
+        if self._running and time.monotonic() < self._live_deadline:
             return
+        self._request_streamer_stop()
+        self._set_motion(False)
+        self._prime_idle_stream()
+        if time.monotonic() >= self._live_deadline:
+            self._set_camera_awake(False)
+        self._join_streamer(join_timeout=1)
 
+    def _consume_wake_event(self) -> None:
+        if not self._wake_event.is_set():
+            return
+        self._wake_event.clear()
+        self._extend_live_deadline()
+        self._send_wake()
+
+    def _send_wake(self) -> None:
+        if not self._is_snap or self._api is None:
+            return
         try:
-            iot = self._api.get_device_iot_config(self._sn_num)
-            raw = iot.get("216") if isinstance(iot, dict) else None
-            enabled = str(raw).strip().lower() in {"1", "true", "yes", "on"}
-            self._video_encryption_enabled = enabled
-            _LOGGER.debug(
-                "Video encryption flag for %s: enabled=%s raw=%r",
-                self._sn_num,
-                enabled,
-                raw,
-            )
-        except Exception as e:
-            self._video_encryption_enabled = False
-            _LOGGER.debug(
-                "Video encryption flag refresh failed for %s: %s",
-                self._sn_num,
-                e,
-            )
+            self._api.wake_device(self._sn_num, self._device_id)
+        except Exception as exc:
+            _LOGGER.debug("Wake failed for %s: %s", self._sn_num, exc)
 
-    def _poll_battery(self) -> None:
-        """Poll battery info, re-login once if the call fails."""
+    def _start_motion_listener(self, api: MeariApiClient) -> None:
+        self._stop_motion_listener()
+        self._motion_listener = MotionEventListener(
+            api, self._device_id, self._sn_num, self._note_motion
+        )
+        self._motion_listener.start()
+
+    def _stop_motion_listener(self) -> None:
+        listener = self._motion_listener
+        self._motion_listener = None
+        if listener is not None:
+            listener.stop()
+
+    def _start_idle_loop(self) -> None:
         if not self._is_snap:
             return
-        if not self._api:
+        if self._idle_thread is not None and self._idle_thread.is_alive():
             return
-        for attempt in range(2):
-            try:
-                info = self._api.get_battery_info(self._sn_num)
-                if not info:
-                    if attempt == 0:
-                        _LOGGER.debug(
-                            "Battery poll returned empty for %s, retrying after re-login",
-                            self._sn_num,
-                        )
-                        self._api.login()
-                        continue
-                    return
+        self._idle_stop.clear()
+        self._idle_thread = threading.Thread(
+            target=self._idle_loop,
+            name=f"cloudplus_idle_{self._sn_num}",
+            daemon=True,
+        )
+        self._idle_thread.start()
 
-                pct = info.get("154")
-                charge = info.get("156")
+    def _idle_loop(self) -> None:
+        next_frame = time.monotonic()
+        pts_interval = IDLE_REFRESH_INTERVAL
+        while self._running and not self._idle_stop.is_set():
+            if self._camera_awake:
+                next_frame = time.monotonic()
+                self._idle_stop.wait(0.1)
+                continue
 
-                if pct is not None:
-                    try:
-                        pct_int = int(pct)
-                        if 0 <= pct_int <= 100:
-                            changed = self._battery_percent != pct_int
-                            self._battery_percent = pct_int
-                            if changed:
-                                self._fire_update()
-                    except (ValueError, TypeError):
-                        pass
+            with self._idle_frame_lock:
+                frame = self._idle_video_frame
+                codec = self._idle_video_codec
+            if not frame:
+                self._idle_stop.wait(0.2)
+                continue
 
-                if charge is not None:
-                    try:
-                        charge_int = int(charge)
-                        is_charging = charge_int == 1
-                        changed = self._battery_charging != is_charging
-                        self._battery_charging = is_charging
-                        if changed:
-                            self._fire_update()
-                    except (ValueError, TypeError):
-                        pass
-                return  # success
-            except Exception as e:
-                if attempt == 0:
-                    _LOGGER.debug(
-                        "Battery poll failed for %s (%s), retrying after re-login",
-                        self._sn_num,
-                        e,
-                    )
-                    try:
-                        self._api.login()
-                    except Exception:
-                        _LOGGER.warning(
-                            "Battery poll re-login failed for %s", self._sn_num
-                        )
-                        return
-                else:
-                    _LOGGER.warning("Battery poll failed for %s: %s", self._sn_num, e)
-
-    def _poll_lamp(self) -> None:
-        """Poll lamp state from the device IoT config."""
-        if not self._has_lamp:
-            return
-        if not self._api:
-            return
-        try:
-            iot = self._api.get_device_iot_config(self._sn_num)
-            if not iot:
-                return
-            lamp_val = iot.get("167")
-            if lamp_val is not None:
-                is_on = int(lamp_val) == 1
-                if self._lamp_on != is_on:
-                    self._lamp_on = is_on
-                    self._fire_update()
-        except Exception as e:
-            _LOGGER.debug("Lamp poll failed for %s: %s", self._sn_num, e)
-
-    def set_lamp(self, on: bool) -> None:
-        """Turn the lamp on or off via the API."""
-        if not self._has_lamp:
-            return
-        if not self._api:
-            return
-        try:
-            self._api.set_device_iot_value(self._sn_num, "167", 1 if on else 0)
-            self._lamp_on = on
-            self._fire_update()
-        except Exception as e:
-            _LOGGER.warning("Lamp set failed for %s: %s", self._sn_num, e)
-
-    def ptz_move(self, direction: str) -> None:
-        """Start PTZ movement in the given direction (left/right/up/down)."""
-        if not self._has_ptz:
-            _LOGGER.warning("PTZ not supported on %s", self._sn_num)
-            return
-        if not self._api:
-            return
-        try:
-            self._api.ptz_start(
-                self._sn_num,
-                direction,
-                use_ptz2=self._has_ptz2,
+            has_clients = self._stream_server.client_count > 0
+            bootstrap_ready = bool(
+                self._stream_server.bootstrap_state().get("ready", False)
             )
-            _LOGGER.info("PTZ move %s on %s", direction, self._sn_num)
-        except Exception as e:
-            _LOGGER.warning("PTZ move failed for %s: %s", self._sn_num, e)
+            if not has_clients and bootstrap_ready:
+                self._muxer.stop()
+                next_frame = time.monotonic()
+                self._idle_stop.wait(IDLE_NO_CLIENT_SLEEP)
+                continue
 
-    def ptz_stop(self) -> None:
-        """Stop any ongoing PTZ movement."""
-        if not self._has_ptz:
+            self._muxer.start(codec, advertised_fps=IDLE_ADVERTISED_FPS)
+            self._muxer.write_video(frame, pts_interval_s=pts_interval)
+            next_frame += IDLE_REFRESH_INTERVAL
+            delay = max(0.0, next_frame - time.monotonic())
+            if delay > IDLE_REFRESH_INTERVAL:
+                next_frame = time.monotonic() + IDLE_REFRESH_INTERVAL
+                delay = IDLE_REFRESH_INTERVAL
+            self._idle_stop.wait(delay)
+
+    def _prime_idle_stream(self) -> None:
+        with self._idle_frame_lock:
+            frame = self._idle_video_frame
+            codec = self._idle_video_codec
+        if not frame:
             return
-        if not self._api:
+        self._muxer.start(codec, advertised_fps=IDLE_ADVERTISED_FPS)
+        self._muxer.replace_video(frame, pts_interval_s=IDLE_REFRESH_INTERVAL)
+
+    def _stop_streamer(self, join_timeout: float = 4.0) -> None:
+        self._request_streamer_stop()
+        self._join_streamer(join_timeout)
+
+    def _request_streamer_stop(self) -> None:
+        streamer = self._p2p_streamer
+        if streamer is not None:
+            streamer.request_stop()
+
+    def _join_streamer(self, join_timeout: float = 4.0) -> None:
+        worker = self._stream_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=join_timeout)
+            if not worker.is_alive() and self._stream_thread is worker:
+                self._stream_thread = None
+
+    def _remember_idle_frame(self, codec: str, payload: bytes) -> None:
+        frame = bytes(payload)
+        with self._idle_frame_lock:
+            self._idle_video_codec = codec
+            self._idle_video_frame = frame
+            self._latest_video_kf = frame
+        self._idle_frame_ready.set()
+        self._maybe_convert_snapshot(codec, frame)
+
+    def _maybe_convert_snapshot(self, codec: str, payload: bytes) -> None:
+        if not self._snapshot_conversion_enabled or not payload:
             return
+        now = time.monotonic()
+        if (
+            self._latest_image is not None
+            and now - self._last_snapshot_convert_time < self._snapshot_convert_interval
+        ):
+            return
+        if not self._snapshot_convert_lock.acquire(blocking=False):
+            return
+        self._last_snapshot_convert_time = now
+        threading.Thread(
+            target=self._convert_snapshot,
+            args=(codec, bytes(payload)),
+            name=f"cloudplus_snapshot_{self._sn_num}",
+            daemon=True,
+        ).start()
+
+    def _convert_snapshot(self, codec: str, payload: bytes) -> None:
         try:
-            self._api.ptz_stop(self._sn_num, use_ptz2=self._has_ptz2)
-            _LOGGER.info("PTZ stop on %s", self._sn_num)
-        except Exception as e:
-            _LOGGER.warning("PTZ stop failed for %s: %s", self._sn_num, e)
+            jpeg = self._video_to_jpeg(codec, payload)
+            if jpeg:
+                self._latest_image = jpeg
+                self._fire_update()
+        finally:
+            self._snapshot_convert_lock.release()
+
+    @staticmethod
+    def _video_to_jpeg(codec: str, payload: bytes) -> bytes | None:
+        video_format = "h264" if codec == "h264" else "hevc"
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    video_format,
+                    "-probesize",
+                    "32768",
+                    "-analyzeduration",
+                    "500000",
+                    "-i",
+                    "pipe:0",
+                    "-vframes",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "mjpeg",
+                    "-q:v",
+                    "5",
+                    "pipe:1",
+                ],
+                input=payload,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            _LOGGER.debug("Snapshot conversion failed: %s", exc)
+            return None
+        return proc.stdout if proc.returncode == 0 and proc.stdout else None
+
+    def _start_streamer_once(self, *, grab_only: bool = False) -> None:
+        if self._stream_thread is not None and self._stream_thread.is_alive():
+            return
+        if self._api is None:
+            return
+
+        self._p2p_session_generation += 1
+        self._stream_started_keyframe = False
+
+        def stream_allowed() -> bool:
+            return (
+                grab_only or not self._is_snap or time.monotonic() < self._live_deadline
+            )
+
+        def on_video(payload: bytes) -> None:
+            if not stream_allowed():
+                return
+            self._last_p2p_video_time = time.monotonic()
+            self._last_video_time = self._last_p2p_video_time
+            self._p2p_video_frames += 1
+            detected = detect_codec(payload, default=self._video_codec)
+            if detected != self._video_codec:
+                self._video_codec = detected
+                self._muxer.stop()
+                self._stream_started_keyframe = False
+
+            self._remember_codec_params(self._video_codec, payload)
+            if not self._codec_params_ready(self._video_codec):
+                return
+            is_keyframe = self._is_keyframe(self._video_codec, payload)
+            if not self._stream_started_keyframe:
+                if not is_keyframe:
+                    return
+                self._stream_started_keyframe = True
+
+            payload = self._with_codec_params(self._video_codec, payload)
+            if is_keyframe:
+                self._remember_idle_frame(self._video_codec, payload)
+            self._muxer.start(
+                self._video_codec,
+                advertised_fps=self._video_mux_target_fps,
+            )
+            self._muxer.write_video(payload)
+            if grab_only and is_keyframe and self._p2p_streamer is not None:
+                self._p2p_streamer.request_stop()
+
+        def on_audio(payload: bytes) -> None:
+            if not stream_allowed():
+                return
+            self._last_p2p_audio_time = time.monotonic()
+            self._muxer.write_audio(payload)
+
+        def _worker() -> None:
+            self._p2p_streamer = P2PStreamer(
+                api=self._api,
+                device=self._device,
+                on_video=on_video,
+                on_audio=on_audio,
+                on_login=lambda: None,
+                on_disconnect=lambda: None,
+                vvp_quality=self._vvp_quality,
+                video_password=self._video_password,
+            )
+            self._p2p_streamer.run_session()
+            self._p2p_streamer = None
+
+        self._stream_thread = threading.Thread(target=_worker, daemon=True)
+        self._stream_thread.start()
+
+    def _count_recent_gap_events(self, *, severity: str, within_s: float) -> int:
+        _ = severity
+        _ = within_s
+        return 0
+
+    def _is_valid_idr_seed(self, seed: bytes) -> bool:
+        return bool(seed)
+
+    @staticmethod
+    def _annexb_units(payload: bytes) -> list[bytes]:
+        starts: list[tuple[int, int]] = []
+        i = 0
+        while i + 3 < len(payload):
+            if payload[i] == 0 and payload[i + 1] == 0:
+                if payload[i + 2] == 1:
+                    starts.append((i, 3))
+                    i += 3
+                    continue
+                if i + 3 < len(payload) and payload[i + 2] == 0 and payload[i + 3] == 1:
+                    starts.append((i, 4))
+                    i += 4
+                    continue
+            i += 1
+        units: list[bytes] = []
+        for idx, (start, _sc_len) in enumerate(starts):
+            end = starts[idx + 1][0] if idx + 1 < len(starts) else len(payload)
+            if end > start:
+                units.append(payload[start:end])
+        return units
+
+    def _remember_codec_params(self, codec: str, payload: bytes) -> None:
+        for unit in self._annexb_units(payload):
+            nal = unit[3:] if unit.startswith(b"\x00\x00\x01") else unit[4:]
+            if not nal:
+                continue
+            if codec == "h264":
+                nal_type = nal[0] & 0x1F
+                if nal_type == 7:
+                    self._h264_sps = unit
+                elif nal_type == 8:
+                    self._h264_pps = unit
+            else:
+                if len(nal) < 2:
+                    continue
+                nal_type = (nal[0] >> 1) & 0x3F
+                if nal_type == 32:
+                    self._hevc_vps = unit
+                elif nal_type == 33:
+                    self._hevc_sps = unit
+                elif nal_type == 34:
+                    self._hevc_pps = unit
+
+    def _codec_params_ready(self, codec: str) -> bool:
+        if codec == "h264":
+            return self._h264_sps is not None and self._h264_pps is not None
+        return (
+            self._hevc_vps is not None
+            and self._hevc_sps is not None
+            and self._hevc_pps is not None
+        )
+
+    def _with_codec_params(self, codec: str, payload: bytes) -> bytes:
+        units = self._annexb_units(payload)
+        if not units:
+            return payload
+        nal_types: set[int] = set()
+        has_idr = False
+        for unit in units:
+            nal = unit[3:] if unit.startswith(b"\x00\x00\x01") else unit[4:]
+            if not nal:
+                continue
+            if codec == "h264":
+                nal_type = nal[0] & 0x1F
+                nal_types.add(nal_type)
+                has_idr = has_idr or nal_type == 5
+            elif len(nal) >= 2:
+                nal_type = (nal[0] >> 1) & 0x3F
+                nal_types.add(nal_type)
+                has_idr = has_idr or nal_type in {19, 20}
+        if not has_idr:
+            return payload
+        prefix: list[bytes] = []
+        if codec == "h264":
+            if 7 not in nal_types and self._h264_sps:
+                prefix.append(self._h264_sps)
+            if 8 not in nal_types and self._h264_pps:
+                prefix.append(self._h264_pps)
+        else:
+            if 32 not in nal_types and self._hevc_vps:
+                prefix.append(self._hevc_vps)
+            if 33 not in nal_types and self._hevc_sps:
+                prefix.append(self._hevc_sps)
+            if 34 not in nal_types and self._hevc_pps:
+                prefix.append(self._hevc_pps)
+        return b"".join(prefix) + payload if prefix else payload
+
+    def _is_keyframe(self, codec: str, payload: bytes) -> bool:
+        for unit in self._annexb_units(payload):
+            nal = unit[3:] if unit.startswith(b"\x00\x00\x01") else unit[4:]
+            if not nal:
+                continue
+            if codec == "h264":
+                if (nal[0] & 0x1F) == 5:
+                    return True
+            elif len(nal) >= 2:
+                if ((nal[0] >> 1) & 0x3F) in {19, 20}:
+                    return True
+        return False
+
+    def _probe_bootstrap_seed_decode(
+        self, seed: bytes, *, max_frames: int = 6
+    ) -> tuple[bool, str]:
+        _ = max_frames
+        if not seed:
+            seed = self._stream_server.bootstrap_snapshot()
+        return (bool(seed), "validated-idr" if seed else "seed-empty")
+
+    def get_gap_skip_events_snapshot(self) -> list[dict[str, Any]]:
+        return []
+
+    def get_stream_join_diagnostics_snapshot(self) -> list[dict[str, Any]]:
+        return []
+
+    def get_startup_bootstrap_state(self) -> dict[str, Any]:
+        now = time.monotonic()
+        video_age_s = (
+            (now - self._last_p2p_video_time)
+            if self._last_p2p_video_time > 0
+            else 999.0
+        )
+        bootstrap = self._stream_server.bootstrap_state()
+        seed_generation = int(bootstrap.get("generation", 0) or 0)
+        if seed_generation != self._stream_idr_seed_generation:
+            self._stream_idr_seed = self._stream_server.bootstrap_snapshot()
+            self._stream_idr_seed_generation = seed_generation
+        seed_valid = bool(bootstrap.get("ready", False))
+        backlog_frame_target = 60 if self._video_codec == "hevc" else 45
+        backlog_ready = seed_valid and self._p2p_video_frames > backlog_frame_target
+        startup_safe = video_age_s < 1.0 and backlog_ready
+        required_generation = max(1, int(self._startup_safe_min_seed_generation))
+        return {
+            "startup_safe": startup_safe,
+            "block_reason": (
+                "ready"
+                if startup_safe
+                else (
+                    "seed-awaiting-idr"
+                    if video_age_s < 1.0 and not seed_valid
+                    else "backlog-warming" if video_age_s < 1.0 else "video-not-recent"
+                )
+            ),
+            "seed_valid": seed_valid,
+            "seed_strong": seed_valid,
+            "seed_video_bytes": int(bootstrap.get("bytes", 0) or 0),
+            "seed_strength_reason": "validated-idr" if seed_valid else "seed-empty",
+            "seed_mono": 0.0,
+            "seed_generation": seed_generation,
+            "required_seed_generation": required_generation,
+            "seed_age_s": 0.0,
+            "frames_since_seed": int(bootstrap.get("frames_since_seed", 0) or 0),
+            "collecting": bool(bootstrap.get("collecting", False)),
+            "video_age_s": float(video_age_s),
+            "backlog_follow_video_pusi_target": backlog_frame_target,
+            "backlog_ready": bool(backlog_ready),
+            "backlog_generation_safe": True,
+            "backlog_candidate_bytes": int(bootstrap.get("bytes", 0) or 0),
+            "preferred_join_mode": "ready-backlog" if backlog_ready else "pending",
+            "latest_severe_gap_event": None,
+        }

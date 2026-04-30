@@ -34,7 +34,7 @@
     "step": {
       "init": {
         "title": "Camera Settings",
-        "description": "Update camera-specific settings. Leave password fields empty to keep the current value.",
+        "description": "Update camera-specific settings. Empty account password keeps the current value; empty E2EE password disables E2EE password use.",
         "data": {
           "password": "Account password (leave empty to keep current)",
           "video_password": "Video encryption password (E2EE)",
