@@ -23,6 +23,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_PHONE_CODE,
     CONF_SN_NUM,
+    CONF_VIDEO_PASSWORD,
     DEFAULT_APP_PROFILE,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_PHONE_CODE,
@@ -328,7 +329,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     phone_code = entry.data.get(CONF_PHONE_CODE, DEFAULT_PHONE_CODE)
     app_profile = entry.data.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE)
     device = entry.data["device"]
-    video_password = str(entry.options.get("video_password", "")).strip()
+    video_password = str(entry.options.get(CONF_VIDEO_PASSWORD) or "").strip()
 
     api = MeariApiClient(
         email=email,

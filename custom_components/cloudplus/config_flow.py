@@ -23,6 +23,7 @@ from .const import (
     CONF_PHONE_CODE,
     CONF_PASSWORD,
     CONF_SN_NUM,
+    CONF_VIDEO_PASSWORD,
     DEFAULT_APP_PROFILE,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_PHONE_CODE,
@@ -32,11 +33,13 @@ from .api import MeariApiClient
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_VIDEO_PASSWORD = "video_password"
-
 
 def _normalize_phone_code(raw: Any) -> str:
     return str(raw).strip().lstrip("+")
+
+
+def _clean_optional_text(raw: Any) -> str:
+    return "" if raw is None else str(raw).strip()
 
 
 def _app_profile_selector() -> selector.SelectSelector:
@@ -168,13 +171,17 @@ class CloudEdgeMeariOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None
     ) -> ConfigFlowResult:
         current_options = dict(self._config_entry.options)
-        current_video_password = str(current_options.get(CONF_VIDEO_PASSWORD, ""))
+        current_video_password = _clean_optional_text(
+            current_options.get(CONF_VIDEO_PASSWORD)
+        )
 
         if user_input is not None:
             new_options = dict(current_options)
-            new_options[CONF_VIDEO_PASSWORD] = str(
-                user_input.get(CONF_VIDEO_PASSWORD, "")
-            ).strip()
+            video_password = _clean_optional_text(user_input.get(CONF_VIDEO_PASSWORD))
+            if video_password:
+                new_options[CONF_VIDEO_PASSWORD] = video_password
+            else:
+                new_options.pop(CONF_VIDEO_PASSWORD, None)
             self.hass.config_entries.async_update_entry(
                 self._config_entry, options=new_options
             )
