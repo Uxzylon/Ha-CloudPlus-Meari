@@ -19,6 +19,166 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent
+AUTH_DEFAULTS = {
+    "country_code": "FR",
+    "phone_code": "33",
+    "profile": "cloudedge",
+}
+AUTH_ENV_KEYS = {
+    "email": ("CLOUDPLUS_EMAIL", "CLOUDEDGE_EMAIL", "EMAIL"),
+    "password": ("CLOUDPLUS_PASSWORD", "CLOUDEDGE_PASSWORD", "PASSWORD"),
+    "country_code": (
+        "CLOUDPLUS_COUNTRY_CODE",
+        "CLOUDEDGE_COUNTRY_CODE",
+        "COUNTRY_CODE",
+    ),
+    "phone_code": ("CLOUDPLUS_PHONE_CODE", "CLOUDEDGE_PHONE_CODE", "PHONE_CODE"),
+    "profile": ("CLOUDPLUS_PROFILE", "CLOUDEDGE_PROFILE", "PROFILE"),
+}
+
+
+def _parse_dotenv_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            values[key] = value
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "Failed to parse .env file %s", path, exc_info=True
+        )
+    return values
+
+
+def _load_env_auth_values() -> dict[str, str]:
+    dotenv_values = _parse_dotenv_file(REPO_ROOT / ".env")
+    resolved: dict[str, str] = {}
+    for field, keys in AUTH_ENV_KEYS.items():
+        value = None
+        for key in keys:
+            candidate = os.environ.get(key)
+            if candidate not in (None, ""):
+                value = candidate
+                break
+            candidate = dotenv_values.get(key)
+            if candidate not in (None, ""):
+                value = candidate
+                break
+        if value in (None, ""):
+            continue
+        if field == "country_code":
+            value = value.upper()
+        elif field == "profile":
+            value = value.lower()
+        resolved[field] = value
+    return resolved
+
+
+def _auth_fields_supplied_on_cli(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, field, None) not in (None, "")
+        for field in ("email", "password", "country_code", "phone_code", "profile")
+    )
+
+
+def _build_auth_values(
+    args: argparse.Namespace,
+    env_auth: dict[str, str],
+    *,
+    use_cli: bool,
+) -> dict[str, str | None]:
+    resolved: dict[str, str | None] = {}
+    for field in ("email", "password", "country_code", "phone_code", "profile"):
+        cli_value = getattr(args, field, None)
+        if use_cli and cli_value not in (None, ""):
+            resolved[field] = cli_value
+            continue
+        env_value = env_auth.get(field)
+        if env_value not in (None, ""):
+            resolved[field] = env_value
+            continue
+        resolved[field] = AUTH_DEFAULTS.get(field)
+    return resolved
+
+
+def _prepare_auth_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    env_auth = _load_env_auth_values()
+    cli_supplied = _auth_fields_supplied_on_cli(args)
+    primary_auth = _build_auth_values(args, env_auth, use_cli=True)
+    env_only_auth = _build_auth_values(args, env_auth, use_cli=False)
+
+    profile = str(primary_auth.get("profile") or "").lower()
+    if profile not in {"cloudedge", "cloudplus"}:
+        parser.error(
+            "Invalid profile. Use --profile cloudedge|cloudplus or set PROFILE/CLOUDPLUS_PROFILE/CLOUDEDGE_PROFILE in .env."
+        )
+
+    if not primary_auth.get("email") or not primary_auth.get("password"):
+        parser.error(
+            "Missing credentials. Provide --email/--password or define EMAIL/PASSWORD (or CLOUDPLUS_EMAIL/CLOUDPLUS_PASSWORD) in .env."
+        )
+
+    args._auth_primary = primary_auth
+    args._auth_env_fallback = None
+    if cli_supplied and env_auth.get("email") and env_auth.get("password"):
+        if any(
+            primary_auth.get(field) != env_only_auth.get(field)
+            for field in primary_auth
+        ):
+            args._auth_env_fallback = env_only_auth
+
+    for field, value in primary_auth.items():
+        setattr(args, field, value)
+
+
+def _make_api_client(MeariApiClient: Any, auth: dict[str, str | None]) -> Any:
+    return MeariApiClient(
+        email=auth["email"],
+        password=auth["password"],
+        country_code=auth["country_code"],
+        phone_code=auth["phone_code"],
+        app_profile=auth["profile"],
+    )
+
+
+def _login_api_with_fallback(MeariApiClient: Any, args: argparse.Namespace) -> Any:
+    auth = dict(getattr(args, "_auth_primary", {}))
+    api = _make_api_client(MeariApiClient, auth)
+    try:
+        api.login()
+    except Exception:
+        fallback_auth = getattr(args, "_auth_env_fallback", None)
+        if not fallback_auth:
+            raise
+        logging.getLogger(__name__).warning(
+            "Login with CLI-priority credentials failed; retrying with .env credentials"
+        )
+        api = _make_api_client(MeariApiClient, fallback_auth)
+        api.login()
+        for field, value in fallback_auth.items():
+            setattr(args, field, value)
+        args._auth_primary = dict(fallback_auth)
+    return api
 
 
 def _load_module(name: str, path: Path):
@@ -174,64 +334,6 @@ def _select_device(
     return devices[0]
 
 
-class CpuSampler:
-    """Lightweight CPU sampler based on /proc without extra dependencies."""
-
-    def __init__(self, pid_provider: Callable[[], list[int]], interval: float = 1.0):
-        self._pid_provider = pid_provider
-        self._interval = interval
-        self._running = False
-        self._task: asyncio.Task | None = None
-        self._samples: list[float] = []
-        self._last: dict[int, tuple[int, float]] = {}
-        self._clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-
-    @staticmethod
-    def _read_ticks(pid: int) -> int | None:
-        try:
-            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
-                fields = f.read().split()
-            utime = int(fields[13])
-            stime = int(fields[14])
-            return utime + stime
-        except Exception:
-            return None
-
-    async def _run(self) -> None:
-        while self._running:
-            now = time.time()
-            total_pct = 0.0
-            for pid in self._pid_provider():
-                ticks = self._read_ticks(pid)
-                if ticks is None:
-                    continue
-                prev = self._last.get(pid)
-                self._last[pid] = (ticks, now)
-                if not prev:
-                    continue
-                dticks = ticks - prev[0]
-                dtime = now - prev[1]
-                if dtime > 0:
-                    total_pct += (dticks / self._clk_tck) / dtime * 100.0
-            self._samples.append(total_pct)
-            await asyncio.sleep(self._interval)
-
-    def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> dict[str, float]:
-        self._running = False
-        if self._task:
-            await self._task
-        if not self._samples:
-            return {"avg": 0.0, "max": 0.0}
-        return {
-            "avg": sum(self._samples) / len(self._samples),
-            "max": max(self._samples),
-        }
-
-
 class StreamHealthTracker:
     """Track live video cadence and report freeze windows."""
 
@@ -370,14 +472,7 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
     MeariApiClient = mods["api"].MeariApiClient
     CloudEdgeMeariCoordinator = mods["coordinator"].CloudEdgeMeariCoordinator
 
-    api = MeariApiClient(
-        email=args.email,
-        password=args.password,
-        country_code=args.country_code,
-        phone_code=args.phone_code,
-        app_profile=args.profile,
-    )
-    api.login()
+    api = _login_api_with_fallback(MeariApiClient, args)
     if hasattr(api, "get_camera_devices"):
         devices = api.get_camera_devices()
     else:
@@ -400,6 +495,7 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
         snapshot_conversion_enabled=True,
     )
 
+    await asyncio.to_thread(coord.prefetch_lamp, api)
     await coord.async_start()
     for _ in range(100):
         if coord.stream_port:
@@ -562,11 +658,30 @@ async def _await_preferred_player_bootstrap(
     """Wait until the coordinator can offer ffplay its preferred fresh join mode."""
     deadline = time.monotonic() + timeout
     last_state = _get_startup_bootstrap_state(coord)
+    codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
 
     while time.monotonic() < deadline:
         last_state = _get_startup_bootstrap_state(coord)
-        if str(last_state.get("preferred_join_mode", "pending")) == "ready-backlog":
-            return True, last_state
+        preferred = str(last_state.get("preferred_join_mode", "pending"))
+        block_reason = str(last_state.get("block_reason", "pending"))
+        backlog_ready = bool(last_state.get("backlog_ready", False))
+        frames_since_seed = int(last_state.get("frames_since_seed", 0) or 0)
+        video_age_s = float(last_state.get("video_age_s", 999.0) or 999.0)
+        if preferred == "ready-backlog" and backlog_ready:
+            if codec == "h264":
+                if (
+                    block_reason in {"ready", "seed-not-fresh"}
+                    and frames_since_seed >= 2
+                    and video_age_s < 0.8
+                ):
+                    return True, last_state
+            else:
+                if block_reason in {
+                    "ready",
+                    "seed-not-fresh",
+                    "seed-awaiting-follow-frames",
+                }:
+                    return True, last_state
         await asyncio.sleep(0.1)
 
     return False, last_state
@@ -605,6 +720,82 @@ async def _await_player_launch_calm(
     return False, last_state
 
 
+async def _await_player_launch_session_stable(
+    coord: Any,
+    timeout: float = 18.0,
+    quiet_s: float = 3.5,
+) -> tuple[bool, dict[str, Any]]:
+    """Wait until stream session churn settles before launching ffplay.
+
+    This is especially important when wake/recovery logic causes short
+    session restarts before the stream becomes visually stable.
+    """
+    deadline = time.monotonic() + timeout
+    last_generation = int(getattr(coord, "_p2p_session_generation", 0) or 0)
+    stable_since = time.monotonic()
+    last_state = _get_startup_bootstrap_state(coord)
+
+    while time.monotonic() < deadline:
+        now_mono = time.monotonic()
+        generation = int(getattr(coord, "_p2p_session_generation", 0) or 0)
+        if generation != last_generation:
+            last_generation = generation
+            stable_since = now_mono
+
+        last_state = _get_startup_bootstrap_state(coord)
+        frames = int(getattr(coord, "_p2p_video_frames", 0) or 0)
+        video_age_s = float(last_state.get("video_age_s", 999.0) or 999.0)
+        preferred_join_mode = str(last_state.get("preferred_join_mode", "") or "")
+        backlog_ready = bool(last_state.get("backlog_ready", False))
+        seed_generation = int(last_state.get("seed_generation", 0) or 0)
+        required_generation = int(last_state.get("required_seed_generation", 0) or 0)
+        severe_recent = 0
+        count_recent_fn = getattr(coord, "_count_recent_gap_events", None)
+        if callable(count_recent_fn):
+            try:
+                severe_recent = int(
+                    count_recent_fn(severity="severe", within_s=3.0) or 0
+                )
+            except Exception:
+                severe_recent = 0
+        codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+        quality = getattr(coord, "vvp_quality", None)
+        if callable(quality):
+            quality = quality()
+        if (
+            codec == "hevc"
+            and preferred_join_mode == "ready-backlog"
+            and backlog_ready
+            and seed_generation >= required_generation
+            and (now_mono - stable_since) >= min(quiet_s, 1.6)
+            and frames >= 18
+            and video_age_s < 0.9
+        ):
+            last_state["session_generation"] = generation
+            last_state["quality"] = quality
+            last_state["codec"] = codec
+            return True, last_state
+        if (
+            (now_mono - stable_since) >= quiet_s
+            and frames >= 60
+            and video_age_s < 0.9
+            and severe_recent == 0
+        ):
+            last_state["session_generation"] = generation
+            last_state["quality"] = quality
+            last_state["codec"] = codec
+            return True, last_state
+        await asyncio.sleep(0.1)
+
+    last_state["session_generation"] = last_generation
+    quality = getattr(coord, "vvp_quality", None)
+    if callable(quality):
+        quality = quality()
+    last_state["quality"] = quality
+    last_state["codec"] = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+    return False, last_state
+
+
 async def _await_hevc_clean_startup_seed(
     coord: Any,
     timeout: float = 12.0,
@@ -640,6 +831,203 @@ async def _await_hevc_clean_startup_seed(
     return False, last_state
 
 
+def _count_recent_gap_events(
+    coord: Any,
+    *,
+    severity: str,
+    within_s: float,
+) -> int:
+    count_recent_fn = getattr(coord, "_count_recent_gap_events", None)
+    if callable(count_recent_fn):
+        try:
+            return int(count_recent_fn(severity=severity, within_s=within_s) or 0)
+        except Exception:
+            return 0
+    return 0
+
+
+async def _await_adaptive_player_launch_gate(
+    coord: Any,
+    *,
+    start_frames: int,
+    timeout: float,
+) -> tuple[bool, dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    gate_started_mono = time.monotonic()
+    last_generation = int(getattr(coord, "_p2p_session_generation", 0) or 0)
+    stable_since_mono = gate_started_mono
+    last_state = _get_startup_bootstrap_state(coord)
+
+    while time.monotonic() < deadline:
+        now_mono = time.monotonic()
+        generation = int(getattr(coord, "_p2p_session_generation", 0) or 0)
+        if generation != last_generation:
+            last_generation = generation
+            stable_since_mono = now_mono
+
+        last_state = _get_startup_bootstrap_state(coord)
+        codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+        target_fps = float(getattr(coord, "_video_mux_target_fps", 15.0) or 15.0)
+        target_fps = max(8.0, min(30.0, target_fps))
+        frames = int(getattr(coord, "_p2p_video_frames", 0) or 0)
+        frames_since_gate = max(0, frames - start_frames)
+        video_age_s = float(last_state.get("video_age_s", 999.0) or 999.0)
+        preferred_join_mode = str(last_state.get("preferred_join_mode", "") or "")
+        backlog_ready = bool(last_state.get("backlog_ready", False))
+        backlog_target = max(
+            2,
+            int(last_state.get("backlog_follow_video_pusi_target", 0) or 0),
+        )
+        seed_generation = int(last_state.get("seed_generation", 0) or 0)
+        required_generation = int(last_state.get("required_seed_generation", 0) or 0)
+        startup_safe = bool(last_state.get("startup_safe", False))
+        seed_strong = bool(last_state.get("seed_strong", False))
+        seed_reason = str(last_state.get("seed_strength_reason", "") or "")
+
+        severe_window_s = 4.2 if codec == "h264" else 5.8
+        recent_severe = _count_recent_gap_events(
+            coord,
+            severity="severe",
+            within_s=severe_window_s,
+        )
+        recent_moderate = _count_recent_gap_events(
+            coord,
+            severity="moderate",
+            within_s=4.2,
+        )
+        latest_severe = last_state.get("latest_severe_gap_event") or {}
+        severe_status = str(latest_severe.get("status", "") or "")
+        severe_started = float(latest_severe.get("started_mono", 0.0) or 0.0)
+        severe_released = float(
+            latest_severe.get("quarantine_release_mono", 0.0) or 0.0
+        )
+        severe_reference = max(severe_started, severe_released)
+        severe_active = bool(latest_severe) and severe_status != "released"
+        severe_recent = bool(severe_reference > 0.0) and (
+            now_mono - severe_reference
+        ) < max(0.7, min(2.2, 0.10 * backlog_target + 0.45))
+
+        stable_for_s = max(0.0, now_mono - stable_since_mono)
+        fast_frames = int(
+            max(
+                6,
+                min(
+                    18,
+                    round(
+                        max(
+                            backlog_target * 2,
+                            target_fps * (0.55 if codec == "h264" else 0.75),
+                        )
+                    ),
+                ),
+            )
+        )
+        stable_frames = int(
+            max(
+                fast_frames + 2,
+                min(
+                    28,
+                    round(
+                        max(
+                            backlog_target * 3,
+                            target_fps * (0.85 if codec == "h264" else 1.05),
+                        )
+                    ),
+                ),
+            )
+        )
+        fast_quiet_s = max(0.55, min(1.7, 0.08 * fast_frames + 0.15))
+        stable_quiet_s = max(0.9, min(2.6, 0.09 * stable_frames + 0.25))
+        wait_penalty_s = min(
+            3.0,
+            (0.9 * recent_severe)
+            + (0.45 * recent_moderate)
+            + (0.6 if severe_active else 0.0),
+        )
+        launch_budget_s = max(
+            2.8 if codec == "h264" else 3.8,
+            min(
+                7.0 if codec == "h264" else 9.5,
+                1.0 + stable_quiet_s + (0.12 * fast_frames) + wait_penalty_s,
+            ),
+        )
+        waited_s = now_mono - gate_started_mono
+        stale_source_s = max(1.4, min(3.1, 0.11 * fast_frames + 0.55))
+        decode_probed = "decoded" in seed_reason or "validated" in seed_reason
+
+        last_state.update(
+            {
+                "codec": codec,
+                "session_generation": generation,
+                "launch_gate_started_mono": gate_started_mono,
+                "launch_gate_wait_s": waited_s,
+                "launch_gate_budget_s": launch_budget_s,
+                "launch_gate_frames_since_start": frames_since_gate,
+                "launch_gate_fast_frames": fast_frames,
+                "launch_gate_stable_frames": stable_frames,
+                "launch_gate_fast_quiet_s": fast_quiet_s,
+                "launch_gate_stable_quiet_s": stable_quiet_s,
+                "stable_for_s": stable_for_s,
+                "recent_severe_gap_count": recent_severe,
+                "recent_moderate_gap_count": recent_moderate,
+                "severe_gap_active": severe_active,
+                "severe_gap_recent": severe_recent,
+                "seed_decode_probed": decode_probed,
+                "seed_strong": seed_strong,
+            }
+        )
+
+        if (
+            preferred_join_mode == "ready-backlog"
+            and backlog_ready
+            and seed_generation >= required_generation
+            and frames_since_gate >= fast_frames
+            and stable_for_s >= min(fast_quiet_s, 1.25 if codec == "h264" else 1.5)
+            and video_age_s < 0.9
+            and not severe_active
+        ):
+            last_state["launch_gate_reason"] = "ready-backlog"
+            return True, last_state
+
+        if (
+            startup_safe
+            and seed_generation >= required_generation
+            and frames_since_gate >= stable_frames
+            and stable_for_s >= stable_quiet_s
+            and video_age_s < 0.85
+            and recent_severe == 0
+            and not severe_recent
+        ):
+            last_state["launch_gate_reason"] = "startup-safe"
+            return True, last_state
+
+        if (
+            codec == "h264"
+            and frames_since_gate >= max(8, fast_frames - 2)
+            and stable_for_s >= max(0.8, fast_quiet_s)
+            and video_age_s < 0.7
+            and recent_severe <= 1
+            and not severe_active
+        ):
+            last_state["launch_gate_reason"] = "h264-live-flow"
+            return True, last_state
+
+        if video_age_s > stale_source_s and frames_since_gate >= max(
+            4, fast_frames // 2
+        ):
+            last_state["launch_gate_reason"] = "source-stale"
+            return False, last_state
+
+        if waited_s >= launch_budget_s:
+            last_state["launch_gate_reason"] = "budget-expired"
+            return False, last_state
+
+        await asyncio.sleep(0.1)
+
+    last_state["launch_gate_reason"] = "deadline-expired"
+    return False, last_state
+
+
 _PLAYER_DECODE_MARKERS = (
     "Could not find ref with POC",
     "Error constructing the frame RPS",
@@ -649,7 +1037,9 @@ _PLAYER_DECODE_MARKERS = (
     "Error while decoding stream",
 )
 _SHOWINFO_PTS_TIME_RE = re.compile(r"pts_time:([\-\d\.]+)")
+_SHOWINFO_FRAME_N_RE = re.compile(r"\bn:\s*(\d+)")
 _FFPLAY_TEXTURE_LINE_RE = re.compile(r"Created\s+\d+x\d+\s+texture")
+_FFPLAY_AV_DRIFT_RE = re.compile(r"A-V:\s*([\-\d\.]+)")
 
 
 def _select_gap_event_for_error_time(
@@ -811,16 +1201,152 @@ def _monitor_player_visual_state(
                     player_started_mono = float(
                         state.get("player_started_mono", when_mono) or when_mono
                     )
-                    log.info(
-                        "Player visual ready: ffplay created its video texture after %.2fs",
-                        when_mono - player_started_mono,
+                    run_started_mono = float(state.get("run_started_mono", 0.0) or 0.0)
+                    if run_started_mono > 0.0:
+                        log.info(
+                            "Player visual ready: ffplay created its video texture after %.2fs from player launch / %.2fs from debug.py start",
+                            when_mono - player_started_mono,
+                            when_mono - run_started_mono,
+                        )
+                    else:
+                        log.info(
+                            "Player visual ready: ffplay created its video texture after %.2fs",
+                            when_mono - player_started_mono,
+                        )
+
+            if "Parsed_showinfo" in line and "pts_time:" in line:
+                state["showinfo_lines"] = int(state.get("showinfo_lines", 0) or 0) + 1
+                if float(state.get("first_showinfo_mono", 0.0) or 0.0) <= 0.0:
+                    state["first_showinfo_mono"] = when_mono
+
+                prev_showinfo_mono = float(state.get("last_showinfo_mono", 0.0) or 0.0)
+                if prev_showinfo_mono > 0.0:
+                    render_gap_s = max(0.0, when_mono - prev_showinfo_mono)
+                    render_gaps = state.setdefault("showinfo_render_gaps_s", [])
+                    if len(render_gaps) < 10000:
+                        render_gaps.append(render_gap_s)
+                    player_started_at = float(
+                        state.get("player_started_mono", when_mono) or when_mono
                     )
+                    startup_cutoff_s = 5.0
+                    target_bucket = (
+                        "showinfo_startup_render_gaps_s"
+                        if (when_mono - player_started_at) <= startup_cutoff_s
+                        else "showinfo_steady_render_gaps_s"
+                    )
+                    phase_render_gaps = state.setdefault(target_bucket, [])
+                    if len(phase_render_gaps) < 5000:
+                        phase_render_gaps.append(render_gap_s)
+                    state["max_showinfo_render_gap_s"] = max(
+                        float(state.get("max_showinfo_render_gap_s", 0.0) or 0.0),
+                        render_gap_s,
+                    )
+                    if render_gap_s > 1.0:
+                        state["showinfo_render_freezes_over_1s"] = (
+                            int(state.get("showinfo_render_freezes_over_1s", 0) or 0)
+                            + 1
+                        )
+                    last_warned_gap_s = float(
+                        state.get("last_warned_showinfo_gap_s", 0.0) or 0.0
+                    )
+                    if (
+                        render_gap_s >= 2.0
+                        and abs(render_gap_s - last_warned_gap_s) > 0.20
+                    ):
+                        player_started_mono = float(
+                            state.get("player_started_mono", when_mono) or when_mono
+                        )
+                        log.warning(
+                            "ffplay visible freeze: showinfo gap %.2fs at +%.2fs from player start",
+                            render_gap_s,
+                            when_mono - player_started_mono,
+                        )
+                        state["last_warned_showinfo_gap_s"] = render_gap_s
+                state["last_showinfo_mono"] = when_mono
+
+                n_match = _SHOWINFO_FRAME_N_RE.search(line)
+                if n_match:
+                    try:
+                        frame_n = int(n_match.group(1))
+                    except ValueError:
+                        frame_n = -1
+                    if frame_n >= 0:
+                        prev_frame_n = int(state.get("last_showinfo_frame_n", -1) or -1)
+                        if prev_frame_n >= 0 and frame_n > prev_frame_n + 1:
+                            state["showinfo_frame_jump_count"] = int(
+                                state.get("showinfo_frame_jump_count", 0) or 0
+                            ) + (frame_n - prev_frame_n - 1)
+                        state["last_showinfo_frame_n"] = frame_n
+
+                pts_match = _SHOWINFO_PTS_TIME_RE.search(line)
+                if pts_match:
+                    try:
+                        pts_time = float(pts_match.group(1))
+                    except ValueError:
+                        pts_time = -1.0
+                    if pts_time >= 0.0:
+                        prev_pts_time = float(
+                            state.get("last_showinfo_pts_time", -1.0) or -1.0
+                        )
+                        if prev_pts_time >= 0.0 and pts_time > prev_pts_time:
+                            pts_gap_s = pts_time - prev_pts_time
+                            pts_gaps = state.setdefault("showinfo_pts_gaps_s", [])
+                            if len(pts_gaps) < 10000:
+                                pts_gaps.append(pts_gap_s)
+                            player_started_at = float(
+                                state.get("player_started_mono", when_mono) or when_mono
+                            )
+                            startup_cutoff_s = 5.0
+                            target_bucket = (
+                                "showinfo_startup_pts_gaps_s"
+                                if (when_mono - player_started_at) <= startup_cutoff_s
+                                else "showinfo_steady_pts_gaps_s"
+                            )
+                            phase_pts_gaps = state.setdefault(target_bucket, [])
+                            if len(phase_pts_gaps) < 5000:
+                                phase_pts_gaps.append(pts_gap_s)
+                            state["max_showinfo_pts_gap_s"] = max(
+                                float(state.get("max_showinfo_pts_gap_s", 0.0) or 0.0),
+                                pts_gap_s,
+                            )
+                            if pts_gap_s > 0.30:
+                                state["showinfo_pts_gaps_over_300ms"] = (
+                                    int(
+                                        state.get("showinfo_pts_gaps_over_300ms", 0)
+                                        or 0
+                                    )
+                                    + 1
+                                )
+                        state["last_showinfo_pts_time"] = pts_time
+                        timeline = state.setdefault("showinfo_timeline", [])
+                        if len(timeline) < 20000:
+                            timeline.append((when_mono, pts_time))
 
             if "A-V:" in line and "aq=" in line and "vq=" in line:
                 state["stats_count"] = int(state.get("stats_count", 0) or 0) + 1
+                prev_stats_mono = float(state.get("last_stats_mono", 0.0) or 0.0)
+                if prev_stats_mono > 0.0:
+                    stats_gap_s = max(0.0, when_mono - prev_stats_mono)
+                    state["max_stats_gap_s"] = max(
+                        float(state.get("max_stats_gap_s", 0.0) or 0.0),
+                        stats_gap_s,
+                    )
+                    if stats_gap_s > 1.0:
+                        state["stats_gaps_over_1s"] = (
+                            int(state.get("stats_gaps_over_1s", 0) or 0) + 1
+                        )
                 state["last_stats_mono"] = when_mono
                 if float(state.get("first_stats_mono", 0.0) or 0.0) <= 0.0:
                     state["first_stats_mono"] = when_mono
+                av_match = _FFPLAY_AV_DRIFT_RE.search(line)
+                if av_match:
+                    try:
+                        av_drift = float(av_match.group(1))
+                    except ValueError:
+                        av_drift = 0.0
+                    av_samples = state.setdefault("av_sync_samples", [])
+                    if len(av_samples) < 5000:
+                        av_samples.append(av_drift)
 
     while not stop_event.is_set():
         _drain_once()
@@ -850,33 +1376,361 @@ def _monitor_player_visual_state(
                     )
                     state["late_stats_warned"] = True
         stop_event.wait(0.2)
+        # Track visible inactivity gaps even when ffplay output arrives in bursts.
+        texture_created_mono = float(state.get("texture_created_mono", 0.0) or 0.0)
+        if texture_created_mono > 0.0:
+            last_showinfo_mono = float(state.get("last_showinfo_mono", 0.0) or 0.0)
+            if last_showinfo_mono > 0.0:
+                silent_showinfo_gap_s = max(0.0, now_mono - last_showinfo_mono)
+                state["max_silent_showinfo_gap_s"] = max(
+                    float(state.get("max_silent_showinfo_gap_s", 0.0) or 0.0),
+                    silent_showinfo_gap_s,
+                )
+            last_stats_mono = float(state.get("last_stats_mono", 0.0) or 0.0)
+            if last_stats_mono > 0.0:
+                silent_stats_gap_s = max(0.0, now_mono - last_stats_mono)
+                state["max_silent_stats_gap_s"] = max(
+                    float(state.get("max_silent_stats_gap_s", 0.0) or 0.0),
+                    silent_stats_gap_s,
+                )
     _drain_once()
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    q = max(0.0, min(1.0, q))
+    sorted_vals = sorted(values)
+    idx = int(round((len(sorted_vals) - 1) * q))
+    return float(sorted_vals[idx])
 
 
 def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    run_started_mono = float(state.get("run_started_mono", 0.0) or 0.0)
+    live_ready_mono = float(state.get("live_ready_mono", 0.0) or 0.0)
+    launch_gate_started_mono = float(state.get("launch_gate_started_mono", 0.0) or 0.0)
     player_started_mono = float(state.get("player_started_mono", 0.0) or 0.0)
     texture_created_mono = float(state.get("texture_created_mono", 0.0) or 0.0)
     first_buffer_mono = float(state.get("first_buffer_mono", 0.0) or 0.0)
     first_stats_mono = float(state.get("first_stats_mono", 0.0) or 0.0)
     stats_count = int(state.get("stats_count", 0) or 0)
+    showinfo_lines = int(state.get("showinfo_lines", 0) or 0)
 
     result["player_texture_created"] = bool(texture_created_mono > 0.0)
     result["player_texture_lines"] = int(state.get("texture_lines", 0) or 0)
     result["player_buffer_lines"] = int(state.get("buffer_lines", 0) or 0)
     result["player_visual_stats_count"] = stats_count
+    result["player_showinfo_lines"] = showinfo_lines
+    if run_started_mono > 0.0 and live_ready_mono > 0.0:
+        result["command_to_live_ready_latency_s"] = round(
+            live_ready_mono - run_started_mono,
+            3,
+        )
+    if run_started_mono > 0.0 and player_started_mono > 0.0:
+        result["command_to_player_launch_latency_s"] = round(
+            player_started_mono - run_started_mono,
+            3,
+        )
+    if live_ready_mono > 0.0 and player_started_mono > 0.0:
+        result["live_ready_to_player_launch_latency_s"] = round(
+            player_started_mono - live_ready_mono,
+            3,
+        )
+    if launch_gate_started_mono > 0.0 and player_started_mono > 0.0:
+        result["player_prelaunch_gate_latency_s"] = round(
+            player_started_mono - launch_gate_started_mono,
+            3,
+        )
+    if state.get("player_launch_gate_reason"):
+        result["player_launch_gate_reason"] = str(
+            state.get("player_launch_gate_reason")
+        )
+    if float(state.get("player_launch_gate_budget_s", 0.0) or 0.0) > 0.0:
+        result["player_launch_gate_budget_s"] = round(
+            float(state.get("player_launch_gate_budget_s", 0.0) or 0.0),
+            3,
+        )
+    if int(state.get("player_launch_gate_frames_since_start", 0) or 0) > 0:
+        result["player_launch_gate_frames_since_start"] = int(
+            state.get("player_launch_gate_frames_since_start", 0) or 0
+        )
     if player_started_mono > 0.0 and texture_created_mono > 0.0:
         result["player_texture_open_latency_s"] = round(
             texture_created_mono - player_started_mono, 3
+        )
+    if run_started_mono > 0.0 and texture_created_mono > 0.0:
+        result["command_to_player_texture_latency_s"] = round(
+            texture_created_mono - run_started_mono,
+            3,
         )
     if player_started_mono > 0.0 and first_buffer_mono > 0.0:
         result["player_first_buffer_latency_s"] = round(
             first_buffer_mono - player_started_mono, 3
         )
+    if run_started_mono > 0.0 and first_buffer_mono > 0.0:
+        result["command_to_player_first_buffer_latency_s"] = round(
+            first_buffer_mono - run_started_mono,
+            3,
+        )
     if player_started_mono > 0.0 and first_stats_mono > 0.0:
         result["player_first_stats_latency_s"] = round(
             first_stats_mono - player_started_mono, 3
         )
+    if run_started_mono > 0.0 and first_stats_mono > 0.0:
+        result["command_to_player_first_stats_latency_s"] = round(
+            first_stats_mono - run_started_mono,
+            3,
+        )
+    first_showinfo_mono = float(state.get("first_showinfo_mono", 0.0) or 0.0)
+    last_showinfo_mono = float(state.get("last_showinfo_mono", 0.0) or 0.0)
+    if player_started_mono > 0.0 and first_showinfo_mono > 0.0:
+        result["player_first_showinfo_latency_s"] = round(
+            first_showinfo_mono - player_started_mono, 3
+        )
+    if run_started_mono > 0.0 and first_showinfo_mono > 0.0:
+        result["command_to_player_first_showinfo_latency_s"] = round(
+            first_showinfo_mono - run_started_mono,
+            3,
+        )
+    if (
+        showinfo_lines > 1
+        and first_showinfo_mono > 0.0
+        and last_showinfo_mono > first_showinfo_mono
+    ):
+        showinfo_span = max(0.001, last_showinfo_mono - first_showinfo_mono)
+        result["player_showinfo_estimated_fps"] = round(
+            (showinfo_lines - 1) / showinfo_span,
+            2,
+        )
+    result["player_showinfo_frame_jump_count"] = int(
+        state.get("showinfo_frame_jump_count", 0) or 0
+    )
+    result["player_showinfo_render_freezes_over_1s"] = int(
+        state.get("showinfo_render_freezes_over_1s", 0) or 0
+    )
+    result["player_showinfo_pts_gaps_over_300ms"] = int(
+        state.get("showinfo_pts_gaps_over_300ms", 0) or 0
+    )
+    result["player_showinfo_max_render_gap_s"] = round(
+        float(state.get("max_showinfo_render_gap_s", 0.0) or 0.0),
+        3,
+    )
+    result["player_showinfo_max_pts_gap_s"] = round(
+        float(state.get("max_showinfo_pts_gap_s", 0.0) or 0.0),
+        3,
+    )
+    result["player_stats_gaps_over_1s"] = int(state.get("stats_gaps_over_1s", 0) or 0)
+    result["player_stats_max_gap_s"] = round(
+        float(state.get("max_stats_gap_s", 0.0) or 0.0),
+        3,
+    )
+    result["player_silent_showinfo_max_gap_s"] = round(
+        float(state.get("max_silent_showinfo_gap_s", 0.0) or 0.0),
+        3,
+    )
+    result["player_silent_stats_max_gap_s"] = round(
+        float(state.get("max_silent_stats_gap_s", 0.0) or 0.0),
+        3,
+    )
+    steady_render_gaps = [
+        float(v)
+        for v in (state.get("showinfo_steady_render_gaps_s", []) or [])
+        if isinstance(v, (int, float)) and float(v) > 0.0
+    ]
+    steady_pts_gaps = [
+        float(v)
+        for v in (state.get("showinfo_steady_pts_gaps_s", []) or [])
+        if isinstance(v, (int, float)) and float(v) > 0.0
+    ]
+
+    render_median = _percentile(steady_render_gaps, 0.5)
+    render_p95 = _percentile(steady_render_gaps, 0.95)
+    pts_median = _percentile(steady_pts_gaps, 0.5)
+    pts_p95 = _percentile(steady_pts_gaps, 0.95)
+    result["player_showinfo_steady_render_gap_median_s"] = round(render_median, 4)
+    result["player_showinfo_steady_render_gap_p95_s"] = round(render_p95, 4)
+    result["player_showinfo_steady_pts_gap_median_s"] = round(pts_median, 4)
+    result["player_showinfo_steady_pts_gap_p95_s"] = round(pts_p95, 4)
+
+    startup_render_gaps = [
+        float(v)
+        for v in (state.get("showinfo_startup_render_gaps_s", []) or [])
+        if isinstance(v, (int, float)) and float(v) > 0.0
+    ]
+    startup_pts_gaps = [
+        float(v)
+        for v in (state.get("showinfo_startup_pts_gaps_s", []) or [])
+        if isinstance(v, (int, float)) and float(v) > 0.0
+    ]
+    short_render_stalls = sum(1 for g in startup_render_gaps if g >= 0.35)
+    short_pts_stalls = sum(1 for g in startup_pts_gaps if g >= 0.22)
+    result["player_startup_short_render_stalls_over_350ms"] = int(short_render_stalls)
+    result["player_startup_short_pts_stalls_over_220ms"] = int(short_pts_stalls)
+
+    steady_observed_duration_s = max(
+        0.0,
+        sum(steady_pts_gaps) if steady_pts_gaps else sum(steady_render_gaps),
+    )
+    startup_observed_duration_s = max(
+        0.0,
+        sum(startup_pts_gaps) if startup_pts_gaps else sum(startup_render_gaps),
+    )
+    visible_render_stall_threshold = (
+        max(0.28, min(0.95, render_median * 4.5)) if render_median > 0.0 else 0.45
+    )
+    visible_pts_stall_threshold = (
+        max(0.18, min(0.95, pts_median * 4.0)) if pts_median > 0.0 else 0.30
+    )
+    startup_visible_render_threshold = max(0.24, visible_render_stall_threshold * 0.85)
+    startup_visible_pts_threshold = max(0.14, visible_pts_stall_threshold * 0.85)
+    steady_visible_render_stalls = [
+        g for g in steady_render_gaps if g >= visible_render_stall_threshold
+    ]
+    steady_visible_pts_stalls = [
+        g for g in steady_pts_gaps if g >= visible_pts_stall_threshold
+    ]
+    startup_visible_render_stalls = [
+        g for g in startup_render_gaps if g >= startup_visible_render_threshold
+    ]
+    startup_visible_pts_stalls = [
+        g for g in startup_pts_gaps if g >= startup_visible_pts_threshold
+    ]
+    steady_visible_render_stall_excess_s = sum(
+        max(0.0, g - visible_render_stall_threshold)
+        for g in steady_visible_render_stalls
+    )
+    steady_visible_pts_stall_excess_s = sum(
+        max(0.0, g - visible_pts_stall_threshold) for g in steady_visible_pts_stalls
+    )
+    startup_visible_render_stall_excess_s = sum(
+        max(0.0, g - startup_visible_render_threshold)
+        for g in startup_visible_render_stalls
+    )
+    startup_visible_pts_stall_excess_s = sum(
+        max(0.0, g - startup_visible_pts_threshold) for g in startup_visible_pts_stalls
+    )
+    visible_stall_budget_count = max(
+        1,
+        min(4, int(round(max(steady_observed_duration_s, 1.0) / 45.0))),
+    )
+    visible_stall_budget_excess_s = max(
+        0.35,
+        min(2.5, max(steady_observed_duration_s, 1.0) * 0.015),
+    )
+    startup_visible_stall_budget_count = 1 if startup_observed_duration_s >= 2.0 else 0
+    startup_visible_stall_budget_excess_s = max(
+        0.20,
+        min(1.2, max(startup_observed_duration_s, 1.0) * 0.08),
+    )
+    result["player_visible_render_stall_threshold_s"] = round(
+        visible_render_stall_threshold, 3
+    )
+    result["player_visible_pts_stall_threshold_s"] = round(
+        visible_pts_stall_threshold, 3
+    )
+    result["player_visible_render_stall_count"] = int(len(steady_visible_render_stalls))
+    result["player_visible_pts_stall_count"] = int(len(steady_visible_pts_stalls))
+    result["player_visible_render_stall_excess_s"] = round(
+        steady_visible_render_stall_excess_s,
+        3,
+    )
+    result["player_visible_pts_stall_excess_s"] = round(
+        steady_visible_pts_stall_excess_s,
+        3,
+    )
+    result["player_visible_stall_budget_count"] = int(visible_stall_budget_count)
+    result["player_visible_stall_budget_excess_s"] = round(
+        visible_stall_budget_excess_s,
+        3,
+    )
+    result["player_startup_visible_render_stall_count"] = int(
+        len(startup_visible_render_stalls)
+    )
+    result["player_startup_visible_pts_stall_count"] = int(
+        len(startup_visible_pts_stalls)
+    )
+    result["player_startup_visible_render_stall_excess_s"] = round(
+        startup_visible_render_stall_excess_s,
+        3,
+    )
+    result["player_startup_visible_pts_stall_excess_s"] = round(
+        startup_visible_pts_stall_excess_s,
+        3,
+    )
+
+    startup_ratio = 1.0
+    startup_speed_spikes = 0
+    startup_fast_speed_spikes = 0
+    startup_slow_speed_spikes = 0
+    timeline_raw = state.get("showinfo_timeline", []) or []
+    timeline: list[tuple[float, float]] = []
+    for item in timeline_raw:
+        if (
+            isinstance(item, (tuple, list))
+            and len(item) == 2
+            and isinstance(item[0], (int, float))
+            and isinstance(item[1], (int, float))
+        ):
+            timeline.append((float(item[0]), float(item[1])))
+    if player_started_mono > 0.0 and timeline:
+        startup_window = [
+            (mono, pts)
+            for mono, pts in timeline
+            if 0.0 <= (mono - player_started_mono) <= 8.0
+        ]
+        if len(startup_window) >= 4:
+            wall_span = max(0.001, startup_window[-1][0] - startup_window[0][0])
+            pts_span = max(0.0, startup_window[-1][1] - startup_window[0][1])
+            startup_ratio = pts_span / wall_span
+            for idx in range(1, len(startup_window)):
+                wall_dt = startup_window[idx][0] - startup_window[idx - 1][0]
+                pts_dt = startup_window[idx][1] - startup_window[idx - 1][1]
+                if wall_dt < 0.02 or pts_dt < 0.02:
+                    continue
+                local_ratio = pts_dt / wall_dt
+                if local_ratio > 1.35:
+                    startup_fast_speed_spikes += 1
+                elif local_ratio < 0.70:
+                    startup_slow_speed_spikes += 1
+                if local_ratio > 1.35 or local_ratio < 0.70:
+                    startup_speed_spikes += 1
+    result["player_startup_playback_speed_ratio"] = round(startup_ratio, 3)
+    result["player_startup_speed_spike_count"] = int(startup_speed_spikes)
+    result["player_startup_fast_speed_spike_count"] = int(startup_fast_speed_spikes)
+    result["player_startup_slow_speed_spike_count"] = int(startup_slow_speed_spikes)
+
+    av_samples_raw = state.get("av_sync_samples", []) or []
+    av_samples = [float(v) for v in av_samples_raw if isinstance(v, (int, float))]
+    av_abs_max = max((abs(v) for v in av_samples), default=0.0)
+    av_large_count = sum(1 for v in av_samples if abs(v) >= 0.20)
+    result["player_av_drift_abs_max_s"] = round(av_abs_max, 3)
+    result["player_av_drift_over_200ms_count"] = int(av_large_count)
+
+    dynamic_render_threshold = max(0.25, min(1.2, render_median * 4.2))
+    dynamic_pts_threshold = max(0.12, min(0.8, pts_median * 3.8))
+    if render_median <= 0.0:
+        dynamic_render_threshold = 0.55
+    if pts_median <= 0.0:
+        dynamic_pts_threshold = 0.30
+    render_outliers = sum(1 for g in steady_render_gaps if g > dynamic_render_threshold)
+    pts_outliers = sum(1 for g in steady_pts_gaps if g > dynamic_pts_threshold)
+
+    steady_frames = max(
+        1,
+        len(steady_render_gaps),
+        len(steady_pts_gaps),
+    )
+    frame_jumps = int(state.get("showinfo_frame_jump_count", 0) or 0)
+    artifact_score = (
+        (render_outliers * 1.0) + (pts_outliers * 0.8) + (frame_jumps * 0.12)
+    ) / max(1.0, steady_frames / 120.0)
+
+    result["player_dynamic_render_gap_threshold_s"] = round(dynamic_render_threshold, 3)
+    result["player_dynamic_pts_gap_threshold_s"] = round(dynamic_pts_threshold, 3)
+    result["player_render_gap_outlier_count"] = int(render_outliers)
+    result["player_pts_gap_outlier_count"] = int(pts_outliers)
+    result["player_motion_artifact_score"] = round(artifact_score, 2)
 
     visual_issues: list[str] = []
     if not result["player_texture_created"]:
@@ -885,11 +1739,98 @@ def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
         visual_issues.append(
             f"late-video-texture:{float(result['player_texture_open_latency_s']):.2f}s"
         )
-    if stats_count <= 0:
+    if stats_count <= 0 and showinfo_lines <= 0:
         visual_issues.append("no-ffplay-stats")
     elif float(result.get("player_first_stats_latency_s", 0.0) or 0.0) > 10.0:
         visual_issues.append(
             f"late-ffplay-stats:{float(result['player_first_stats_latency_s']):.2f}s"
+        )
+    if showinfo_lines <= 0:
+        visual_issues.append("no-showinfo-frames")
+    if float(result.get("player_showinfo_max_render_gap_s", 0.0) or 0.0) > 1.0:
+        visual_issues.append(
+            f"render-freeze:{float(result['player_showinfo_max_render_gap_s']):.2f}s"
+        )
+    if float(result.get("player_stats_max_gap_s", 0.0) or 0.0) > 1.0:
+        visual_issues.append(
+            f"stats-freeze:{float(result['player_stats_max_gap_s']):.2f}s"
+        )
+    if float(result.get("player_silent_showinfo_max_gap_s", 0.0) or 0.0) > 1.0:
+        visual_issues.append(
+            f"showinfo-silence:{float(result['player_silent_showinfo_max_gap_s']):.2f}s"
+        )
+    render_outlier_budget = max(3, int(steady_frames * 0.018))
+    pts_outlier_budget = max(3, int(steady_frames * 0.022))
+    jump_budget = max(10, int(steady_frames * 0.06))
+    if render_outliers > render_outlier_budget:
+        visual_issues.append(
+            f"render-cadence-instability:{render_outliers}>{render_outlier_budget}"
+        )
+    if pts_outliers > pts_outlier_budget:
+        visual_issues.append(
+            f"pts-cadence-instability:{pts_outliers}>{pts_outlier_budget}"
+        )
+    if frame_jumps > jump_budget:
+        visual_issues.append(f"frame-jumps:{frame_jumps}>{jump_budget}")
+    if artifact_score > 4.0:
+        visual_issues.append(f"motion-artifact-score:{artifact_score:.2f}")
+    if startup_ratio > 1.18:
+        visual_issues.append(f"startup-fast-play:{startup_ratio:.2f}x")
+    startup_oscillation_pairs = min(
+        startup_fast_speed_spikes, startup_slow_speed_spikes
+    )
+    if startup_oscillation_pairs >= 2:
+        visual_issues.append(
+            "startup-speed-oscillation:"
+            f"pairs={startup_oscillation_pairs},fast={startup_fast_speed_spikes},slow={startup_slow_speed_spikes}"
+        )
+    if short_render_stalls >= 2:
+        visual_issues.append(f"startup-render-stalls:{short_render_stalls}")
+    if short_pts_stalls >= 2:
+        visual_issues.append(f"startup-pts-stalls:{short_pts_stalls}")
+    if len(startup_visible_render_stalls) > startup_visible_stall_budget_count:
+        visual_issues.append(
+            "startup-visible-render-stalls:"
+            f"{len(startup_visible_render_stalls)}>{startup_visible_stall_budget_count}"
+        )
+    if len(startup_visible_pts_stalls) > startup_visible_stall_budget_count:
+        visual_issues.append(
+            "startup-visible-pts-stalls:"
+            f"{len(startup_visible_pts_stalls)}>{startup_visible_stall_budget_count}"
+        )
+    if startup_visible_render_stall_excess_s > startup_visible_stall_budget_excess_s:
+        visual_issues.append(
+            "startup-render-stall-excess:"
+            f"{startup_visible_render_stall_excess_s:.2f}s>{startup_visible_stall_budget_excess_s:.2f}s"
+        )
+    if startup_visible_pts_stall_excess_s > startup_visible_stall_budget_excess_s:
+        visual_issues.append(
+            "startup-pts-stall-excess:"
+            f"{startup_visible_pts_stall_excess_s:.2f}s>{startup_visible_stall_budget_excess_s:.2f}s"
+        )
+    if len(steady_visible_render_stalls) > visible_stall_budget_count:
+        visual_issues.append(
+            "visible-render-stalls:"
+            f"{len(steady_visible_render_stalls)}>{visible_stall_budget_count}"
+        )
+    if len(steady_visible_pts_stalls) > visible_stall_budget_count:
+        visual_issues.append(
+            "visible-pts-stalls:"
+            f"{len(steady_visible_pts_stalls)}>{visible_stall_budget_count}"
+        )
+    if steady_visible_render_stall_excess_s > visible_stall_budget_excess_s:
+        visual_issues.append(
+            "visible-render-stall-excess:"
+            f"{steady_visible_render_stall_excess_s:.2f}s>{visible_stall_budget_excess_s:.2f}s"
+        )
+    if steady_visible_pts_stall_excess_s > visible_stall_budget_excess_s:
+        visual_issues.append(
+            "visible-pts-stall-excess:"
+            f"{steady_visible_pts_stall_excess_s:.2f}s>{visible_stall_budget_excess_s:.2f}s"
+        )
+    if av_large_count >= 25 or av_abs_max >= 0.90:
+        visual_issues.append(
+            f"audio-sync-instability:max={av_abs_max:.3f}s,count={av_large_count}"
         )
     result["player_visual_has_issues"] = bool(visual_issues)
     if visual_issues:
@@ -970,6 +1911,17 @@ def _print_stream_join_diagnostics(coord: Any) -> None:
             f"seed_bytes={int(event.get('seed_bytes', 0) or 0)} "
             f"live_chunks={int(event.get('live_chunk_count', 0) or 0)} "
             f"seed_offset_s={float(event.get('seed_offset_s', 0.0) or 0.0):.3f}"
+        )
+        gap_tag = ""
+        if int(event.get("active_gap_event_id", 0) or 0) > 0:
+            gap_tag = f" gap_event_id={int(event['active_gap_event_id'])}"
+        stale_tag = " STALE_SEED_GEN" if event.get("seed_gen_stale") else ""
+        print(
+            "  "
+            f"join_event_{event_id}_extra:"
+            f"{gap_tag}{stale_tag}"
+            f" seed_gen={int(event.get('seed_generation', 0) or 0)}"
+            f"/required={int(event.get('required_seed_generation', 0) or 0)}"
         )
         print(
             "  "
@@ -1162,14 +2114,7 @@ async def cmd_list(args) -> int:
     MeariApiClient = mods["api"].MeariApiClient
     parse_quality_profiles = mods["p2p_streamer"].parse_quality_profiles
 
-    api = MeariApiClient(
-        email=args.email,
-        password=args.password,
-        country_code=args.country_code,
-        phone_code=args.phone_code,
-        app_profile=args.profile,
-    )
-    api.login()
+    api = _login_api_with_fallback(MeariApiClient, args)
 
     print("=" * 78)
     print(f"Profile: {args.profile}")
@@ -1197,100 +2142,6 @@ async def cmd_list(args) -> int:
     return 0
 
 
-async def _run_probe(url: str, duration: int) -> tuple[int, list[str]]:
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-nostdin",
-        "-rw_timeout",
-        "5000000",
-        "-fflags",
-        "nobuffer",
-        "-i",
-        url,
-        "-t",
-        str(duration),
-        "-f",
-        "null",
-        "-",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    lines: list[str] = []
-    assert proc.stderr is not None
-    while True:
-        line = await proc.stderr.readline()
-        if not line:
-            break
-        lines.append(line.decode(errors="replace").rstrip())
-
-    rc = await proc.wait()
-    return rc, lines
-
-
-async def _run_idle_client_probe(url: str, duration: int) -> tuple[int, list[str]]:
-    """Keep a TCP client attached for idle/still benchmarking duration."""
-    parsed = urlparse(url)
-    if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
-        return 2, [f"unsupported idle probe URL: {url}"]
-
-    host = parsed.hostname
-    port = int(parsed.port)
-    seconds = max(1, int(duration))
-    deadline = time.monotonic() + float(seconds)
-    total_bytes = 0
-    reconnects = 0
-    reader: asyncio.StreamReader | None = None
-    writer: asyncio.StreamWriter | None = None
-
-    async def _close_client() -> None:
-        nonlocal writer, reader
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-        writer = None
-        reader = None
-
-    while time.monotonic() < deadline:
-        if reader is None or writer is None:
-            try:
-                reader, writer = await asyncio.open_connection(host, port)
-            except Exception:
-                reconnects += 1
-                await asyncio.sleep(0.25)
-                continue
-
-        timeout = max(0.1, min(1.0, deadline - time.monotonic()))
-        try:
-            chunk = await asyncio.wait_for(reader.read(32768), timeout=timeout)
-        except asyncio.TimeoutError:
-            continue
-        except Exception:
-            reconnects += 1
-            await _close_client()
-            continue
-
-        if not chunk:
-            reconnects += 1
-            await _close_client()
-            await asyncio.sleep(0.1)
-            continue
-
-        total_bytes += len(chunk)
-
-    await _close_client()
-    return 0, [
-        f"idle_client_bytes={total_bytes}",
-        f"idle_client_reconnects={reconnects}",
-    ]
-
-
 def _build_stream_player_cmd(
     url: str,
     duration: int = 0,
@@ -1299,6 +2150,10 @@ def _build_stream_player_cmd(
     """Build ffplay command for visible live playback."""
     if not shutil.which("ffplay"):
         raise RuntimeError("ffplay not found")
+
+    fflags = "+discardcorrupt"
+    sync_mode = "audio"
+    include_framedrop = False
 
     cmd = [
         "ffplay",
@@ -1309,17 +2164,26 @@ def _build_stream_player_cmd(
         "-window_title",
         "CloudEdge live",
         "-fflags",
-        "+discardcorrupt",
-        "-sync",
-        "ext",
-        "-infbuf",
-        "-analyzeduration",
-        "1000000",
-        "-probesize",
-        "524288",
-        "-f",
-        "mpegts",
+        fflags,
+        "-flags",
+        "low_delay",
     ]
+    if include_framedrop:
+        cmd.extend(["-framedrop"])
+    cmd.extend(
+        [
+            "-sync",
+            sync_mode,
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "524288",
+            "-vf",
+            "showinfo",
+            "-f",
+            "mpegts",
+        ]
+    )
     if int(duration) > 0:
         cmd.extend(["-t", str(int(duration))])
     cmd.append(url)
@@ -2009,6 +2873,11 @@ def _analyze_recorder_log(log_path: str, log: logging.Logger) -> dict[str, Any]:
 
 
 async def cmd_stream(args) -> int:
+    # Stream mode is always interactive: wake camera and launch ffplay.
+    setattr(args, "wake", True)
+    setattr(args, "play", True)
+
+    run_started_mono = time.monotonic()
     coord = None
     player_proc = None
     player_log_fh = None
@@ -2017,32 +2886,60 @@ async def cmd_stream(args) -> int:
     pcm_recorder_proc: subprocess.Popen | None = None
     recorder_started_mono: float | None = None
     player_started_mono: float | None = None
+    live_ready_mono: float | None = None
     player_decode_corr_stop = threading.Event()
     player_decode_corr_thread: threading.Thread | None = None
     player_visual_stop = threading.Event()
     player_visual_thread: threading.Thread | None = None
     player_decode_corr_state: dict[str, Any] = {
+        "run_started_mono": run_started_mono,
         "player_started_mono": 0.0,
         "startup_count": 0,
         "startup_samples": [],
         "by_event": {},
     }
     player_visual_state: dict[str, Any] = {
+        "run_started_mono": run_started_mono,
+        "live_ready_mono": 0.0,
+        "launch_gate_started_mono": 0.0,
         "player_started_mono": 0.0,
         "texture_created_mono": 0.0,
         "first_buffer_mono": 0.0,
         "first_stats_mono": 0.0,
         "last_stats_mono": 0.0,
         "stats_count": 0,
+        "first_showinfo_mono": 0.0,
+        "last_showinfo_mono": 0.0,
+        "showinfo_lines": 0,
+        "last_showinfo_frame_n": -1,
+        "showinfo_frame_jump_count": 0,
+        "last_showinfo_pts_time": -1.0,
+        "max_showinfo_pts_gap_s": 0.0,
+        "showinfo_pts_gaps_over_300ms": 0,
+        "max_showinfo_render_gap_s": 0.0,
+        "showinfo_render_freezes_over_1s": 0,
+        "showinfo_render_gaps_s": [],
+        "showinfo_pts_gaps_s": [],
+        "showinfo_startup_render_gaps_s": [],
+        "showinfo_steady_render_gaps_s": [],
+        "showinfo_startup_pts_gaps_s": [],
+        "showinfo_steady_pts_gaps_s": [],
+        "showinfo_timeline": [],
+        "av_sync_samples": [],
         "texture_lines": 0,
         "buffer_lines": 0,
         "late_texture_warned": False,
         "late_stats_warned": False,
     }
-    artifact_base = os.path.join(
-        tempfile.gettempdir(),
-        f"cloudedge_stream_{os.getpid()}_{int(time.time() * 1000)}",
-    )
+    output_file_arg = str(getattr(args, "output_file", "") or "").strip()
+    if output_file_arg:
+        artifact_base = os.path.abspath(os.path.expanduser(output_file_arg))
+        os.makedirs(os.path.dirname(artifact_base) or ".", exist_ok=True)
+    else:
+        artifact_base = os.path.join(
+            tempfile.gettempdir(),
+            f"cloudedge_stream_{os.getpid()}_{int(time.time() * 1000)}",
+        )
     ts_record_path = f"{artifact_base}.ts"
     pcm_record_path = f"{artifact_base}.wav"
     player_log_path = f"{artifact_base}_player.log"
@@ -2098,7 +2995,11 @@ async def cmd_stream(args) -> int:
             # In player mode, a first keyframe may appear before a stable live
             # session is established. Keep self-healing enabled by default so
             # playback does not freeze on a static frame.
-            effective_stall_timeout = 15
+            # Keep conservative defaults here. During the active playback loop
+            # we use runtime codec state to shorten HEVC recovery windows.
+            # New daytime signaling paths can take >15s before first stable
+            # keyframe; avoid preempting bootstrap too aggressively.
+            effective_stall_timeout = 30
             effective_wake_retry_interval = 8
             logging.getLogger(__name__).info(
                 "Player wake recovery enabled: stall_timeout=%ss wake_retry=%ss",
@@ -2122,6 +3023,7 @@ async def cmd_stream(args) -> int:
                         "No live video frames received after wake attempts. "
                         "Aborting to avoid a black player window."
                     )
+                live_ready_mono = time.monotonic()
 
         if args.play:
             active_codec = str(getattr(coord, "_video_codec", "hevc")).lower()
@@ -2130,120 +3032,142 @@ async def cmd_stream(args) -> int:
                 duration=0,
                 codec=active_codec,
             )
-            # Hold player launch until the live feed shows a minimum of
-            # stable cadence. Launching too early often opens ffplay on a
-            # black window while the first GOP is still recovering.
-            launch_deadline = time.monotonic() + 10.0
             start_frames = int(getattr(coord, "_p2p_video_frames", 0))
-            while time.monotonic() < launch_deadline:
-                await asyncio.sleep(0.25)
-                frames = int(getattr(coord, "_p2p_video_frames", 0))
-                last_video = float(getattr(coord, "_last_p2p_video_time", 0.0))
-                age = (time.monotonic() - last_video) if last_video > 0 else 999.0
-                if (frames - start_frames) >= 12 and age < 0.8:
-                    break
-            calm_ready, calm_state = await _await_player_launch_calm(
-                coord, timeout=6.0, severe_quiet_s=2.5
+            if live_ready_mono is None:
+                live_ready_mono = time.monotonic()
+            launch_gate_started_mono = time.monotonic()
+            player_visual_state["live_ready_mono"] = live_ready_mono
+            player_visual_state["launch_gate_started_mono"] = launch_gate_started_mono
+            gate_ready, gate_state = await _await_adaptive_player_launch_gate(
+                coord,
+                start_frames=start_frames,
+                timeout=11.0 if active_codec == "hevc" else 8.0,
             )
             logging.getLogger(__name__).info(
-                "Player launch calm gate %s (latest_severe_id=%s, latest_severe_status=%s, video_age=%.2fs)",
-                "ready" if calm_ready else "timeout; launching anyway",
-                (calm_state.get("latest_severe_gap_event") or {}).get("event_id"),
-                (calm_state.get("latest_severe_gap_event") or {}).get("status", "none"),
-                float(calm_state.get("video_age_s", 999.0) or 999.0),
+                "Player launch gate %s after %.2fs (reason=%s, preferred=%s, backlog_ready=%s, frames=%s, stable_for=%.2fs, video_age=%.2fs, generation=%s/%s, budget=%.2fs)",
+                "ready" if gate_ready else "expired; launching anyway",
+                float(gate_state.get("launch_gate_wait_s", 0.0) or 0.0),
+                gate_state.get("launch_gate_reason", "unknown"),
+                gate_state.get("preferred_join_mode", "unknown"),
+                gate_state.get("backlog_ready", False),
+                gate_state.get("launch_gate_frames_since_start", 0),
+                float(gate_state.get("stable_for_s", 0.0) or 0.0),
+                float(gate_state.get("video_age_s", 999.0) or 999.0),
+                gate_state.get("seed_generation", 0),
+                gate_state.get("required_seed_generation", 0),
+                float(gate_state.get("launch_gate_budget_s", 0.0) or 0.0),
             )
-            seed_ready, seed_state = await _await_preferred_player_bootstrap(
-                coord, timeout=18.0
-            )
-            logging.getLogger(__name__).info(
-                "Player bootstrap seed %s before launch (reason=%s, preferred=%s, backlog_ready=%s, backlog_target=%s, strong=%s, generation=%s/%s, seed_age=%.2fs, follow_frames=%s, video_age=%.2fs, bytes=%s)",
-                "ready" if seed_ready else "not ready; proceeding with live join",
-                seed_state.get("block_reason", "unknown"),
-                seed_state.get("preferred_join_mode", "unknown"),
-                seed_state.get("backlog_ready", False),
-                seed_state.get("backlog_follow_video_pusi_target", 0),
-                seed_state.get("seed_strong", False),
-                seed_state.get("seed_generation", 0),
-                seed_state.get("required_seed_generation", 0),
-                float(seed_state.get("seed_age_s", 999.0) or 999.0),
-                seed_state.get("frames_since_seed", 0),
-                float(seed_state.get("video_age_s", 999.0) or 999.0),
-                seed_state.get("seed_video_bytes", 0),
-            )
-            logging.getLogger(__name__).info("Delaying player 1s for stream startup")
-            await asyncio.sleep(1)
-            seed_ready_final, seed_state_final = (
-                await _await_preferred_player_bootstrap(coord, timeout=8.0)
-            )
-            logging.getLogger(__name__).info(
-                "Player bootstrap recheck %s immediately before launch (reason=%s, preferred=%s, backlog_ready=%s, backlog_target=%s, strong=%s, generation=%s/%s, seed_age=%.2fs, follow_frames=%s, video_age=%.2fs, bytes=%s)",
-                "ready" if seed_ready_final else "not ready; proceeding with live join",
-                seed_state_final.get("block_reason", "unknown"),
-                seed_state_final.get("preferred_join_mode", "unknown"),
-                seed_state_final.get("backlog_ready", False),
-                seed_state_final.get("backlog_follow_video_pusi_target", 0),
-                seed_state_final.get("seed_strong", False),
-                seed_state_final.get("seed_generation", 0),
-                seed_state_final.get("required_seed_generation", 0),
-                float(seed_state_final.get("seed_age_s", 999.0) or 999.0),
-                seed_state_final.get("frames_since_seed", 0),
-                float(seed_state_final.get("video_age_s", 999.0) or 999.0),
-                seed_state_final.get("seed_video_bytes", 0),
-            )
-            if not seed_ready_final:
-                logging.getLogger(__name__).info(
-                    "Preferred player bootstrap still unavailable; waiting up to 4s more before launch"
+            if active_codec == "hevc" and gate_ready:
+                need_hevc_cleanup = bool(
+                    str(gate_state.get("launch_gate_reason", "") or "")
+                    == "ready-backlog"
+                    and not bool(gate_state.get("seed_decode_probed", False))
                 )
-                seed_ready_final, seed_state_final = (
-                    await _await_preferred_player_bootstrap(
-                        coord,
-                        timeout=4.0,
+                if need_hevc_cleanup:
+                    bounded_hevc_wait_s = max(
+                        0.9,
+                        min(
+                            2.4,
+                            0.16
+                            * max(
+                                4,
+                                int(
+                                    gate_state.get(
+                                        "backlog_follow_video_pusi_target",
+                                        0,
+                                    )
+                                    or 0
+                                ),
+                            )
+                            + 0.55,
+                        ),
+                    )
+                    logging.getLogger(__name__).info(
+                        "HEVC fast backlog launch is ready but not decode-probed yet; waiting up to %.2fs for a cleaner startup seed",
+                        bounded_hevc_wait_s,
+                    )
+                    hevc_seed_ready, hevc_seed_state = (
+                        await _await_hevc_clean_startup_seed(
+                            coord,
+                            timeout=bounded_hevc_wait_s,
+                        )
+                    )
+                    gate_state = {**gate_state, **hevc_seed_state}
+                    if hevc_seed_ready:
+                        gate_state["launch_gate_reason"] = "ready-backlog-clean-seed"
+                    logging.getLogger(__name__).info(
+                        "HEVC fast backlog cleanup %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
+                        "ready" if hevc_seed_ready else "expired; keeping fast launch",
+                        gate_state.get("seed_strength_reason", ""),
+                        gate_state.get("hevc_gate_probe_reason", ""),
+                        gate_state.get("startup_safe", False),
+                        float(gate_state.get("video_age_s", 999.0) or 999.0),
+                    )
+            if active_codec == "hevc" and not gate_ready:
+                bounded_hevc_wait_s = max(
+                    1.4,
+                    min(
+                        4.0,
+                        0.22
+                        * max(
+                            4,
+                            int(
+                                gate_state.get(
+                                    "backlog_follow_video_pusi_target",
+                                    0,
+                                )
+                                or 0
+                            ),
+                        )
+                        + 0.9
+                        + 0.35
+                        * int(gate_state.get("recent_moderate_gap_count", 0) or 0),
+                    ),
+                )
+                try_short_hevc_wait = bool(
+                    float(gate_state.get("video_age_s", 999.0) or 999.0) < 1.2
+                    and int(gate_state.get("recent_severe_gap_count", 0) or 0) == 0
+                    and (
+                        bool(gate_state.get("startup_safe", False))
+                        or bool(gate_state.get("seed_decode_probed", False))
+                        or str(gate_state.get("preferred_join_mode", "") or "")
+                        == "ready-backlog"
                     )
                 )
-                logging.getLogger(__name__).info(
-                    "Player bootstrap final wait %s before launch (reason=%s, preferred=%s, backlog_ready=%s, backlog_target=%s, strong=%s, generation=%s/%s, seed_age=%.2fs, follow_frames=%s, video_age=%.2fs, bytes=%s)",
-                    (
-                        "ready"
-                        if seed_ready_final
-                        else "not ready; proceeding with live join"
-                    ),
-                    seed_state_final.get("block_reason", "unknown"),
-                    seed_state_final.get("preferred_join_mode", "unknown"),
-                    seed_state_final.get("backlog_ready", False),
-                    seed_state_final.get("backlog_follow_video_pusi_target", 0),
-                    seed_state_final.get("seed_strong", False),
-                    seed_state_final.get("seed_generation", 0),
-                    seed_state_final.get("required_seed_generation", 0),
-                    float(seed_state_final.get("seed_age_s", 999.0) or 999.0),
-                    seed_state_final.get("frames_since_seed", 0),
-                    float(seed_state_final.get("video_age_s", 999.0) or 999.0),
-                    seed_state_final.get("seed_video_bytes", 0),
-                )
-                if not seed_ready_final:
+                if try_short_hevc_wait:
+                    logging.getLogger(__name__).info(
+                        "HEVC launch gate missed its fast budget; waiting up to %.2fs more for a cleaner startup seed",
+                        bounded_hevc_wait_s,
+                    )
+                    hevc_seed_ready, hevc_seed_state = (
+                        await _await_hevc_clean_startup_seed(
+                            coord,
+                            timeout=bounded_hevc_wait_s,
+                        )
+                    )
+                    gate_state = {**gate_state, **hevc_seed_state}
+                    gate_ready = gate_ready or hevc_seed_ready
+                    logging.getLogger(__name__).info(
+                        "HEVC bounded clean-seed wait %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
+                        "ready" if hevc_seed_ready else "expired; launching anyway",
+                        gate_state.get("seed_strength_reason", ""),
+                        gate_state.get("hevc_gate_probe_reason", ""),
+                        gate_state.get("startup_safe", False),
+                        float(gate_state.get("video_age_s", 999.0) or 999.0),
+                    )
+                else:
                     logging.getLogger(__name__).warning(
-                        "No preferred backlog bootstrap became available in time; launching anyway with live join fallback"
+                        "HEVC launch gate expired and the source is already too stale or unstable; launching immediately"
                     )
-            if active_codec == "hevc":
-                hevc_seed_ready, hevc_seed_state = await _await_hevc_clean_startup_seed(
-                    coord,
-                    timeout=12.0,
-                )
-                logging.getLogger(__name__).info(
-                    "HEVC clean-seed gate %s before launch (reason=%s, probe=%s, strong=%s, startup_safe=%s, seed_age=%.2fs, video_age=%.2fs, generation=%s/%s)",
-                    (
-                        "ready"
-                        if hevc_seed_ready
-                        else "timeout; launching with best available seed"
-                    ),
-                    hevc_seed_state.get("seed_strength_reason", ""),
-                    hevc_seed_state.get("hevc_gate_probe_reason", ""),
-                    hevc_seed_state.get("seed_strong", False),
-                    hevc_seed_state.get("startup_safe", False),
-                    float(hevc_seed_state.get("seed_age_s", 999.0) or 999.0),
-                    float(hevc_seed_state.get("video_age_s", 999.0) or 999.0),
-                    hevc_seed_state.get("seed_generation", 0),
-                    hevc_seed_state.get("required_seed_generation", 0),
-                )
+            player_visual_state["player_launch_gate_reason"] = str(
+                gate_state.get("launch_gate_reason", "unknown")
+            )
+            player_visual_state["player_launch_gate_budget_s"] = float(
+                gate_state.get("launch_gate_budget_s", 0.0) or 0.0
+            )
+            player_visual_state["player_launch_gate_frames_since_start"] = int(
+                gate_state.get("launch_gate_frames_since_start", 0) or 0
+            )
             play_env = os.environ.copy()
             player_log_fh = open(player_log_path, "wb")
 
@@ -2497,11 +3421,13 @@ async def cmd_stream(args) -> int:
         if not args.play and args.duration > 0:
             end_at = time.time() + args.duration
         stall_started_at: float | None = None
+        runtime_stall_timeout = effective_stall_timeout
+        runtime_stall_timeout_logged = False
         while True:
             if end_at is not None and time.time() >= end_at:
                 break
             if args.play and player_proc is not None and args.duration > 0:
-                # With --play, duration is wall-clock ffplay open time.
+                # Duration is measured as ffplay wall-clock open time.
                 if player_started_mono is not None and (
                     time.monotonic() - player_started_mono
                 ) >= float(args.duration):
@@ -2511,11 +3437,24 @@ async def cmd_stream(args) -> int:
             health_source.tick(coord)
 
             if effective_stall_timeout > 0:
+                if args.play:
+                    runtime_codec = str(
+                        getattr(coord, "_video_codec", "") or ""
+                    ).lower()
+                    runtime_stall_timeout = (
+                        6 if runtime_codec == "hevc" else effective_stall_timeout
+                    )
+                    if runtime_codec == "hevc" and not runtime_stall_timeout_logged:
+                        logging.getLogger(__name__).info(
+                            "Runtime HEVC recovery timeout active: stall_timeout=%ss",
+                            runtime_stall_timeout,
+                        )
+                        runtime_stall_timeout_logged = True
                 stall_started_at = _maybe_restart_stalled_stream(
                     coord,
                     baseline_video_time,
                     stall_started_at,
-                    effective_stall_timeout,
+                    runtime_stall_timeout,
                 )
             await asyncio.sleep(1)
 
@@ -2547,22 +3486,25 @@ async def cmd_stream(args) -> int:
         )
 
         source_summary = health_source.summary(coord)
+        analysis_mode = str(getattr(args, "analysis_mode", "ffplay") or "ffplay")
+        full_mode = analysis_mode == "full"
 
-        print("\nStream health (source ingress)")
-        print("-" * 78)
-        print(f"video_frames: {int(source_summary['video_frames'])}")
-        print(f"avg_fps: {float(source_summary['avg_fps']):.2f}")
-        print(f"max_video_gap_s: {float(source_summary['max_gap_s']):.2f}")
-        print(f"recovered_stalls: {int(source_summary['recovered_stalls'])}")
-        print(
-            f"recovered_stalls_over_1s: {int(source_summary['recovered_stalls_over_1s'])}"
-        )
-        print(
-            f"recovered_stalls_over_3s: {int(source_summary['recovered_stalls_over_3s'])}"
-        )
-        unresolved = float(source_summary["unresolved_stall_s"])
-        if unresolved > 0.0:
-            print(f"unresolved_stall_s: {unresolved:.2f}")
+        if (not args.play) or full_mode:
+            print("\nStream health (source ingress)")
+            print("-" * 78)
+            print(f"video_frames: {int(source_summary['video_frames'])}")
+            print(f"avg_fps: {float(source_summary['avg_fps']):.2f}")
+            print(f"max_video_gap_s: {float(source_summary['max_gap_s']):.2f}")
+            print(f"recovered_stalls: {int(source_summary['recovered_stalls'])}")
+            print(
+                f"recovered_stalls_over_1s: {int(source_summary['recovered_stalls_over_1s'])}"
+            )
+            print(
+                f"recovered_stalls_over_3s: {int(source_summary['recovered_stalls_over_3s'])}"
+            )
+            unresolved = float(source_summary["unresolved_stall_s"])
+            if unresolved > 0.0:
+                print(f"unresolved_stall_s: {unresolved:.2f}")
 
         # --- TS recording analysis ---
         if args.play:
@@ -2577,7 +3519,7 @@ async def cmd_stream(args) -> int:
             )
             log.info("Player log analysis completed in %.1fs", time.time() - _t_player)
             if player_metrics:
-                print("\nPlayer log analysis (what ffplay actually reported)")
+                print("\nFFplay observed stats (authoritative)")
                 print("-" * 78)
                 for k, v in player_metrics.items():
                     if isinstance(v, list):
@@ -2587,138 +3529,155 @@ async def cmd_stream(args) -> int:
                 run_failed = run_failed or bool(
                     player_metrics.get("player_has_issues", False)
                 )
-                _print_player_decode_correlation(coord, player_decode_corr_state)
-                _print_stream_join_diagnostics(coord)
+                if full_mode:
+                    _print_player_decode_correlation(coord, player_decode_corr_state)
+                    _print_stream_join_diagnostics(coord)
 
-            _t_rec = time.time()
-            recorder_metrics = _analyze_recorder_log(recorder_log_path, log)
-            log.info("Recorder log analysis completed in %.1fs", time.time() - _t_rec)
             recorder_only_timestamp_discontinuities = False
-            if recorder_metrics:
-                print("\nRecorder log analysis (what ffmpeg recorder reported)")
-                print("-" * 78)
-                for k, v in recorder_metrics.items():
-                    if isinstance(v, list):
-                        print(f"  {k}: {v}")
-                    else:
-                        print(f"  {k}: {v}")
-                recorder_only_timestamp_discontinuities = bool(
-                    int(recorder_metrics.get("recorder_decode_error_lines", 0) or 0)
-                    == 0
-                    and int(
-                        recorder_metrics.get("recorder_continuity_error_lines", 0) or 0
-                    )
-                    > 0
-                    and int(
-                        recorder_metrics.get("recorder_continuity_error_lines", 0) or 0
-                    )
-                    == int(
-                        recorder_metrics.get(
-                            "recorder_timestamp_discontinuity_lines", 0
-                        )
-                        or 0
-                    )
-                )
-                run_failed = run_failed or bool(
-                    recorder_metrics.get("recorder_has_issues", False)
-                    and not recorder_only_timestamp_discontinuities
-                )
-            else:
-                print("\nRecorder log analysis (what ffmpeg recorder reported)")
-                print("-" * 78)
-                print("  recorder stderr was empty")
-                recorder_only_timestamp_discontinuities = False
-
-            _t1 = time.time()
-            ts_metrics = _analyze_recorded_ts(ts_record_path, log)
-            log.info("TS analysis completed in %.1fs", time.time() - _t1)
             ts_minor_glitch = False
-            if ts_metrics:
-                print("\nTS recording analysis (what the player received)")
-                print("-" * 78)
-                for k, v in ts_metrics.items():
-                    if k == "decode_errors_sample":
-                        print(f"  {k}:")
-                        for line in v:
-                            print(f"    {line}")
-                    elif isinstance(v, list):
-                        print(f"  {k}: {v}")
-                    elif isinstance(v, float):
-                        print(f"  {k}: {v:.2f}")
-                    else:
-                        print(f"  {k}: {v}")
-                _print_ts_decode_correlation(coord, recorder_started_mono, ts_metrics)
-                video_skip_durations = [
-                    float(v)
-                    for v in (ts_metrics.get("video_skip_durations_s", []) or [])
-                ]
-                max_video_skip_s = (
-                    max(video_skip_durations) if video_skip_durations else 0.0
+            if full_mode:
+                _t_rec = time.time()
+                recorder_metrics = _analyze_recorder_log(recorder_log_path, log)
+                log.info(
+                    "Recorder log analysis completed in %.1fs", time.time() - _t_rec
                 )
-                ts_minor_glitch = bool(
-                    int(ts_metrics.get("decode_error_lines", 0) or 0) == 0
-                    and int(ts_metrics.get("audio_gap_count", 0) or 0) == 0
-                    and int(ts_metrics.get("video_skip_count", 0) or 0) <= 1
-                    and max_video_skip_s < 1.0
-                )
-                run_failed = run_failed or bool(
-                    int(ts_metrics.get("decode_error_lines", 0) or 0) > 0
-                    or int(ts_metrics.get("audio_gap_count", 0) or 0) > 0
-                    or (
-                        int(ts_metrics.get("video_skip_count", 0) or 0) > 0
-                        and not ts_minor_glitch
-                    )
-                )
-            else:
-                run_failed = True
-
-            if player_metrics and ts_metrics:
-                player_has_issues = bool(player_metrics.get("player_has_issues", False))
-                ts_looks_clean = (
-                    int(ts_metrics.get("decode_error_lines", 0) or 0) == 0
-                    and int(ts_metrics.get("video_skip_count", 0) or 0) == 0
-                )
-                if player_has_issues and ts_looks_clean:
-                    print("\nResult consistency warning")
+                if recorder_metrics:
+                    print("\nRecorder log analysis (what ffmpeg recorder reported)")
                     print("-" * 78)
-                    print(
-                        "  ffplay reported player-visible decode/continuity issues even though"
+                    for k, v in recorder_metrics.items():
+                        if isinstance(v, list):
+                            print(f"  {k}: {v}")
+                        else:
+                            print(f"  {k}: {v}")
+                    recorder_only_timestamp_discontinuities = bool(
+                        int(recorder_metrics.get("recorder_decode_error_lines", 0) or 0)
+                        == 0
+                        and int(
+                            recorder_metrics.get("recorder_continuity_error_lines", 0)
+                            or 0
+                        )
+                        > 0
+                        and int(
+                            recorder_metrics.get("recorder_continuity_error_lines", 0)
+                            or 0
+                        )
+                        == int(
+                            recorder_metrics.get(
+                                "recorder_timestamp_discontinuity_lines", 0
+                            )
+                            or 0
+                        )
                     )
-                    print(
-                        "  the recorded TS analysis looked clean. Treat the run as failed or"
+                    run_failed = run_failed or bool(
+                        recorder_metrics.get("recorder_has_issues", False)
+                        and not recorder_only_timestamp_discontinuities
                     )
-                    print(
-                        "  degraded; the player log is authoritative for viewer experience."
+                else:
+                    print("\nRecorder log analysis (what ffmpeg recorder reported)")
+                    print("-" * 78)
+                    print("  recorder stderr was empty")
+
+                _t1 = time.time()
+                ts_metrics = _analyze_recorded_ts(ts_record_path, log)
+                log.info("TS analysis completed in %.1fs", time.time() - _t1)
+                if ts_metrics:
+                    print("\nTS recording analysis (what the player received)")
+                    print("-" * 78)
+                    for k, v in ts_metrics.items():
+                        if k == "decode_errors_sample":
+                            print(f"  {k}:")
+                            for line in v:
+                                print(f"    {line}")
+                        elif isinstance(v, list):
+                            print(f"  {k}: {v}")
+                        elif isinstance(v, float):
+                            print(f"  {k}: {v:.2f}")
+                        else:
+                            print(f"  {k}: {v}")
+                    _print_ts_decode_correlation(
+                        coord, recorder_started_mono, ts_metrics
                     )
+                    video_skip_durations = [
+                        float(v)
+                        for v in (ts_metrics.get("video_skip_durations_s", []) or [])
+                    ]
+                    max_video_skip_s = (
+                        max(video_skip_durations) if video_skip_durations else 0.0
+                    )
+                    ts_minor_glitch = bool(
+                        int(ts_metrics.get("decode_error_lines", 0) or 0) == 0
+                        and int(ts_metrics.get("audio_gap_count", 0) or 0) == 0
+                        and int(ts_metrics.get("video_skip_count", 0) or 0) <= 1
+                        and max_video_skip_s < 1.0
+                    )
+                    run_failed = run_failed or bool(
+                        int(ts_metrics.get("decode_error_lines", 0) or 0) > 0
+                        or int(ts_metrics.get("audio_gap_count", 0) or 0) > 0
+                        or (
+                            int(ts_metrics.get("video_skip_count", 0) or 0) > 0
+                            and not ts_minor_glitch
+                        )
+                    )
+                else:
                     run_failed = True
 
-            # --- PCM audio content analysis ---
-            _t2 = time.time()
-            pcm_metrics = _analyze_pcm_audio(pcm_record_path, log)
-            log.info("PCM analysis completed in %.1fs", time.time() - _t2)
-            if pcm_metrics:
-                print("\nPCM audio analysis (actual audible content)")
-                print("-" * 78)
-                for k, v in pcm_metrics.items():
-                    if isinstance(v, list):
-                        print(f"  {k}: {v}")
-                    elif isinstance(v, float):
-                        print(f"  {k}: {v:.2f}")
-                    else:
-                        print(f"  {k}: {v}")
-            else:
-                run_failed = True
+                if player_metrics and ts_metrics:
+                    player_has_issues = bool(
+                        player_metrics.get("player_has_issues", False)
+                    )
+                    ts_looks_clean = (
+                        int(ts_metrics.get("decode_error_lines", 0) or 0) == 0
+                        and int(ts_metrics.get("video_skip_count", 0) or 0) == 0
+                    )
+                    if player_has_issues and ts_looks_clean:
+                        print("\nResult consistency warning")
+                        print("-" * 78)
+                        print(
+                            "  ffplay reported player-visible decode/continuity issues even though"
+                        )
+                        print(
+                            "  the recorded TS analysis looked clean. Treat the run as failed or"
+                        )
+                        print(
+                            "  degraded; the player log is authoritative for viewer experience."
+                        )
+                        run_failed = True
+
+                # --- PCM audio content analysis ---
+                _t2 = time.time()
+                pcm_metrics = _analyze_pcm_audio(pcm_record_path, log)
+                log.info("PCM analysis completed in %.1fs", time.time() - _t2)
+                if pcm_metrics:
+                    print("\nPCM audio analysis (actual audible content)")
+                    print("-" * 78)
+                    for k, v in pcm_metrics.items():
+                        if isinstance(v, list):
+                            print(f"  {k}: {v}")
+                        elif isinstance(v, float):
+                            print(f"  {k}: {v:.2f}")
+                        else:
+                            print(f"  {k}: {v}")
+                else:
+                    run_failed = True
 
             print("\nOverall test verdict")
             print("-" * 78)
             if run_failed:
                 print("  degraded/fail")
-                print(
-                    "  One or more of: player log, recorder log, or TS analysis reported"
-                )
-                print("  viewer-visible issues. Exit status will be non-zero.")
+                if full_mode:
+                    print(
+                        "  One or more of: player log, recorder log, or TS analysis reported"
+                    )
+                    print("  viewer-visible issues. Exit status will be non-zero.")
+                else:
+                    print(
+                        "  FFplay observed issues (visual cadence/decode/continuity) are present."
+                    )
+                    print("  Exit status will be non-zero.")
                 return 3
-            if ts_minor_glitch or recorder_only_timestamp_discontinuities:
+            if full_mode and (
+                ts_minor_glitch or recorder_only_timestamp_discontinuities
+            ):
                 print("  acceptable")
                 print(
                     "  ffplay stayed clean; only a short isolated TS skip and/or recorder"
@@ -2733,6 +3692,88 @@ async def cmd_stream(args) -> int:
         _stop_player_process(player_proc)
         _stop_player_process(recorder_proc)
         _stop_player_process(pcm_recorder_proc)
+        # Write per-gap event telemetry JSONL: gap events + linked join events
+        try:
+            gap_telemetry_path = f"{artifact_base}_gap_telemetry.jsonl"
+            gap_events = []
+            join_events = []
+            if coord is not None:
+                getter_gap = getattr(coord, "get_gap_skip_events_snapshot", None)
+                if callable(getter_gap):
+                    gap_events = getter_gap()
+                getter_join = getattr(
+                    coord, "get_stream_join_diagnostics_snapshot", None
+                )
+                if callable(getter_join):
+                    join_events = getter_join()
+            if gap_events or join_events:
+                import json as _json
+
+                # Build a map: gap_event_id -> list of join events referencing it
+                join_by_gap: dict = {}
+                for je in join_events:
+                    gid = int(je.get("active_gap_event_id", 0) or 0)
+                    join_by_gap.setdefault(gid, []).append(
+                        {
+                            k: v
+                            for k, v in je.items()
+                            if k
+                            not in (
+                                "live_capture",
+                                "seed_summary",
+                                "live_summary",
+                                "boundary",
+                            )
+                        }
+                    )
+                with open(gap_telemetry_path, "w") as _gf:
+                    for ge in gap_events:
+                        eid = int(ge.get("event_id", 0) or 0)
+                        record = {
+                            "type": "gap_event",
+                            "event_id": eid,
+                            "severity": ge.get("severity"),
+                            "gap_size": ge.get("gap_size"),
+                            "stall_s": ge.get("stall_s"),
+                            "backlog_s": ge.get("backlog_s"),
+                            "strict_release": ge.get("strict_release"),
+                            "release_reason": ge.get("release_reason"),
+                            "quarantine_drops": ge.get("quarantine_drops"),
+                            "released_frame_bytes": ge.get("released_frame_bytes"),
+                            "startup_safe_min_seed_generation": ge.get(
+                                "startup_safe_min_seed_generation"
+                            ),
+                            "status": ge.get("status"),
+                            "join_events": join_by_gap.get(eid, []),
+                        }
+                        _gf.write(_json.dumps(record) + "\n")
+                    # Write any join events not linked to a gap (startup/initial joins)
+                    for je in join_events:
+                        gid = int(je.get("active_gap_event_id", 0) or 0)
+                        if gid == 0:
+                            record = {
+                                "type": "join_event_unlinked",
+                                **{
+                                    k: v
+                                    for k, v in je.items()
+                                    if k
+                                    not in (
+                                        "live_capture",
+                                        "seed_summary",
+                                        "live_summary",
+                                        "boundary",
+                                    )
+                                },
+                            }
+                            _gf.write(_json.dumps(record) + "\n")
+                log.info(
+                    "Gap telemetry written to %s (%d gap events, %d join events)",
+                    gap_telemetry_path,
+                    len(gap_events),
+                    len(join_events),
+                )
+        except Exception:
+            log.debug("Failed to write gap telemetry", exc_info=True)
         if player_log_fh is not None:
             try:
                 player_log_fh.flush()
@@ -2752,120 +3793,34 @@ async def cmd_stream(args) -> int:
             await coord.async_stop()
 
 
-async def cmd_bench(args) -> int:
-    coord = None
-    try:
-        setattr(args, "skip_initial_grab", bool(args.idle_still))
-        if args.idle_still:
-            logging.getLogger(__name__).info(
-                "Auto-disabling startup frame grab for idle-still benchmark"
-            )
-
-        coord, dev, mods = await _create_coordinator(args)
-        bench_mode = "idle-still" if args.idle_still else "live"
-        live_ok: bool | None = None
-        if not args.idle_still:
-            coord.wake_camera()
-            live_ok = await _await_live_stream(
-                coord,
-                timeout=args.wake_timeout,
-                stall_timeout=0,
-            )
-
-        url = await _camera_stream_source(mods, coord)
-        print("=" * 78)
-        print(f"Benchmarking device: {dev.get('deviceName')} ({dev.get('snNum')})")
-        print(f"Mode: {bench_mode}")
-        print(f"Input URL: {url}")
-        print(f"Duration: {args.duration}s")
-        print(f"camera_awake={coord.camera_awake}")
-        if live_ok is None:
-            print("live_ready=n/a (idle-still mode)")
-        else:
-            print(f"live_ready={live_ok}")
-        print("=" * 78)
-
-        if not args.idle_still and not bool(live_ok):
-            print("ERROR: no live video frames received after wake attempts")
-            return 2
-
-        def _pid_provider() -> list[int]:
-            pids = [os.getpid()]
-            ff = getattr(coord, "_ffmpeg_proc", None)
-            if ff and ff.poll() is None:
-                pids.append(ff.pid)
-            return pids
-
-        sampler = CpuSampler(_pid_provider, interval=1.0)
-        sampler.start()
-
-        try:
-            if args.idle_still:
-                probe_rc, probe_lines = await asyncio.wait_for(
-                    _run_idle_client_probe(url, args.duration),
-                    timeout=args.duration + 20,
-                )
-            else:
-                probe_rc, probe_lines = await asyncio.wait_for(
-                    _run_probe(url, args.duration),
-                    timeout=args.duration + 20,
-                )
-        except asyncio.TimeoutError:
-            probe_rc, probe_lines = 124, ["probe timeout"]
-        cpu = await sampler.stop()
-
-        warn_lines = [
-            ln
-            for ln in probe_lines
-            if "non monoton" in ln.lower()
-            or "timestamp" in ln.lower()
-            or "dts" in ln.lower()
-            or "pts" in ln.lower()
-            or "invalid" in ln.lower()
-            or "dropped" in ln.lower()
-        ]
-
-        print("\nProbe summary")
-        print("-" * 78)
-        if args.idle_still:
-            print("probe engine: idle-client")
-        else:
-            print("probe engine: ffmpeg")
-        print(f"probe rc: {probe_rc}")
-        if args.idle_still and probe_lines:
-            print("probe details:")
-            for ln in probe_lines:
-                print(f"  {ln}")
-        print(f"warning-like lines: {len(warn_lines)}")
-        if warn_lines:
-            print("first warnings:")
-            for ln in warn_lines[:20]:
-                print(f"  {ln}")
-
-        print("\nCPU summary")
-        print("-" * 78)
-        print(f"avg cpu% (python + integration ffmpeg): {cpu['avg']:.2f}")
-        print(f"max cpu% (python + integration ffmpeg): {cpu['max']:.2f}")
-
-        # Non-zero probe RC is informative but not always fatal for live inputs.
-        return 0
-    finally:
-        if coord:
-            await coord.async_stop()
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="CloudEdge integration local harness")
 
-    p.add_argument("--email", required=True, help="Account email")
-    p.add_argument("--password", required=True, help="Account password")
-    p.add_argument("--country-code", default="FR", help="Country code (e.g. FR)")
-    p.add_argument("--phone-code", default="33", help="Phone code (e.g. 33)")
+    p.add_argument(
+        "--email",
+        default=None,
+        help="Account email (defaults to .env when omitted)",
+    )
+    p.add_argument(
+        "--password",
+        default=None,
+        help="Account password (defaults to .env when omitted)",
+    )
+    p.add_argument(
+        "--country-code",
+        default=None,
+        help="Country code (e.g. FR, defaults to .env then FR)",
+    )
+    p.add_argument(
+        "--phone-code",
+        default=None,
+        help="Phone code (e.g. 33, defaults to .env then 33)",
+    )
     p.add_argument(
         "--profile",
-        default="cloudedge",
+        default=None,
         choices=["cloudedge", "cloudplus", "iegeek"],
-        help="App profile",
+        help="App profile (defaults to .env then cloudedge)",
     )
     p.add_argument("--debug", action="store_true", help="Enable verbose logs")
 
@@ -2884,20 +3839,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration",
         type=int,
         default=0,
-        help="Duration in seconds (with --play: ffplay on-screen time; without --play: harness run time, 0 = until Ctrl+C)",
+        help="Duration in seconds for ffplay on-screen time (0 = until Ctrl+C)",
     )
-    p_stream.add_argument("--wake", action="store_true", help="Wake camera immediately")
     p_stream.add_argument(
         "--wake-timeout",
         type=int,
         default=45,
         help="Seconds to wait for live frames before playback/stream readiness checks",
-    )
-    p_stream.add_argument(
-        "--play",
-        dest="play",
-        action="store_true",
-        help="Auto-launch local ffplay preview",
     )
     p_stream.add_argument(
         "--quality",
@@ -2910,28 +3858,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional camera video-encryption password (E2EE)",
     )
+    p_stream.add_argument(
+        "--output-file",
+        default="",
+        help=(
+            "Optional base filename (without extension) for stream artifacts/logs "
+            "(.ts/.wav/player/recorder logs). When omitted, a timestamped name is "
+            "auto-generated in the system temp directory. Example: logs/run1"
+        ),
+    )
+    p_stream.add_argument(
+        "--analysis-mode",
+        choices=["ffplay", "full"],
+        default="ffplay",
+        help=(
+            "Result reporting mode: 'ffplay' reports only what ffplay actually showed "
+            "(default), 'full' also includes recorder/TS/PCM diagnostics."
+        ),
+    )
 
-    p_bench = sub.add_parser(
-        "bench", help="Run stream stability + CPU benchmark (live or idle-still)"
-    )
-    p_bench.add_argument(
-        "--device-id", type=int, default=None, help="Select a specific deviceID"
-    )
-    p_bench.add_argument("--sn", default=None, help="Select a specific serial number")
-    p_bench.add_argument(
-        "--duration", type=int, default=45, help="Benchmark duration in seconds"
-    )
-    p_bench.add_argument(
-        "--idle-still",
-        action="store_true",
-        help="Benchmark idle/still stream without waking camera",
-    )
-    p_bench.add_argument(
-        "--wake-timeout",
-        type=int,
-        default=45,
-        help="Seconds to wait for live frames before benchmarking (live mode)",
-    )
     return p
 
 
@@ -2940,14 +3885,13 @@ async def _async_main(args) -> int:
         return await cmd_list(args)
     if args.command == "stream":
         return await cmd_stream(args)
-    if args.command == "bench":
-        return await cmd_bench(args)
     raise RuntimeError(f"Unknown command: {args.command}")
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    _prepare_auth_args(parser, args)
     if getattr(args, "debug", False):
         logging.basicConfig(
             level=logging.DEBUG,

@@ -7,6 +7,7 @@ import os
 import socket
 import struct
 import time
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from ..turn_client import (
@@ -14,12 +15,16 @@ from ..turn_client import (
     _encode_attr,
     _add_integrity,
     _encode_xor_address,
+    _decode_xor_address,
+    _parse_stun,
     BINDING_REQUEST,
     BINDING_RESPONSE,
+    DATA_INDICATION,
     ATTR_USERNAME,
     ATTR_XOR_MAPPED_ADDRESS,
+    ATTR_DATA,
+    ATTR_XOR_PEER_ADDRESS,
 )
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +33,17 @@ _LOGGER = logging.getLogger(__name__)
 _SIG_CACHE_TTL_S = 180.0
 _SIG_CACHE_ENDPOINT: tuple[str, int] | None = None
 _SIG_CACHE_EXPIRES_AT: float = 0.0
+
+
+@dataclass(slots=True)
+class PeerPacket:
+    """One UDP packet with TURN framing removed when present."""
+
+    data: bytes
+    source: tuple[str, int]
+    peer: tuple[str, int] | None
+    via_turn: bool
+    stun: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +277,71 @@ def _send_direct_ice_binding(
     attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
     msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
     sock.sendto(msg, (peer_ip, peer_port))
+
+
+def _unwrap_peer_packet(turn, raw: bytes, addr: tuple[str, int]) -> PeerPacket:
+    if len(raw) < 4:
+        return PeerPacket(raw, addr, None, False)
+
+    if (raw[0] & 0xC0) == 0x40:
+        ch, length = struct.unpack(">HH", raw[:4])
+        data = raw[4 : 4 + length]
+        peer = turn.reverse_channels.get(ch)
+        return PeerPacket(data, addr, peer, True, _parse_stun(data))
+
+    msg = _parse_stun(raw)
+    if msg and msg["type"] == DATA_INDICATION:
+        data = msg["attrs"].get(ATTR_DATA, b"")
+        peer = None
+        if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
+            peer_ip, peer_port = _decode_xor_address(
+                msg["attrs"][ATTR_XOR_PEER_ADDRESS]
+            )
+            if peer_ip is not None and peer_port is not None:
+                peer = (peer_ip, peer_port)
+        return PeerPacket(data, addr, peer, True, _parse_stun(data))
+
+    peer = None if addr[0] == getattr(turn, "server_ip", None) else addr
+    return PeerPacket(raw, addr, peer, False, msg)
+
+
+def recv_peer_packet(turn, timeout: float = 1.0) -> PeerPacket | None:
+    """Receive one UDP packet and unwrap TURN ChannelData/DataIndication.
+
+    ``TurnClient.recv_data()`` intentionally hides the socket source address.
+    The streamer needs it for direct ICE checks, so this helper keeps both the
+    raw source address and the logical peer address.
+    """
+    turn.sock.settimeout(timeout)
+    try:
+        raw, addr = turn.sock.recvfrom(65536)
+    except socket.timeout:
+        return None
+    return _unwrap_peer_packet(turn, raw, addr)
+
+
+def recv_peer_packets(
+    turn,
+    *,
+    timeout: float = 0.08,
+    max_packets: int = 512,
+) -> list[PeerPacket]:
+    """Receive one packet, then drain immediately available UDP bursts."""
+    first = recv_peer_packet(turn, timeout=timeout)
+    if first is None:
+        return []
+
+    packets = [first]
+    sock = turn.sock
+    sock.setblocking(False)
+    try:
+        for _ in range(max(0, max_packets - 1)):
+            try:
+                raw, addr = sock.recvfrom(65536)
+            except (BlockingIOError, OSError):
+                break
+            packets.append(_unwrap_peer_packet(turn, raw, addr))
+    finally:
+        sock.setblocking(True)
+        sock.settimeout(timeout)
+    return packets
