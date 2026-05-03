@@ -55,12 +55,21 @@ APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
         "partner_id": "8",
         "ttid": TTID,
     },
+    "iegeek": {
+        "source_app": "81",
+        "app_ver": "5.5.2",
+        "app_ver_code": "552",
+        "redirect_url": REDIRECT_URL,
+        "partner_id": "81",
+        "ttid": TTID,
+    },
 }
 
 
 # ---------------------------------------------------------------------------
 # Crypto helpers
 # ---------------------------------------------------------------------------
+
 
 def _hmac_sha1_b64(message: str, key: str) -> str:
     sig = hmac.new(key.encode(), message.encode(), hashlib.sha1).digest()
@@ -359,7 +368,9 @@ class MeariApiClient:
         last_code: str = ""
         last_msg: str = ""
 
-        for idx, password_candidate in enumerate(_password_variants(self.password), start=1):
+        for idx, password_candidate in enumerate(
+            _password_variants(self.password), start=1
+        ):
             ts = int(time.time() * 1000)
             params = {
                 "phoneType": PHONE_TYPE,
@@ -412,7 +423,16 @@ class MeariApiClient:
 
     def _get_iot_config(self) -> None:
         data = self._get("/v2/app/config/pf/init", {"iotType": "4"})
-        if data.get("resultCode") != "1001":
+        result_code = str(data.get("resultCode", ""))
+        if result_code != "1001":
+            # Some accounts/devices intermittently return 1023 for this endpoint
+            # even when auth is valid. Keep defaults and continue.
+            if result_code == "1023":
+                _LOGGER.warning(
+                    "IoT config returned 1023 for %s; continuing with default endpoints",
+                    self.email,
+                )
+                return
             raise RuntimeError(f"IoT config failed: {data}")
         result = data["result"]
         pf = result.get("pfApi", {})
@@ -548,7 +568,8 @@ class MeariApiClient:
         """Return camera-capable devices (battery + wired cameras)."""
         categories = {"snap", "ipc", "doorbell"}
         return [
-            d for d in self.devices.values()
+            d
+            for d in self.devices.values()
             if str(d.get("_category", "")).lower() in categories
         ]
 
@@ -567,9 +588,12 @@ class MeariApiClient:
         """Get battery info for a device. Returns {code: value} dict."""
         try:
             sn_map = {sn_num: BATTERY_CODES}
-            data = self._get("/v2/app/iot/model/get/batch", {
-                "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
-            })
+            data = self._get(
+                "/v2/app/iot/model/get/batch",
+                {
+                    "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
+                },
+            )
             if data.get("resultCode") == "1001":
                 return data.get("result", {}).get(sn_num, {})
         except Exception as e:
@@ -591,12 +615,15 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "get",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-            "target": "server",
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "get",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+                "target": "server",
+            },
+        )
         return resp.get("iot", {})
 
     def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
@@ -607,12 +634,15 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-            "target": "server",
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+                "target": "server",
+            },
+        )
         return resp.get("action") == "set"
 
     def ptz_start(self, sn_num: str, direction: str, *, use_ptz2: bool = True) -> bool:
@@ -623,8 +653,11 @@ class MeariApiClient:
         device directly (as the official app does for codes 800-899).
         """
         from .const import (
-            IOT_CODE_PTZ_START, IOT_CODE_PTZ2_START, PTZ_DIRECTIONS,
+            IOT_CODE_PTZ_START,
+            IOT_CODE_PTZ2_START,
+            PTZ_DIRECTIONS,
         )
+
         ps, ts = PTZ_DIRECTIONS.get(direction, (0, 0))
         code = IOT_CODE_PTZ2_START if use_ptz2 else IOT_CODE_PTZ_START
         value_str = json.dumps({"ps": ps, "ts": ts, "zs": 0}, separators=(",", ":"))
@@ -635,16 +668,20 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
         return "errid" not in resp
 
     def ptz_stop(self, sn_num: str, *, use_ptz2: bool = True) -> bool:
         """Send a PTZ stop command."""
         from .const import IOT_CODE_PTZ_STOP, IOT_CODE_PTZ2_STOP
+
         code = IOT_CODE_PTZ2_STOP if use_ptz2 else IOT_CODE_PTZ_STOP
 
         dev_uuid = format_sn(sn_num)
@@ -653,11 +690,14 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
         return "errid" not in resp
 
     def wake_device(self, sn_num: str, device_id: int) -> bool:

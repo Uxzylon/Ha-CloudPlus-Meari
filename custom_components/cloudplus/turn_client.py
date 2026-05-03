@@ -67,7 +67,7 @@ FINGERPRINT_XOR = 0x5354554E  # "STUN" in ASCII
 def _pad4(data):
     """Pad to 4-byte boundary."""
     r = len(data) % 4
-    return data + b'\x00' * ((4 - r) % 4)
+    return data + b"\x00" * ((4 - r) % 4)
 
 
 def _encode_attr(attr_type, value):
@@ -142,8 +142,8 @@ def _parse_stun(data):
     attrs = {}
     pos = 20
     while pos + 4 <= len(data) and pos < 20 + msg_len:
-        attr_type, attr_len = struct.unpack(">HH", data[pos:pos + 4])
-        attr_value = data[pos + 4:pos + 4 + attr_len]
+        attr_type, attr_len = struct.unpack(">HH", data[pos : pos + 4])
+        attr_value = data[pos + 4 : pos + 4 + attr_len]
         attrs[attr_type] = attr_value
         pos += 4 + ((attr_len + 3) & ~3)
 
@@ -255,7 +255,9 @@ class TurnClient:
                 continue
             # Also match binding request/response (different categories)
             if msg_type == BINDING_REQUEST and parsed["type"] in (
-                    BINDING_RESPONSE, BINDING_ERROR):
+                BINDING_RESPONSE,
+                BINDING_ERROR,
+            ):
                 if parsed["txn_id"] == txn_id:
                     return parsed
                 continue
@@ -269,7 +271,8 @@ class TurnClient:
         if resp and resp["type"] == BINDING_RESPONSE:
             if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
                 self.mapped_ip, self.mapped_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS])
+                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS]
+                )
             elif ATTR_MAPPED_ADDRESS in resp["attrs"]:
                 data = resp["attrs"][ATTR_MAPPED_ADDRESS]
                 self.mapped_port = struct.unpack(">H", data[2:4])[0]
@@ -294,7 +297,7 @@ class TurnClient:
             if ATTR_NONCE in resp["attrs"]:
                 self.nonce = resp["attrs"][ATTR_NONCE]
             if ATTR_REALM in resp["attrs"]:
-                self.realm = resp["attrs"][ATTR_REALM].rstrip(b'\x00').decode()
+                self.realm = resp["attrs"][ATTR_REALM].rstrip(b"\x00").decode()
 
         if not self.nonce:
             raise RuntimeError("TURN server did not provide nonce")
@@ -304,10 +307,12 @@ class TurnClient:
         if resp and resp["type"] == ALLOCATE_RESPONSE:
             if ATTR_XOR_RELAYED_ADDRESS in resp["attrs"]:
                 self.relay_ip, self.relay_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_RELAYED_ADDRESS])
+                    resp["attrs"][ATTR_XOR_RELAYED_ADDRESS]
+                )
             if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
                 self.mapped_ip, self.mapped_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS])
+                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS]
+                )
             return True
         elif resp:
             err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
@@ -320,8 +325,7 @@ class TurnClient:
 
     def create_permission(self, peer_ip):
         """Create permission for a peer IP."""
-        addr_attr = _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                                 _encode_xor_address(peer_ip, 0))
+        addr_attr = _encode_attr(ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, 0))
         resp = self._stun_request(CREATE_PERM_REQUEST, addr_attr)
         if resp:
             if resp["type"] == CREATE_PERM_RESPONSE:
@@ -359,8 +363,9 @@ class TurnClient:
         self._channel_counter += 1
 
         attrs = _encode_attr(ATTR_CHANNEL_NUMBER, struct.pack(">HH", ch, 0))
-        attrs += _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                              _encode_xor_address(peer_ip, peer_port))
+        attrs += _encode_attr(
+            ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, peer_port)
+        )
 
         for attempt in range(3):
             resp = self._stun_request(CHANNEL_BIND_REQUEST, attrs)
@@ -375,16 +380,22 @@ class TurnClient:
                 if len(err_attr) >= 4:
                     err_code = err_attr[2] * 100 + err_attr[3]
                     err_reason = err_attr[4:].decode("utf-8", errors="replace")
-                    print(f"[TURN] ChannelBind error for {peer_ip}:{peer_port}: "
-                          f"{err_code} {err_reason} (type=0x{rtype:04X})")
+                    print(
+                        f"[TURN] ChannelBind error for {peer_ip}:{peer_port}: "
+                        f"{err_code} {err_reason} (type=0x{rtype:04X})"
+                    )
                 elif rtype != CHANNEL_BIND_RESPONSE:
-                    print(f"[TURN] ChannelBind unexpected response type=0x{rtype:04X} "
-                          f"for {peer_ip}:{peer_port} (attempt {attempt+1})")
+                    print(
+                        f"[TURN] ChannelBind unexpected response type=0x{rtype:04X} "
+                        f"for {peer_ip}:{peer_port} (attempt {attempt+1})"
+                    )
                 if rtype in (CHANNEL_BIND_RESPONSE, 0x0119):
                     break  # Real response (success or error), don't retry
             else:
-                print(f"[TURN] ChannelBind timeout for {peer_ip}:{peer_port} "
-                      f"(attempt {attempt+1})")
+                print(
+                    f"[TURN] ChannelBind timeout for {peer_ip}:{peer_port} "
+                    f"(attempt {attempt+1})"
+                )
         return None
 
     def send_to_peer(self, peer_ip, peer_port, data):
@@ -395,12 +406,13 @@ class TurnClient:
             ch = self.channels[key]
             frame = struct.pack(">HH", ch, len(data)) + data
             if len(frame) % 4:
-                frame += b'\x00' * (4 - len(frame) % 4)
+                frame += b"\x00" * (4 - len(frame) % 4)
             self._send(frame)
         else:
             # Send Indication (no auth needed for indications)
-            attrs = _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                                 _encode_xor_address(peer_ip, peer_port))
+            attrs = _encode_attr(
+                ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, peer_port)
+            )
             attrs += _encode_attr(ATTR_DATA, data)
             msg, _ = _build_stun(SEND_INDICATION, attrs)
             self._send(msg)
@@ -425,7 +437,7 @@ class TurnClient:
             peer = self.reverse_channels.get(ch)
             peer_ip = peer[0] if peer else None
             peer_port = peer[1] if peer else None
-            return raw[4:4 + length], peer_ip, peer_port
+            return raw[4 : 4 + length], peer_ip, peer_port
 
         # STUN Data Indication
         msg = _parse_stun(raw)
@@ -434,7 +446,8 @@ class TurnClient:
             peer_ip, peer_port = None, None
             if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
                 peer_ip, peer_port = _decode_xor_address(
-                    msg["attrs"][ATTR_XOR_PEER_ADDRESS])
+                    msg["attrs"][ATTR_XOR_PEER_ADDRESS]
+                )
             return data, peer_ip, peer_port
 
         # STUN response (e.g., binding response for ICE)
@@ -443,8 +456,15 @@ class TurnClient:
 
         return raw, None, None
 
-    def send_ice_binding(self, peer_ip, peer_port, local_ufrag, remote_ufrag,
-                         remote_pwd, use_candidate=True):
+    def send_ice_binding(
+        self,
+        peer_ip,
+        peer_port,
+        local_ufrag,
+        remote_ufrag,
+        remote_pwd,
+        use_candidate=True,
+    ):
         """Send ICE STUN Binding request through TURN relay.
 
         This is used for ICE connectivity checks. The binding request is
@@ -458,7 +478,9 @@ class TurnClient:
         attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
 
         # ICE-CONTROLLING (0x802A)
-        attrs += _encode_attr(0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big")))
+        attrs += _encode_attr(
+            0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+        )
 
         # USE-CANDIDATE (0x0025) - empty attribute
         if use_candidate:
