@@ -26,6 +26,7 @@ from ..const import (
 )
 from ..p2p_streamer import P2PStreamer, parse_quality_profiles
 from ..p2p_streamer.codecs import detect_codec
+from .iot import iot_value, normalize_iot_values, parse_capabilities, supports_feature
 from .motion import MotionEventListener
 from .muxer import FfmpegMuxer
 from .stream_server import StreamServer
@@ -36,6 +37,7 @@ IDLE_ADVERTISED_FPS = 15.0
 IDLE_REFRESH_INTERVAL = 1.0
 IDLE_NO_CLIENT_SLEEP = 1.0
 BATTERY_POLL_INTERVAL = 300.0
+STATUS_POLL_INTERVAL = 300.0
 
 
 class CloudEdgeMeariCoordinator:
@@ -74,6 +76,8 @@ class CloudEdgeMeariCoordinator:
         self._device_name = str(device.get("deviceName", self._sn_num) or self._sn_num)
         self._device_category = str(device.get("_category", "")).lower()
         self._is_snap = self._device_category == "snap"
+        self._capabilities = parse_capabilities(device)
+        self._iot_data: dict[int | str, Any] = {}
 
         self._available = False
         self._camera_awake = False
@@ -96,7 +100,7 @@ class CloudEdgeMeariCoordinator:
         self._battery_charging = False
         self._has_lamp = False
         self._lamp_on = False
-        self._has_ptz = self._detect_ptz_support(device)
+        self._has_ptz = self.supports_iot("ptz")
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -208,6 +212,15 @@ class CloudEdgeMeariCoordinator:
     def has_ptz(self) -> bool:
         return self._has_ptz
 
+    def supports_iot(self, feature: str | None) -> bool:
+        return supports_feature(self._capabilities, self._device, feature)
+
+    def has_iot_code(self, code: int | str) -> bool:
+        return self.get_iot_value(code) is not None
+
+    def get_iot_value(self, code: int | str) -> Any:
+        return iot_value(self._iot_data, code)
+
     @property
     def stream_port(self) -> int:
         return self._stream_server.port
@@ -269,37 +282,50 @@ class CloudEdgeMeariCoordinator:
             info = api.get_battery_info(self._sn_num)
             if not info and api.openapi_server:
                 info = api.get_device_iot_config(self._sn_num)
-            changed = self._apply_battery_info(info)
+            changed = self._apply_iot_values(info)
+            changed = self._apply_battery_info(info) or changed
             changed = self._apply_video_encryption_info(info) or changed
             if changed:
                 self._fire_update()
         except Exception as exc:
             _LOGGER.warning("Battery prefetch failed for %s: %s", self._sn_num, exc)
 
+    def prefetch_status(self, api: MeariApiClient) -> None:
+        self.prefetch_lamp(api)
+
     def prefetch_lamp(self, api: MeariApiClient) -> None:
         self._api = api
+        if not api.openapi_server:
+            return
         try:
             iot = api.get_device_iot_config(self._sn_num)
         except Exception as exc:
-            _LOGGER.debug("Lamp prefetch failed for %s: %s", self._sn_num, exc)
+            _LOGGER.debug("Lamp/status prefetch failed for %s: %s", self._sn_num, exc)
             return
-        changed = self._apply_battery_info(iot)
+        changed = self._apply_iot_values(iot)
+        changed = self._apply_battery_info(iot) or changed
         changed = self._apply_video_encryption_info(iot) or changed
+        lamp = self._as_int(self.get_iot_value(IOT_CODE_LAMP))
+        if lamp is not None:
+            changed = changed or not self._has_lamp or self._lamp_on != (lamp == 1)
+            self._has_lamp = True
+            self._lamp_on = lamp == 1
         if changed:
             self._fire_update()
-        if IOT_CODE_LAMP not in iot:
-            return
-        self._has_lamp = True
-        self._lamp_on = self._as_int(iot.get(IOT_CODE_LAMP)) == 1
 
     def set_lamp(self, enabled: bool) -> bool:
+        return self.set_iot_value(IOT_CODE_LAMP, 1 if enabled else 0)
+
+    def set_iot_value(self, code: int | str, value: Any) -> bool:
         api = self._api
         if api is None:
             return False
-        ok = api.set_device_iot_value(self._sn_num, IOT_CODE_LAMP, 1 if enabled else 0)
+        ok = api.set_device_iot_value(self._sn_num, str(code), value)
         if ok:
-            self._has_lamp = True
-            self._lamp_on = bool(enabled)
+            self._iot_data.update(normalize_iot_values({code: value}))
+            if str(code) == IOT_CODE_LAMP:
+                self._has_lamp = True
+                self._lamp_on = self._as_int(value) == 1
             self._fire_update()
         return ok
 
@@ -385,12 +411,18 @@ class CloudEdgeMeariCoordinator:
             return None
 
     def _iot_value(self, info: dict[str, Any], code: str) -> Any:
-        value = info.get(code)
-        if value is None:
-            value = info.get(self._as_int(code))
-        if isinstance(value, dict):
-            value = value.get("value")
-        return value
+        return iot_value(normalize_iot_values(info), code)
+
+    def _apply_iot_values(self, info: dict[str, Any]) -> bool:
+        values = normalize_iot_values(info)
+        if not values:
+            return False
+        updated = dict(self._iot_data)
+        updated.update(values)
+        if updated == self._iot_data:
+            return False
+        self._iot_data = updated
+        return True
 
     def _apply_battery_info(self, info: dict[str, Any]) -> bool:
         if not info:
@@ -438,7 +470,8 @@ class CloudEdgeMeariCoordinator:
                 info = api.get_battery_info(self._sn_num)
                 if not info and api.openapi_server:
                     info = api.get_device_iot_config(self._sn_num)
-                changed = self._apply_battery_info(info)
+                changed = self._apply_iot_values(info)
+                changed = self._apply_battery_info(info) or changed
                 changed = self._apply_video_encryption_info(info) or changed
                 if changed:
                     self._fire_update()
@@ -453,10 +486,26 @@ class CloudEdgeMeariCoordinator:
                     continue
                 _LOGGER.debug("Battery poll failed for %s: %s", self._sn_num, exc)
 
-    @staticmethod
-    def _detect_ptz_support(device: dict[str, Any]) -> bool:
-        capability = str(device.get("capability") or "").lower()
-        return any(token in capability for token in ("ptz", "ptz2", "pan", "tilt"))
+    def _poll_status(self) -> None:
+        api = self._api
+        if api is None or not api.openapi_server:
+            return
+        try:
+            iot = api.get_device_iot_config(self._sn_num)
+        except Exception as exc:
+            _LOGGER.debug("Status poll failed for %s: %s", self._sn_num, exc)
+            return
+
+        changed = self._apply_iot_values(iot)
+        changed = self._apply_battery_info(iot) or changed
+        changed = self._apply_video_encryption_info(iot) or changed
+        lamp = self._as_int(self.get_iot_value(IOT_CODE_LAMP))
+        if lamp is not None:
+            changed = changed or not self._has_lamp or self._lamp_on != (lamp == 1)
+            self._has_lamp = True
+            self._lamp_on = lamp == 1
+        if changed:
+            self._fire_update()
 
     async def async_start(self) -> None:
         if self._running:
@@ -518,6 +567,7 @@ class CloudEdgeMeariCoordinator:
                 time.sleep(2)
 
     def _session_loop(self) -> None:
+        self._poll_status()
         if self._is_snap:
             self._snap_session_loop()
         else:
@@ -530,12 +580,16 @@ class CloudEdgeMeariCoordinator:
             self._run_initial_frame_grab()
 
         last_battery_poll = time.monotonic()
+        last_status_poll = time.monotonic()
         next_grab_retry = time.monotonic() + 30.0
         while self._running:
             now = time.monotonic()
             if now - last_battery_poll >= BATTERY_POLL_INTERVAL:
                 self._poll_battery()
                 last_battery_poll = now
+            if now - last_status_poll >= STATUS_POLL_INTERVAL:
+                self._poll_status()
+                last_status_poll = now
 
             if (
                 self._initial_frame_grab
@@ -562,7 +616,12 @@ class CloudEdgeMeariCoordinator:
 
     def _ipc_session_loop(self) -> None:
         self._set_camera_awake(True)
+        last_status_poll = time.monotonic()
         while self._running:
+            now = time.monotonic()
+            if now - last_status_poll >= STATUS_POLL_INTERVAL:
+                self._poll_status()
+                last_status_poll = now
             self._consume_wake_event()
             should_stream = (
                 self._stream_server.client_count > 0
