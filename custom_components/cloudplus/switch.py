@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -12,8 +12,115 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
+from .meari_commands import (
+    ABNORMAL_NOISE_ENABLE,
+    ANTI_JAMMING,
+    AUTO_UPDATE,
+    CRY_DET_ENABLE,
+    FACE_RECOGNITION_SWITCH,
+    FLIGHT_LINK_LIGHTING_ENABLE,
+    FLIGHT_LINK_SIREN_ENABLE,
+    HOMEKIT_ENABLE,
+    HUMAN_DET_ENABLE,
+    HUMAN_TRACK_ENABLE,
+    LASER_SWITCH,
+    LED_ENABLE,
+    LOGO_SWITCH,
+    MOTION_DET_ENABLE,
+    ONVIF_ENABLE,
+    OSD_ENABLE,
+    PET_ALARM_ENABLE,
+    PET_THROW_WARNING,
+    PIR_DET_ENABLE,
+    PTZ_PATROL,
+    RECORD_SWITCH,
+    RGB_LIGHT_SWITCH,
+    SLEEP_MODE,
+    SOUND_DET_ENABLE,
+    SOUND_SWITCH,
+)
 
-_LOGGER = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class IotSwitchSpec:
+    feature: str | None
+    code: int
+    name: str
+    icon: str | None = None
+
+
+IOT_SWITCHES: tuple[IotSwitchSpec, ...] = (
+    IotSwitchSpec("status_led", LED_ENABLE, "Status LED", "mdi:led-on"),
+    IotSwitchSpec(
+        "motion_det",
+        MOTION_DET_ENABLE,
+        "Motion Detection",
+        "mdi:motion-sensor",
+    ),
+    IotSwitchSpec(
+        "person_det",
+        HUMAN_DET_ENABLE,
+        "Person Detection",
+        "mdi:account-search",
+    ),
+    IotSwitchSpec(
+        "human_track",
+        HUMAN_TRACK_ENABLE,
+        "Human Tracking",
+        "mdi:target-account",
+    ),
+    IotSwitchSpec("noise_det", SOUND_DET_ENABLE, "Sound Detection", "mdi:ear-hearing"),
+    IotSwitchSpec(
+        "cry_det",
+        CRY_DET_ENABLE,
+        "Crying Detection",
+        "mdi:baby-face-outline",
+    ),
+    IotSwitchSpec("onvif", ONVIF_ENABLE, "ONVIF", "mdi:network-outline"),
+    IotSwitchSpec("sd_card", RECORD_SWITCH, "SD Recording", "mdi:sd"),
+    IotSwitchSpec("pir", PIR_DET_ENABLE, "PIR Sensor", "mdi:motion-sensor"),
+    IotSwitchSpec(
+        "floodlight",
+        FLIGHT_LINK_LIGHTING_ENABLE,
+        "Floodlight Linkage",
+        "mdi:link-variant",
+    ),
+    IotSwitchSpec(
+        "siren",
+        FLIGHT_LINK_SIREN_ENABLE,
+        "Siren Linkage",
+        "mdi:alarm-light",
+    ),
+    IotSwitchSpec(
+        "face_det",
+        FACE_RECOGNITION_SWITCH,
+        "Face Recognition",
+        "mdi:face-recognition",
+    ),
+    IotSwitchSpec("sleep_mode", SLEEP_MODE, "Sleep Mode", "mdi:sleep"),
+    IotSwitchSpec("rgb_light", RGB_LIGHT_SWITCH, "RGB Light", "mdi:palette"),
+    IotSwitchSpec("anti_jamming", ANTI_JAMMING, "Anti-Jamming", "mdi:shield-check"),
+    IotSwitchSpec(
+        "abnormal_noise",
+        ABNORMAL_NOISE_ENABLE,
+        "Abnormal Noise",
+        "mdi:alert-decagram",
+    ),
+    IotSwitchSpec("ptz_patrol", PTZ_PATROL, "PTZ Patrol", "mdi:pan-horizontal"),
+    IotSwitchSpec("laser", LASER_SWITCH, "Laser Toy", "mdi:laser-pointer"),
+    IotSwitchSpec("pet_alarm", PET_ALARM_ENABLE, "Pet Alarm", "mdi:bell-alert"),
+    IotSwitchSpec(
+        "pet_alarm",
+        PET_THROW_WARNING,
+        "Pet Throw Warning",
+        "mdi:bell-alert",
+    ),
+    IotSwitchSpec("homekit", HOMEKIT_ENABLE, "HomeKit", "mdi:home-automation"),
+    IotSwitchSpec("auto_update", AUTO_UPDATE, "Auto Update", "mdi:update"),
+    IotSwitchSpec(None, OSD_ENABLE, "OSD Watermark", "mdi:watermark"),
+    IotSwitchSpec(None, LOGO_SWITCH, "Brand Logo", "mdi:label-outline"),
+    IotSwitchSpec(None, SOUND_SWITCH, "Sound", "mdi:volume-high"),
+)
 
 
 async def async_setup_entry(
@@ -22,14 +129,91 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CloudEdge / Meari switches from a config entry."""
-    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    coord: CloudEdgeMeariCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[SwitchEntity] = []
-    for coord in coordinators:
-        if coord.is_battery_camera:
-            entities.append(CloudEdgeMeariMotionWakeSwitch(coord, entry))
-        if coord.has_lamp:
-            entities.append(CloudEdgeMeariLampSwitch(coord, entry))
+    if coord.is_battery_camera:
+        entities.append(CloudEdgeMeariMotionWakeSwitch(coord, entry))
+    if coord.has_lamp:
+        entities.append(CloudEdgeMeariLampSwitch(coord, entry))
+    entities.extend(
+        CloudEdgeMeariIotSwitch(coord, entry, spec)
+        for spec in IOT_SWITCHES
+        if (spec.feature and coord.supports_iot(spec.feature))
+        or coord.has_iot_code(spec.code)
+    )
     async_add_entities(entities)
+
+
+class CloudEdgeMeariIotSwitch(SwitchEntity):
+    """Switch entity backed by a Meari IoT value."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CloudEdgeMeariCoordinator,
+        entry: ConfigEntry,
+        spec: IotSwitchSpec,
+    ) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        self._spec = spec
+        self._attr_name = spec.name
+        self._attr_icon = spec.icon
+        self._attr_unique_id = f"{coordinator.device_uuid}_iot_switch_{spec.code}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, coordinator.device_uuid)},
+            "name": f"CloudEdge / Meari {coordinator.device_name}",
+            "manufacturer": "CloudEdge / Meari",
+            "model": coordinator.device_model,
+        }
+        self._unsub_update: Any = None
+
+    async def async_added_to_hass(self) -> None:
+        self._unsub_update = self._coordinator.register_update_callback(
+            self._handle_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_update:
+            self._unsub_update()
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return (
+            self._coordinator.available
+            and self._coordinator.get_iot_value(self._spec.code) is not None
+        )
+
+    @property
+    def is_on(self) -> bool:
+        value = self._coordinator.get_iot_value(self._spec.code)
+        try:
+            return int(value) == 1
+        except (TypeError, ValueError):
+            return False
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the camera IoT value on."""
+        await self.hass.async_add_executor_job(
+            self._coordinator.set_iot_value,
+            self._spec.code,
+            1,
+        )
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the camera IoT value off."""
+        await self.hass.async_add_executor_job(
+            self._coordinator.set_iot_value,
+            self._spec.code,
+            0,
+        )
+        self.async_write_ha_state()
 
 
 class CloudEdgeMeariMotionWakeSwitch(SwitchEntity):
@@ -39,7 +223,9 @@ class CloudEdgeMeariMotionWakeSwitch(SwitchEntity):
     _attr_name = "Wake on Motion"
     _attr_icon = "mdi:motion-sensor"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_motion_wake"
@@ -90,7 +276,9 @@ class CloudEdgeMeariLampSwitch(SwitchEntity):
     _attr_name = "Lamp"
     _attr_icon = "mdi:lightbulb"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_lamp"
