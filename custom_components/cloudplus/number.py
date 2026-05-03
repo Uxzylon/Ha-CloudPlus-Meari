@@ -2,37 +2,121 @@
 
 from __future__ import annotations
 
-import logging
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTime
+from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, CONF_MOTION_TIMEOUT
+from .const import DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
 from .meari_commands import (
-    CHIME_PRO_MOTION_VOLUME,
-    CHIME_PRO_RING_VOLUME,
     FLIGHT_BRIGHTNESS,
     FLIGHT_PIR_DURATION,
     HUMAN_SENSITIVITY_LEVEL,
-    JINGLE_VOLUME,
     MOTION_DET_SENSITIVITY,
-    MUSIC_VOLUME,
     PIR_DET_SENSITIVITY,
     PIR_TRIGGER_INTERVAL,
-    POWER_ON_VOLUME,
-    SMART_DET_SENSITIVITY,
     SOUND_DET_SENSITIVITY,
     SPEAK_VOLUME,
     WARM_LIGHT_BRI,
-    WIRELESS_CHIME_VOLUME,
 )
 
-_LOGGER = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class IotNumberSpec:
+    feature: str
+    code: int
+    name: str
+    min_value: float
+    max_value: float
+    step: float = 1
+    icon: str | None = None
+    unit: str | None = None
+
+
+IOT_NUMBERS: tuple[IotNumberSpec, ...] = (
+    IotNumberSpec(
+        "motion_det",
+        MOTION_DET_SENSITIVITY,
+        "Motion Sensitivity",
+        1,
+        5,
+        icon="mdi:motion-sensor",
+    ),
+    IotNumberSpec(
+        "noise_det",
+        SOUND_DET_SENSITIVITY,
+        "Sound Sensitivity",
+        1,
+        100,
+        icon="mdi:ear-hearing",
+    ),
+    IotNumberSpec(
+        "person_det",
+        HUMAN_SENSITIVITY_LEVEL,
+        "Human Sensitivity",
+        1,
+        3,
+        icon="mdi:account-search",
+    ),
+    IotNumberSpec(
+        "pir",
+        PIR_DET_SENSITIVITY,
+        "PIR Sensitivity",
+        1,
+        10,
+        icon="mdi:motion-sensor",
+    ),
+    IotNumberSpec(
+        "pir",
+        PIR_TRIGGER_INTERVAL,
+        "PIR Interval",
+        1,
+        60,
+        icon="mdi:timer-outline",
+        unit=UnitOfTime.SECONDS,
+    ),
+    IotNumberSpec(
+        "light_brightness",
+        FLIGHT_BRIGHTNESS,
+        "Floodlight Brightness",
+        1,
+        100,
+        icon="mdi:brightness-6",
+        unit=PERCENTAGE,
+    ),
+    IotNumberSpec(
+        "light_brightness",
+        FLIGHT_PIR_DURATION,
+        "Floodlight Duration",
+        5,
+        300,
+        icon="mdi:timer-outline",
+        unit=UnitOfTime.SECONDS,
+    ),
+    IotNumberSpec(
+        "speaker",
+        SPEAK_VOLUME,
+        "Speaker Volume",
+        0,
+        100,
+        icon="mdi:volume-high",
+        unit=PERCENTAGE,
+    ),
+    IotNumberSpec(
+        "warm_light",
+        WARM_LIGHT_BRI,
+        "Warm Light Brightness",
+        1,
+        100,
+        icon="mdi:brightness-6",
+        unit=PERCENTAGE,
+    ),
+)
 
 
 async def async_setup_entry(
@@ -41,53 +125,20 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CloudEdge / Meari number entities from a config entry."""
-    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
+    coord: CloudEdgeMeariCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[NumberEntity] = []
-    for coord in coordinators:
-        if coord.is_battery_camera:
-            entities.append(CloudEdgeMeariMotionTimeout(coord, entry))
-
-        # Generic IoT Numbers
-        if coord._has_motion_det:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, MOTION_DET_SENSITIVITY, "Motion Sensitivity", 1, 5, 1, "mdi:motion-sensor"
-            ))
-        if coord._has_noise_det:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, SOUND_DET_SENSITIVITY, "Sound Sensitivity", 1, 100, 1, "mdi:ear-hearing"
-            ))
-        if coord._has_person_det:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, HUMAN_SENSITIVITY_LEVEL, "Human Sensitivity", 1, 3, 1, "mdi:account-search"
-            ))
-        if coord._has_pir:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, PIR_DET_SENSITIVITY, "PIR Sensitivity", 1, 10, 1, "mdi:motion-sensor-pau"
-            ))
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, PIR_TRIGGER_INTERVAL, "PIR Interval", 1, 60, 1, "mdi:timer-outline", "s"
-            ))
-        if coord._has_light_brightness:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, FLIGHT_BRIGHTNESS, "Floodlight Brightness", 1, 100, 1, "mdi:brightness-6", "%"
-            ))
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, FLIGHT_PIR_DURATION, "Floodlight Duration", 5, 300, 1, "mdi:timer-outline", "s"
-            ))
-        if coord._has_speaker:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, SPEAK_VOLUME, "Speaker Volume", 0, 100, 1, "mdi:volume-high", "%"
-            ))
-        if coord._has_warm_light:
-            entities.append(CloudEdgeMeariIotNumber(
-                coord, entry, WARM_LIGHT_BRI, "Warm Light Brightness", 1, 100, 1, "mdi:brightness-6", "%"
-            ))
-
+    if coord.is_battery_camera:
+        entities.append(CloudEdgeMeariMotionTimeout(coord, entry))
+    entities.extend(
+        CloudEdgeMeariIotNumber(coord, entry, spec)
+        for spec in IOT_NUMBERS
+        if coord.supports_iot(spec.feature) or coord.has_iot_code(spec.code)
+    )
     async_add_entities(entities)
 
 
 class CloudEdgeMeariIotNumber(NumberEntity):
-    """Generic number for CloudEdge / Meari IOT properties."""
+    """Number entity backed by a Meari IoT value."""
 
     _attr_has_entity_name = True
     _attr_mode = NumberMode.SLIDER
@@ -96,24 +147,18 @@ class CloudEdgeMeariIotNumber(NumberEntity):
         self,
         coordinator: CloudEdgeMeariCoordinator,
         entry: ConfigEntry,
-        code: int,
-        name: str,
-        min_value: float,
-        max_value: float,
-        step: float,
-        icon: str | None = None,
-        unit: str | None = None
+        spec: IotNumberSpec,
     ) -> None:
         self._coordinator = coordinator
         self._entry = entry
-        self._code = code
-        self._attr_name = name
-        self._attr_icon = icon
-        self._attr_native_min_value = min_value
-        self._attr_native_max_value = max_value
-        self._attr_native_step = step
-        self._attr_native_unit_of_measurement = unit
-        self._attr_unique_id = f"{coordinator.device_uuid}_iot_number_{code}"
+        self._spec = spec
+        self._attr_name = spec.name
+        self._attr_icon = spec.icon
+        self._attr_native_min_value = spec.min_value
+        self._attr_native_max_value = spec.max_value
+        self._attr_native_step = spec.step
+        self._attr_native_unit_of_measurement = spec.unit
+        self._attr_unique_id = f"{coordinator.device_uuid}_iot_number_{spec.code}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, coordinator.device_uuid)},
             "name": f"CloudEdge / Meari {coordinator.device_name}",
@@ -137,21 +182,25 @@ class CloudEdgeMeariIotNumber(NumberEntity):
 
     @property
     def available(self) -> bool:
-        return self._coordinator.available and self._coordinator.get_iot_value(self._code) is not None
+        return self._coordinator.available and self.native_value is not None
 
     @property
     def native_value(self) -> float | None:
-        val = self._coordinator.get_iot_value(self._code)
-        if val is None:
+        value = self._coordinator.get_iot_value(self._spec.code)
+        if value is None:
             return None
         try:
-            return float(val)
-        except (ValueError, TypeError):
+            return float(value)
+        except (TypeError, ValueError):
             return None
 
     async def async_set_native_value(self, value: float) -> None:
-        """Update the value."""
-        await self.hass.async_add_executor_job(self._coordinator.set_iot_value, self._code, int(value))
+        """Update the camera IoT value."""
+        await self.hass.async_add_executor_job(
+            self._coordinator.set_iot_value,
+            self._spec.code,
+            int(value),
+        )
         self.async_write_ha_state()
 
 
@@ -167,7 +216,9 @@ class CloudEdgeMeariMotionTimeout(NumberEntity):
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
     _attr_mode = NumberMode.SLIDER
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_motion_timeout"

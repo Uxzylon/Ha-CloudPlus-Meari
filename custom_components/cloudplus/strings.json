@@ -3,13 +3,30 @@
     "step": {
       "user": {
         "title": "CloudEdge / Meari Account",
-        "description": "Enter your CloudEdge / Meari credentials. If login fails, adjust country/phone code and app profile.",
+        "description": "Enter your CloudEdge / Meari credentials.",
         "data": {
           "email": "Email",
           "password": "Password",
           "country_code": "Country code (ISO, e.g. FR, US)",
           "phone_code": "Phone code (e.g. 33, 1)",
           "app_profile": "App profile (cloudedge/cloudplus)"
+        }
+      },
+      "camera": {
+        "title": "Select Camera",
+        "description": "Choose which camera to add. Run the flow again to add more cameras.",
+        "data": {
+          "selected_camera": "Camera"
+        },
+        "account": {
+          "title": "Account Settings",
+          "description": "Update account credentials. Leave password empty to keep the current value.",
+          "data": {
+            "password": "Account password (leave empty to keep current)",
+            "country_code": "Country code",
+            "phone_code": "Phone country code",
+            "app_profile": "App profile"
+          }
         }
       }
     },
@@ -20,7 +37,25 @@
       "unknown": "An unexpected error occurred."
     },
     "abort": {
-      "already_configured": "This account is already configured."
+      "already_configured": "All cameras on this account are already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Camera Settings",
+        "description": "Update camera-specific settings. Empty account password keeps the current value; empty E2EE password disables E2EE password use.",
+        "data": {
+          "password": "Account password (leave empty to keep current)",
+          "video_password": "Video encryption password (E2EE)",
+          "country_code": "Country code",
+          "phone_code": "Phone country code",
+          "app_profile": "App profile"
+        }
+      }
+    },
+    "error": {
+      "unknown": "An unexpected error occurred."
     }
   },
   "entity": {
