@@ -25,13 +25,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up CloudEdge / Meari binary sensors from a config entry."""
-    coordinators: list[CloudEdgeMeariCoordinator] = hass.data[DOMAIN][entry.entry_id]
-    entities = []
-    for coord in coordinators:
-        entities.append(CloudEdgeMeariMotionSensor(coord, entry))
-        if coord._is_battery_powered:
-            entities.append(CloudEdgeMeariAwakeSensor(coord, entry))
-            entities.append(CloudEdgeMeariChargingSensor(coord, entry))
+    coord: CloudEdgeMeariCoordinator = hass.data[DOMAIN][entry.entry_id]
+    entities = [CloudEdgeMeariMotionSensor(coord, entry)]
+    if coord.is_battery_camera:
+        entities.append(CloudEdgeMeariAwakeSensor(coord, entry))
+        entities.append(CloudEdgeMeariChargingSensor(coord, entry))
     async_add_entities(entities)
 
 
@@ -42,7 +40,9 @@ class CloudEdgeMeariMotionSensor(BinarySensorEntity):
     _attr_name = "Motion"
     _attr_device_class = BinarySensorDeviceClass.MOTION
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_motion"
@@ -101,7 +101,9 @@ class CloudEdgeMeariAwakeSensor(BinarySensorEntity):
     _attr_device_class = BinarySensorDeviceClass.RUNNING
     _attr_icon = "mdi:eye"
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_awake"
@@ -142,7 +144,9 @@ class CloudEdgeMeariChargingSensor(BinarySensorEntity):
     _attr_name = "Charging"
     _attr_device_class = BinarySensorDeviceClass.BATTERY_CHARGING
 
-    def __init__(self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
+    ) -> None:
         self._coordinator = coordinator
         self._entry = entry
         self._attr_unique_id = f"{coordinator.device_uuid}_charging"
