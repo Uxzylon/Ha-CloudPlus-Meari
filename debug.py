@@ -1443,7 +1443,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--profile",
         default="cloudedge",
-        choices=["cloudedge", "cloudplus"],
+        choices=["cloudedge", "cloudplus", "iegeek"],
         help="App profile",
     )
     p.add_argument("--debug", action="store_true", help="Enable verbose logs")
