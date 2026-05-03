@@ -30,17 +30,17 @@ import struct
 import time
 
 # KCP constants
-KCP_CONV = 0x0000000c  # Meari hardcoded conversation ID
-KCP_CMD_PUSH = 81   # 0x51 - data
-KCP_CMD_ACK = 82    # 0x52 - acknowledgment
-KCP_CMD_WASK = 83   # 0x53 - window probe request
-KCP_CMD_WINS = 84   # 0x54 - window probe response
+KCP_CONV = 0x0000000C  # Meari hardcoded conversation ID
+KCP_CMD_PUSH = 81  # 0x51 - data
+KCP_CMD_ACK = 82  # 0x52 - acknowledgment
+KCP_CMD_WASK = 83  # 0x53 - window probe request
+KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
-KCP_MSS = 1176      # 0x498 - max segment size
-KCP_WND = 4096      # Advertised receive window (large to avoid flow control throttle)
+KCP_MSS = 1176  # 0x498 - max segment size
+KCP_WND = 4096  # Advertised receive window (large to avoid flow control throttle)
 
 # IVA frame constants
-IVA_MAGIC = b'\xFF\x01'
+IVA_MAGIC = b"\xff\x01"
 IVA_FRAME_SIZE = 20
 IVA_TYPE_HANDSHAKE = 0x7012
 IVA_TYPE_DATA = 0x7010
@@ -55,10 +55,15 @@ def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
         session_id1 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
     if session_id2 is None:
         session_id2 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
-    header = struct.pack("<BBHI I HH I",
-        0xFF, 0x01, 0, session_id1,
+    header = struct.pack(
+        "<BBHI I HH I",
+        0xFF,
+        0x01,
+        0,
+        session_id1,
         session_id2,
-        0, type_marker,
+        0,
+        type_marker,
         len(data),
     )
     return header + data
@@ -84,13 +89,16 @@ def parse_iva_frame(data):
     session_id2 = struct.unpack_from("<I", data, 0x08)[0]
     type_marker = struct.unpack_from("<H", data, 0x0E)[0]
     data_len = struct.unpack_from("<I", data, 0x10)[0]
-    payload = data[IVA_FRAME_SIZE:IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
+    if len(data) < IVA_FRAME_SIZE + data_len:
+        return None
+    payload = data[IVA_FRAME_SIZE : IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
     return type_marker, session_id1, session_id2, payload
 
 
 def build_kcp_segment(cmd, sn=0, una=0, wnd=KCP_WND, ts=0, frg=0, data=b""):
     """Build a KCP segment."""
-    header = struct.pack("<IBBHIIII",
+    header = struct.pack(
+        "<IBBHIIII",
         KCP_CONV,
         cmd,
         frg,
@@ -107,11 +115,10 @@ def parse_kcp_segment(raw):
     """Parse a KCP segment. Returns dict or None."""
     if len(raw) < KCP_HEADER_SIZE:
         return None
-    conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
-        "<IBBHIIII", raw, 0)
+    conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from("<IBBHIIII", raw, 0)
     if conv != KCP_CONV:
         return None
-    payload = raw[KCP_HEADER_SIZE:KCP_HEADER_SIZE + length]
+    payload = raw[KCP_HEADER_SIZE : KCP_HEADER_SIZE + length]
     return {
         "conv": conv,
         "cmd": cmd,
@@ -123,6 +130,46 @@ def parse_kcp_segment(raw):
         "len": length,
         "data": payload,
     }
+
+
+def parse_kcp_segments(raw):
+    """Parse one UDP payload that may contain multiple KCP segments."""
+    segments = []
+    pos = 0
+    while pos + KCP_HEADER_SIZE <= len(raw):
+        conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
+            "<IBBHIIII", raw, pos
+        )
+        if conv != KCP_CONV or cmd not in (
+            KCP_CMD_PUSH,
+            KCP_CMD_ACK,
+            KCP_CMD_WASK,
+            KCP_CMD_WINS,
+        ):
+            return []
+        end = pos + KCP_HEADER_SIZE + length
+        if end > len(raw):
+            return []
+        segments.append(
+            {
+                "conv": conv,
+                "cmd": cmd,
+                "frg": frg,
+                "wnd": wnd,
+                "ts": ts,
+                "sn": sn,
+                "una": una,
+                "len": length,
+                "data": raw[pos + KCP_HEADER_SIZE : end],
+            }
+        )
+        pos = end
+
+    if not segments:
+        return []
+    if any(raw[pos:]):
+        return []
+    return segments
 
 
 class KcpTunnel:
@@ -141,8 +188,8 @@ class KcpTunnel:
                        Function to send raw UDP data to peer.
         """
         self.send_func = send_func
-        self.sn_send = 0           # Next outgoing sequence number
-        self.una_recv = 0          # Highest SN seen + 1 (internal tracking)
+        self.sn_send = 0  # Next outgoing sequence number
+        self.una_recv = 0  # Highest SN seen + 1 (internal tracking)
         self.ts_base = int(time.time() * 1000) & 0xFFFFFFFF
         self.handshake_done = False
 
@@ -175,6 +222,8 @@ class KcpTunnel:
 
         # Deferred ACK queue: list of (sn, ts) to send in batch
         self.pending_acks = []
+        self.last_rx_sn = -1
+        self.last_rx_ts = 0
 
     def _ts(self):
         """Current KCP timestamp."""
@@ -194,7 +243,7 @@ class KcpTunnel:
         offset = 0
         fragments = []
         while offset < len(data):
-            chunk = data[offset:offset + KCP_MSS]
+            chunk = data[offset : offset + KCP_MSS]
             fragments.append(chunk)
             offset += KCP_MSS
 
@@ -233,6 +282,14 @@ class KcpTunnel:
                     data=chunk,
                 )
                 self.send_func(seg)
+
+    def _mark_remote_una(self, una):
+        """Apply the peer's cumulative ACK field to our send buffer."""
+        if una <= 0 or not self.sent_segments:
+            return
+        for sn in [sn for sn in self.sent_segments if sn < una]:
+            self.acked_sns.add(sn)
+            del self.sent_segments[sn]
 
     def send_iva_data(self, data):
         """Wrap data in IVA frame, then send through KCP."""
@@ -317,7 +374,27 @@ class KcpTunnel:
             self.send_func(bytes(buf))
         return True
 
-    def skip_gap(self, max_gaps: int | None = None):
+    def send_ack_probe(self):
+        """Repeat the latest cumulative ACK to unstick a quiet sender."""
+        if self.next_recv_sn < 0 or self.last_rx_sn < 0:
+            return False
+        self.send_func(
+            build_kcp_segment(
+                cmd=KCP_CMD_ACK,
+                sn=self.last_rx_sn,
+                una=max(self.next_recv_sn, 0),
+                wnd=KCP_WND,
+                ts=self.last_rx_ts,
+            )
+        )
+        return True
+
+    def skip_gap(
+        self,
+        max_gaps: int | None = None,
+        *,
+        require_iva_start: bool = False,
+    ):
         """Skip past persistent gaps to unblock delivery.
 
         When next_recv_sn is missing but higher segments are buffered,
@@ -325,6 +402,9 @@ class KcpTunnel:
         By default all visible gaps are skipped (legacy behavior). When
         max_gaps is set, only that many gaps are skipped, which provides a
         lower-loss recovery mode for jittery links.
+        When require_iva_start is true, stale fragments before the next IVA
+        frame boundary are discarded so lossy recovery never emits a partial
+        KCP message as video.
         Returns True if any gap was skipped and messages may be available.
         """
         if self.next_recv_sn < 0 or not self.recv_buf:
@@ -335,15 +415,27 @@ class KcpTunnel:
         any_skipped = False
         total_gaps = 0
         gaps_skipped = 0
+        stale_fragments = 0
         first_skip_sn = self.next_recv_sn
 
         # Loop: skip gap, assemble contiguous run, check for next gap, repeat
         while True:
             # Find the lowest buffered SN above the current gap
-            above = [sn for sn in self.recv_buf if sn > self.next_recv_sn]
+            above = sorted(sn for sn in self.recv_buf if sn > self.next_recv_sn)
             if not above:
                 break
-            new_sn = min(above)
+            new_sn = above[0]
+            if require_iva_start:
+                new_sn = -1
+                for candidate in above:
+                    _, candidate_data = self.recv_buf[candidate]
+                    if candidate_data.startswith(IVA_MAGIC):
+                        new_sn = candidate
+                        break
+                    del self.recv_buf[candidate]
+                    stale_fragments += 1
+                if new_sn < 0:
+                    break
             gap_size = new_sn - self.next_recv_sn
             total_gaps += gap_size
             gaps_skipped += 1
@@ -372,10 +464,108 @@ class KcpTunnel:
             # Otherwise there's another gap — loop and skip it too
 
         if any_skipped:
-            print(f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
-                  f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
-                  f"queued={len(self.recv_queue)}")
+            stale_info = f", stale={stale_fragments}" if stale_fragments else ""
+            print(
+                f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
+                f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
+                f"queued={len(self.recv_queue)}{stale_info}"
+            )
         return any_skipped
+
+    def _decode_complete_message(self, data):
+        """Decode a complete KCP message into the legacy process_input result."""
+        if len(data) >= IVA_FRAME_SIZE and data[0:2] == IVA_MAGIC:
+            iva = parse_iva_frame(data)
+            if iva:
+                type_marker, id1, id2, payload = iva
+                if type_marker == IVA_TYPE_HANDSHAKE:
+                    self.handshake_done = True
+                    self.peer_id1 = id1
+                    self.peer_id2 = id2
+                    return ("handshake", (id1, id2))
+                if type_marker == IVA_TYPE_DATA:
+                    return ("data", payload)
+                return ("iva", payload)
+        return ("data", data)
+
+    def _process_kcp_segment(self, seg):
+        """Process one parsed KCP segment.
+
+        Returns ("messages", list[bytes]) for completed KCP messages, or the
+        legacy non-data result tuple for ACK/probe/fragment handling.
+        """
+        self._mark_remote_una(seg["una"])
+        cmd = seg["cmd"]
+
+        if cmd == KCP_CMD_PUSH:
+            # Update una_recv
+            if seg["sn"] >= self.una_recv:
+                self.una_recv = seg["sn"] + 1
+
+            # Store in receive buffer for ordered reassembly
+            sn = seg["sn"]
+            self.last_rx_sn = sn
+            self.last_rx_ts = seg["ts"]
+
+            # Skip duplicate/retransmitted segments we've already processed
+            if self.next_recv_sn >= 0 and sn < self.next_recv_sn:
+                # Queue ACK with current cumulative una to help sender advance
+                self.pending_acks.append((seg["sn"], seg["ts"]))
+                return ("dup", sn)
+
+            self.recv_buf[sn] = (seg["frg"], seg["data"])
+
+            # Initialize next_recv_sn on first PUSH segment received
+            # (camera may start at sn=1 if sn=0 was used for IVA handshake)
+            if self.next_recv_sn < 0:
+                self.next_recv_sn = sn
+
+            # Try to assemble complete messages from recv_buf
+            messages = []
+            while self.next_recv_sn in self.recv_buf:
+                frg, data = self.recv_buf[self.next_recv_sn]
+                self.recv_frag_buf.append(data)
+                del self.recv_buf[self.next_recv_sn]
+                self.next_recv_sn += 1
+
+                if frg == 0:
+                    # Last fragment - assemble complete message
+                    complete = b"".join(self.recv_frag_buf)
+                    self.recv_frag_buf = []
+                    messages.append(complete)
+
+            # Queue ACK for batched sending (flush_acks() sends all at once)
+            self.pending_acks.append((seg["sn"], seg["ts"]))
+
+            if not messages:
+                # No complete message yet - still accumulating fragments
+                return ("fragment", seg["data"])
+
+            return ("messages", messages)
+
+        if cmd == KCP_CMD_ACK:
+            self.acked_sns.add(seg["sn"])
+            # Clean up sent_segments for ACK'd data
+            if seg["sn"] in self.sent_segments:
+                del self.sent_segments[seg["sn"]]
+            return ("ack", seg["sn"])
+
+        if cmd == KCP_CMD_WASK:
+            # Window probe request - respond with WINS
+            wins = build_kcp_segment(
+                cmd=KCP_CMD_WINS,
+                sn=self.sn_send,
+                una=max(self.next_recv_sn, 0),
+                wnd=KCP_WND,
+                ts=self._ts(),
+            )
+            self.send_func(wins)
+            return ("wask", None)
+
+        if cmd == KCP_CMD_WINS:
+            return ("wins", seg["wnd"])
+
+        return None
 
     def process_input(self, raw):
         """Process incoming UDP data.
@@ -404,98 +594,25 @@ class KcpTunnel:
                 return ("iva", payload)
             return None
 
-        # Check for KCP segment
-        seg = parse_kcp_segment(raw)
-        if not seg:
+        # Check for KCP segment(s). KCP may bundle several PUSH/ACK segments
+        # in a single UDP datagram.
+        segments = parse_kcp_segments(raw)
+        if not segments:
             return None
 
-        cmd = seg["cmd"]
+        first_result = None
+        for seg in segments:
+            result = self._process_kcp_segment(seg)
+            if not result:
+                continue
+            if result[0] == "messages":
+                for complete in result[1]:
+                    if first_result is None:
+                        first_result = self._decode_complete_message(complete)
+                    else:
+                        self.recv_queue.append(complete)
+                continue
+            if first_result is None:
+                first_result = result
 
-        if cmd == KCP_CMD_PUSH:
-            # Update una_recv
-            if seg["sn"] >= self.una_recv:
-                self.una_recv = seg["sn"] + 1
-
-            # Store in receive buffer for ordered reassembly
-            sn = seg["sn"]
-
-            # Skip duplicate/retransmitted segments we've already processed
-            if self.next_recv_sn >= 0 and sn < self.next_recv_sn:
-                # Queue ACK with current cumulative una to help sender advance
-                self.pending_acks.append((seg["sn"], seg["ts"]))
-                return ("dup", sn)
-
-            self.recv_buf[sn] = (seg["frg"], seg["data"])
-
-            # Initialize next_recv_sn on first PUSH segment received
-            # (camera may start at sn=1 if sn=0 was used for IVA handshake)
-            if self.next_recv_sn < 0:
-                self.next_recv_sn = sn
-
-            # Try to assemble complete messages from recv_buf
-            # Process segments in order starting from next_recv_sn
-            messages = []
-            while self.next_recv_sn in self.recv_buf:
-                frg, data = self.recv_buf[self.next_recv_sn]
-                self.recv_frag_buf.append(data)
-                del self.recv_buf[self.next_recv_sn]
-                self.next_recv_sn += 1
-
-                if frg == 0:
-                    # Last fragment - assemble complete message
-                    complete = b"".join(self.recv_frag_buf)
-                    self.recv_frag_buf = []
-                    messages.append(complete)
-
-            # Queue ACK for batched sending (flush_acks() sends all at once)
-            self.pending_acks.append((seg["sn"], seg["ts"]))
-
-            if not messages:
-                # No complete message yet - still accumulating fragments
-                return ("fragment", seg["data"])
-
-            # Process the first complete message
-            # (additional messages queued for later retrieval)
-            for msg in messages[1:]:
-                self.recv_queue.append(msg)
-
-            data = messages[0]
-
-            # Auto-detect IVA frame inside reassembled KCP payload
-            if len(data) >= 20 and data[0] == 0xFF and data[1] == 0x01:
-                iva = parse_iva_frame(data)
-                if iva:
-                    type_marker, id1, id2, payload = iva
-                    if type_marker == IVA_TYPE_HANDSHAKE:
-                        self.handshake_done = True
-                        self.peer_id1 = id1
-                        self.peer_id2 = id2
-                        return ("handshake", (id1, id2))
-                    if type_marker == IVA_TYPE_DATA:
-                        return ("data", payload)
-
-            return ("data", data)
-
-        elif cmd == KCP_CMD_ACK:
-            self.acked_sns.add(seg["sn"])
-            # Clean up sent_segments for ACK'd data
-            if seg["sn"] in self.sent_segments:
-                del self.sent_segments[seg["sn"]]
-            return ("ack", seg["sn"])
-
-        elif cmd == KCP_CMD_WASK:
-            # Window probe request - respond with WINS
-            wins = build_kcp_segment(
-                cmd=KCP_CMD_WINS,
-                sn=self.sn_send,
-                una=max(self.next_recv_sn, 0),
-                wnd=KCP_WND,
-                ts=self._ts(),
-            )
-            self.send_func(wins)
-            return ("wask", None)
-
-        elif cmd == KCP_CMD_WINS:
-            return ("wins", seg["wnd"])
-
-        return None
+        return first_result
