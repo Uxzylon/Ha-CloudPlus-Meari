@@ -30,6 +30,9 @@ from .mpegts import (
 _LOGGER = logging.getLogger(__name__)
 
 VIDEO_QUEUE_FRAMES = 30
+AUDIO_START_BUFFER_FRAMES = 4
+AUDIO_EMIT_LIMIT = 3
+AUDIO_MAX_LEAD_TICKS = 27000
 
 
 class FfmpegMuxer:
@@ -58,6 +61,12 @@ class FfmpegMuxer:
         self._video_pts_step_ticks = 6000
         self._current_video_pts = 0
         self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._audio_emit_frames = 0
+        self._audio_silence_frames = 0
+        self._last_audio_emit_mono = 0.0
+        self._audio_emit_max_gap_s = 0.0
 
     @property
     def codec(self) -> str:
@@ -87,6 +96,12 @@ class FfmpegMuxer:
         self._video_pts_step_ticks = int(90000 / input_fps)
         self._current_video_pts = 0
         self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._audio_emit_frames = 0
+        self._audio_silence_frames = 0
+        self._last_audio_emit_mono = 0.0
+        self._audio_emit_max_gap_s = 0.0
         self._drain_video_queue()
 
         fps_text = f"{input_fps:.3f}"
@@ -184,6 +199,9 @@ class FfmpegMuxer:
         self._audio.clear()
         self._audio_started = False
         self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._last_audio_emit_mono = 0.0
         self._video_pts_step_ticks = int(90000 / self._input_fps)
 
     def write_video(
@@ -252,11 +270,9 @@ class FfmpegMuxer:
                     break
                 pending.extend(data)
 
-            out, saw_video = self._consume_ts(pending)
-            if out:
-                audio = (
-                    self._due_audio_ts() if saw_video and self._audio_gate_open else b""
-                )
+            out, _saw_video = self._consume_ts(pending)
+            audio = self._due_audio_ts() if self._audio_gate_open else b""
+            if out or audio:
                 if audio:
                     out.extend(audio)
                 self._on_ts(bytes(out))
@@ -319,19 +335,21 @@ class FfmpegMuxer:
         return pts
 
     def _due_audio_ts(self) -> bytes:
-        if self._last_video_pts is None:
+        target_pts = self._audio_target_pts()
+        if target_pts is None:
             return b""
-        if not self._audio_started:
-            self._next_audio_pts = self._last_video_pts - AAC_FRAME_TICKS
-            self._audio_started = True
         out = bytearray()
         emitted = 0
-        while (
-            self._next_audio_pts + AAC_FRAME_TICKS <= self._last_video_pts
-            and emitted < 32
-        ):
+        while self._next_audio_pts + AAC_FRAME_TICKS <= target_pts:
+            if emitted >= AUDIO_EMIT_LIMIT:
+                break
+            frame = self._audio.pop_frame()
+            if frame is None:
+                if not self._audio.silence_allowed():
+                    break
+                frame = AAC_SILENCE_FRAME
+                self._audio_silence_frames += 1
             self._next_audio_pts += AAC_FRAME_TICKS
-            frame = self._audio.pop_frame() or AAC_SILENCE_FRAME
             audio_ts, self._audio_cc = make_audio_ts(
                 frame,
                 self._next_audio_pts,
@@ -339,7 +357,47 @@ class FfmpegMuxer:
             )
             out.extend(audio_ts)
             emitted += 1
+        if emitted:
+            self._note_audio_emit(emitted)
         return bytes(out)
+
+    def _audio_target_pts(self) -> int | None:
+        if self._last_video_pts is None:
+            return None
+        now = time.monotonic()
+        if not self._audio_started:
+            if (
+                not self._audio.silence_allowed()
+                and self._audio.frame_count() < AUDIO_START_BUFFER_FRAMES
+            ):
+                return None
+            self._next_audio_pts = self._last_video_pts - AAC_FRAME_TICKS
+            self._audio_clock_started_at = now
+            self._audio_clock_base_pts = self._last_video_pts
+            self._audio_started = True
+        elapsed_ticks = int(max(0.0, now - self._audio_clock_started_at) * 90000)
+        wall_target = self._audio_clock_base_pts + elapsed_ticks
+        max_lead_target = self._last_video_pts + AUDIO_MAX_LEAD_TICKS
+        return min(max(wall_target, self._last_video_pts), max_lead_target)
+
+    def _note_audio_emit(self, frames: int) -> None:
+        now = time.monotonic()
+        if self._last_audio_emit_mono > 0:
+            self._audio_emit_max_gap_s = max(
+                self._audio_emit_max_gap_s,
+                now - self._last_audio_emit_mono,
+            )
+        self._last_audio_emit_mono = now
+        self._audio_emit_frames += frames
+
+    def audio_debug_snapshot(self) -> dict[str, int | float]:
+        return {
+            "mux_audio_frames": self._audio_emit_frames,
+            "mux_audio_silence_frames": self._audio_silence_frames,
+            "mux_audio_max_emit_gap_s": round(self._audio_emit_max_gap_s, 3),
+            "mux_audio_next_pts": self._next_audio_pts,
+            "mux_video_last_pts": self._last_video_pts or 0,
+        }
 
     def _read_stderr(self, proc: subprocess.Popen) -> None:
         if proc.stderr is None:
