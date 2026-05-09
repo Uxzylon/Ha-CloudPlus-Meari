@@ -29,6 +29,8 @@ from .mpegts import (
 
 _LOGGER = logging.getLogger(__name__)
 
+VIDEO_QUEUE_FRAMES = 30
+
 
 class FfmpegMuxer:
     """Mux raw H.264/HEVC video and camera mu-law audio without blocking P2P."""
@@ -40,10 +42,10 @@ class FfmpegMuxer:
         self._stderr_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
         self._video_queue: queue.Queue[tuple[bytes, float, float | None]] = queue.Queue(
-            maxsize=120
+            maxsize=VIDEO_QUEUE_FRAMES
         )
         self._video_time_queue: queue.Queue[tuple[float, float | None]] = queue.Queue(
-            maxsize=120
+            maxsize=VIDEO_QUEUE_FRAMES
         )
         self._audio = AacAudioEncoder()
         self._running = False
@@ -53,7 +55,6 @@ class FfmpegMuxer:
         self._next_audio_pts = -AAC_FRAME_TICKS
         self._audio_started = False
         self._last_video_pts: int | None = None
-        self._last_input_frame_mono = 0.0
         self._video_pts_step_ticks = 6000
         self._current_video_pts = 0
         self._audio_gate_open = False
@@ -83,7 +84,6 @@ class FfmpegMuxer:
         self._next_audio_pts = -AAC_FRAME_TICKS
         self._audio_started = False
         self._last_video_pts = None
-        self._last_input_frame_mono = 0.0
         self._video_pts_step_ticks = int(90000 / input_fps)
         self._current_video_pts = 0
         self._audio_gate_open = False
@@ -178,6 +178,13 @@ class FfmpegMuxer:
                 except Exception:
                     pass
         self._drain_video_queue()
+
+    def reset_live_timing(self) -> None:
+        self._drain_video_queue()
+        self._audio.clear()
+        self._audio_started = False
+        self._audio_gate_open = False
+        self._video_pts_step_ticks = int(90000 / self._input_fps)
 
     def write_video(
         self,
@@ -294,9 +301,8 @@ class FfmpegMuxer:
 
     def _next_video_pts(self) -> int:
         try:
-            frame_mono, pts_interval_s = self._video_time_queue.get_nowait()
+            _frame_mono, pts_interval_s = self._video_time_queue.get_nowait()
         except queue.Empty:
-            frame_mono = time.monotonic()
             pts_interval_s = None
         if pts_interval_s is not None:
             step = max(1, int(max(0.001, pts_interval_s) * 90000))
@@ -304,7 +310,6 @@ class FfmpegMuxer:
             self._current_video_pts = pts
             return pts
 
-        self._observe_video_cadence(frame_mono)
         pts = (
             0
             if self._last_video_pts is None
@@ -312,19 +317,6 @@ class FfmpegMuxer:
         )
         self._current_video_pts = pts
         return pts
-
-    def _observe_video_cadence(self, frame_mono: float) -> None:
-        prev = self._last_input_frame_mono
-        self._last_input_frame_mono = frame_mono
-        if prev <= 0.0:
-            return
-        dt = frame_mono - prev
-        if dt < 0.02 or dt > 0.35:
-            return
-        target = max(1500, min(18000, int(dt * 90000)))
-        self._video_pts_step_ticks = int(
-            (self._video_pts_step_ticks * 0.82) + (target * 0.18)
-        )
 
     def _due_audio_ts(self) -> bytes:
         if self._last_video_pts is None:

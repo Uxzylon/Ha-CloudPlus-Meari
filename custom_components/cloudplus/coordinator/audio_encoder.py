@@ -96,6 +96,10 @@ class AacAudioEncoder:
         self._drain_queue()
         self._frames.clear()
 
+    def clear(self) -> None:
+        self._drain_queue()
+        self._frames.clear()
+
     def write_mulaw(self, payload: bytes) -> None:
         if not payload:
             return
