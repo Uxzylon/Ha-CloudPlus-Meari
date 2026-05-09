@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from .base import GapRecoveryPolicy
+
+GAP_RECOVERY = GapRecoveryPolicy(
+    skip_wait_s=4.0,
+    skip_interval_s=1.2,
+    keyframe_wait_s=2.0,
+)
+
 
 def _iter_annexb_headers(data: bytes):
     i = 0

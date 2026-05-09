@@ -2956,13 +2956,6 @@ async def cmd_stream(args) -> int:
         quality_arg = getattr(args, "quality", None)
         if quality_arg is not None:
             coord.set_vvp_quality(quality_arg)
-        if args.play:
-            # Gap-fill during stalls must advance PTS at the same rate as
-            # realtime audio so the muxer interleaves cleanly.  The keepalive
-            # loop caps gap-fill FPS to _video_mux_target_fps (which equals
-            # the setts BSF FPS), so we just need a high ceiling here.
-            setattr(coord, "_live_gap_fill_after_seconds", 0.3)
-            setattr(coord, "_live_gap_fill_fps", 30.0)  # capped by mux target FPS
         adaptive_recovery_for_player = bool(args.wake and args.play)
         setattr(coord, "_p2p_allow_lossy_gap_skip", False)
         setattr(coord, "_p2p_adaptive_lossy_gap_skip", adaptive_recovery_for_player)
@@ -3441,12 +3434,14 @@ async def cmd_stream(args) -> int:
                     runtime_codec = str(
                         getattr(coord, "_video_codec", "") or ""
                     ).lower()
-                    runtime_stall_timeout = (
-                        6 if runtime_codec == "hevc" else effective_stall_timeout
-                    )
-                    if runtime_codec == "hevc" and not runtime_stall_timeout_logged:
+                    runtime_stall_timeout = 6 if runtime_codec == "hevc" else 8
+                    if (
+                        runtime_codec in {"h264", "hevc"}
+                        and not runtime_stall_timeout_logged
+                    ):
                         logging.getLogger(__name__).info(
-                            "Runtime HEVC recovery timeout active: stall_timeout=%ss",
+                            "Runtime %s recovery timeout active: stall_timeout=%ss",
+                            runtime_codec.upper(),
                             runtime_stall_timeout,
                         )
                         runtime_stall_timeout_logged = True
@@ -3851,7 +3846,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--quality",
         type=int,
         default=None,
-        help="VVP quality profile ID (from 'list' command, e.g. 0=SD, 2=HD). Default: highest",
+        help=(
+            "Quality profile ID from 'list' (0=SD, 2=QHD/FHD). "
+            "Default: Auto, using adaptive stream when supported."
+        ),
     )
     p_stream.add_argument(
         "--video-password",

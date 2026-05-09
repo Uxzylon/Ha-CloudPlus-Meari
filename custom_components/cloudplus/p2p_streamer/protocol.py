@@ -57,9 +57,9 @@ def build_vvp_packet(
     *,
     param: int = 8,
     channel: int = 0,
-    video_id: int = 0,
+    stream_id: int = 0,
     stream_flag: int = 0,
-    quality: int = 0,
+    reserve: int = 0,
     licence_id: str | None = None,
 ) -> bytes:
     auth = build_vvp_auth_md5(host_key, seq, cmd, param, licence_id)
@@ -71,9 +71,9 @@ def build_vvp_packet(
     pkt[0x10:0x30] = auth.encode("ascii")
     struct.pack_into(">I", pkt, 0x30, param)
     struct.pack_into("<I", pkt, 0x34, channel)
-    pkt[0x38] = video_id & 0xFF
+    pkt[0x38] = stream_id & 0xFF
     pkt[0x39] = stream_flag & 0xFF
-    pkt[0x3A] = quality & 0xFF
+    pkt[0x3A] = reserve & 0xFF
     pkt[0x3B] = 0x00
     return bytes(pkt)
 

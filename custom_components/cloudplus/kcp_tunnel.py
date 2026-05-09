@@ -25,6 +25,7 @@ KCP segment wire format (24-byte header):
 Ref: https://github.com/skywind3000/kcp
 """
 
+import logging
 import os
 import struct
 import time
@@ -37,13 +38,15 @@ KCP_CMD_WASK = 83  # 0x53 - window probe request
 KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
 KCP_MSS = 1176  # 0x498 - max segment size
-KCP_WND = 4096  # Advertised receive window (large to avoid flow control throttle)
+KCP_WND = 512  # Conservative receive window; avoids overrunning weaker cameras.
 
 # IVA frame constants
 IVA_MAGIC = b"\xff\x01"
 IVA_FRAME_SIZE = 20
 IVA_TYPE_HANDSHAKE = 0x7012
 IVA_TYPE_DATA = 0x7010
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _build_iva_frame(type_marker, data, session_id1=None, session_id2=None):
@@ -181,13 +184,15 @@ class KcpTunnel:
       - IVA data framing around application data
     """
 
-    def __init__(self, send_func):
+    def __init__(self, send_func, *, recv_wnd: int = KCP_WND):
         """
         Args:
             send_func: callable(data: bytes) -> None
                        Function to send raw UDP data to peer.
+            recv_wnd: advertised receive window for outbound KCP headers.
         """
         self.send_func = send_func
+        self.recv_wnd = max(1, int(recv_wnd))
         self.sn_send = 0  # Next outgoing sequence number
         self.una_recv = 0  # Highest SN seen + 1 (internal tracking)
         self.ts_base = int(time.time() * 1000) & 0xFFFFFFFF
@@ -229,6 +234,11 @@ class KcpTunnel:
         """Current KCP timestamp."""
         return (int(time.time() * 1000) - self.ts_base) & 0xFFFFFFFF
 
+    def _wnd(self):
+        """Advertise remaining receive slots without overstating backlog."""
+        used = len(self.recv_buf) + len(self.recv_queue) + len(self.recv_frag_buf)
+        return max(0, self.recv_wnd - used)
+
     def send_handshake(self):
         """Send IVA handshake frame wrapped in KCP PUSH segment."""
         frame = build_iva_handshake(self.session_id1, self.session_id2)
@@ -258,7 +268,7 @@ class KcpTunnel:
                 cmd=KCP_CMD_PUSH,
                 sn=self.sn_send,
                 una=max(self.next_recv_sn, 0),
-                wnd=KCP_WND,
+                wnd=self._wnd(),
                 ts=self._ts(),
                 frg=frg,
                 data=chunk,
@@ -276,7 +286,7 @@ class KcpTunnel:
                     cmd=KCP_CMD_PUSH,
                     sn=sn,
                     una=max(self.next_recv_sn, 0),
-                    wnd=KCP_WND,
+                    wnd=self._wnd(),
                     ts=self._ts(),
                     frg=frg,
                     data=chunk,
@@ -333,7 +343,7 @@ class KcpTunnel:
                 cmd=KCP_CMD_ACK,
                 sn=sn,
                 una=una,
-                wnd=KCP_WND,
+                wnd=self._wnd(),
                 ts=by_sn[sn],
             )
             if len(buf) >= 1200:
@@ -364,7 +374,7 @@ class KcpTunnel:
                 cmd=KCP_CMD_ACK,
                 sn=sn,
                 una=una,
-                wnd=KCP_WND,
+                wnd=self._wnd(),
                 ts=self._ts(),
             )
             if len(buf) >= 1200:
@@ -383,7 +393,7 @@ class KcpTunnel:
                 cmd=KCP_CMD_ACK,
                 sn=self.last_rx_sn,
                 una=max(self.next_recv_sn, 0),
-                wnd=KCP_WND,
+                wnd=self._wnd(),
                 ts=self.last_rx_ts,
             )
         )
@@ -465,10 +475,16 @@ class KcpTunnel:
 
         if any_skipped:
             stale_info = f", stale={stale_fragments}" if stale_fragments else ""
-            print(
-                f"[KCP] Skipped gaps: sn {first_skip_sn}→{self.next_recv_sn} "
-                f"({total_gaps} missing across {gaps_skipped} gap(s)), buf={len(self.recv_buf)}, "
-                f"queued={len(self.recv_queue)}{stale_info}"
+            _LOGGER.warning(
+                "KCP skipped gaps: sn %s -> %s (%s missing across %s gap(s)), "
+                "buf=%s, queued=%s%s",
+                first_skip_sn,
+                self.next_recv_sn,
+                total_gaps,
+                gaps_skipped,
+                len(self.recv_buf),
+                len(self.recv_queue),
+                stale_info,
             )
         return any_skipped
 
@@ -556,7 +572,7 @@ class KcpTunnel:
                 cmd=KCP_CMD_WINS,
                 sn=self.sn_send,
                 una=max(self.next_recv_sn, 0),
-                wnd=KCP_WND,
+                wnd=self._wnd(),
                 ts=self._ts(),
             )
             self.send_func(wins)

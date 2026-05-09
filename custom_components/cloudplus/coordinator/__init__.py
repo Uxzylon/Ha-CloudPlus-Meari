@@ -38,6 +38,8 @@ IDLE_REFRESH_INTERVAL = 1.0
 IDLE_NO_CLIENT_SLEEP = 1.0
 BATTERY_POLL_INTERVAL = 300.0
 STATUS_POLL_INTERVAL = 300.0
+LIVE_VIDEO_STALL_RESTART_S = 4.0
+LIVE_STARTUP_STALL_RESTART_S = 25.0
 
 
 class CloudEdgeMeariCoordinator:
@@ -119,6 +121,7 @@ class CloudEdgeMeariCoordinator:
         self._video_codec = "hevc"
         self._video_mux_target_fps = 15.0
         self._p2p_session_generation = 0
+        self._stream_started_at = 0.0
         self._last_p2p_video_time = 0.0
         self._last_p2p_audio_time = 0.0
         self._last_video_time = 0.0
@@ -134,6 +137,7 @@ class CloudEdgeMeariCoordinator:
         self._startup_safe_min_seed_generation = 0
 
         self._vvp_quality: int | None = None
+        self._adaptive_vvp_quality: int | None = None
         self._h264_sps: bytes | None = None
         self._h264_pps: bytes | None = None
         self._hevc_vps: bytes | None = None
@@ -252,6 +256,7 @@ class CloudEdgeMeariCoordinator:
 
     def set_vvp_quality(self, quality: int | None) -> None:
         self._vvp_quality = quality
+        self._adaptive_vvp_quality = None
         self._fire_update()
 
     def set_stream_host_mode(self, mode: str) -> None:
@@ -636,6 +641,9 @@ class CloudEdgeMeariCoordinator:
             if not self._stream_thread or not self._stream_thread.is_alive():
                 self._stream_thread = None
                 self._start_streamer_once()
+            elif self._stream_video_stale(now):
+                self._restart_stale_stream(now, context="ipc")
+                continue
 
             worker = self._stream_thread
             if worker is None:
@@ -659,11 +667,16 @@ class CloudEdgeMeariCoordinator:
     def _run_live_until_deadline(self) -> None:
         self._set_camera_awake(True)
         while self._running and time.monotonic() < self._live_deadline:
+            now = time.monotonic()
             self._consume_wake_event()
             if not self._stream_thread or not self._stream_thread.is_alive():
                 self._stream_thread = None
                 self._muxer.stop()
                 self._start_streamer_once()
+            elif self._stream_video_stale(now):
+                self._restart_stale_stream(now, context="live")
+                time.sleep(0.5)
+                continue
 
             worker = self._stream_thread
             if worker is None:
@@ -784,6 +797,63 @@ class CloudEdgeMeariCoordinator:
             if not worker.is_alive() and self._stream_thread is worker:
                 self._stream_thread = None
 
+    def _stream_video_stale(self, now: float) -> bool:
+        worker = self._stream_thread
+        if worker is None or not worker.is_alive() or self._stream_started_at <= 0.0:
+            return False
+        if self._last_p2p_video_time >= self._stream_started_at:
+            return now - self._last_p2p_video_time >= LIVE_VIDEO_STALL_RESTART_S
+        return now - self._stream_started_at >= LIVE_STARTUP_STALL_RESTART_S
+
+    def _restart_stale_stream(self, now: float, *, context: str) -> None:
+        if self._last_p2p_video_time >= self._stream_started_at:
+            idle_s = now - self._last_p2p_video_time
+            reason = f"no video for {idle_s:.1f}s"
+        else:
+            idle_s = now - self._stream_started_at
+            reason = f"no first video after {idle_s:.1f}s"
+        _LOGGER.warning(
+            "Restarting stale %s P2P stream for %s (%s)",
+            context,
+            self._sn_num,
+            reason,
+        )
+        self._note_stale_stream_restart()
+        self._stop_streamer(join_timeout=2)
+        self._muxer.reset_live_timing()
+
+    def _note_stale_stream_restart(self) -> None:
+        self._downgrade_auto_quality()
+
+    def _downgrade_auto_quality(self) -> bool:
+        if self._vvp_quality is not None:
+            return False
+        profiles = sorted(self.quality_profiles)
+        if len(profiles) < 2:
+            return False
+        current = (
+            self._adaptive_vvp_quality
+            if self._adaptive_vvp_quality is not None
+            else profiles[-1]
+        )
+        lower = [quality for quality in profiles if quality < current]
+        if not lower:
+            return False
+        self._adaptive_vvp_quality = lower[-1]
+        _LOGGER.warning(
+            "Auto quality fallback for %s: profile %s after stream stalls",
+            self._sn_num,
+            self._adaptive_vvp_quality,
+        )
+        return True
+
+    def _stream_quality(self) -> int | None:
+        return (
+            self._vvp_quality
+            if self._vvp_quality is not None
+            else self._adaptive_vvp_quality
+        )
+
     def _remember_idle_frame(self, codec: str, payload: bytes) -> None:
         frame = bytes(payload)
         with self._idle_frame_lock:
@@ -865,6 +935,7 @@ class CloudEdgeMeariCoordinator:
             return
 
         self._p2p_session_generation += 1
+        self._stream_started_at = time.monotonic()
         self._stream_started_keyframe = False
 
         def stream_allowed() -> bool:
@@ -875,8 +946,9 @@ class CloudEdgeMeariCoordinator:
         def on_video(payload: bytes) -> None:
             if not stream_allowed():
                 return
-            self._last_p2p_video_time = time.monotonic()
-            self._last_video_time = self._last_p2p_video_time
+            now = time.monotonic()
+            self._last_p2p_video_time = now
+            self._last_video_time = now
             self._p2p_video_frames += 1
             detected = detect_codec(payload, default=self._video_codec)
             if detected != self._video_codec:
@@ -918,7 +990,7 @@ class CloudEdgeMeariCoordinator:
                 on_audio=on_audio,
                 on_login=lambda: None,
                 on_disconnect=lambda: None,
-                vvp_quality=self._vvp_quality,
+                vvp_quality=self._stream_quality(),
                 video_password=self._video_password,
             )
             self._p2p_streamer.run_session()
