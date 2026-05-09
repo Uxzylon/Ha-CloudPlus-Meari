@@ -11,7 +11,12 @@ from typing import Any, Callable
 from ..api import format_sn
 from ..meari_signaling import MsgSvrClient
 from ..turn_client import BINDING_REQUEST, BINDING_RESPONSE, TurnClient
-from ..kcp_tunnel import KcpTunnel, parse_iva_frame, parse_kcp_segment
+from ..kcp_tunnel import (
+    KCP_WND,
+    KcpTunnel,
+    parse_iva_frame,
+    parse_kcp_segment,
+)
 from .network import (
     _build_ice_response,
     _get_local_ips,
@@ -20,7 +25,7 @@ from .network import (
     _send_direct_ice_binding,
     recv_peer_packets,
 )
-from .codecs import detect_codec
+from .codecs import detect_codec, gap_recovery_for
 from .protocol import (
     VVP_CMD_STOP,
     VVP_CMD_HEARTBEAT,
@@ -37,11 +42,11 @@ from .codec import (
     parse_stream_frame,
     split_stream_frames,
 )
-from .quality import best_quality_profile
+from .quality import stream_id_for_quality
 
 _LOGGER = logging.getLogger(__name__)
 
-KEYFRAME_WAIT_AFTER_GAP_S = 0.8
+START_LIVE_KEEPALIVE_S = 12.0
 START_LIVE_IDLE_NUDGE_S = 1.0
 START_LIVE_RETRY_S = 1.5
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
@@ -174,18 +179,13 @@ class P2PStreamer:
         self._device = device
         self._sn_num = device["snNum"]
         self._device_uuid = format_sn(str(self._sn_num))
+        self._is_snap = str(device.get("_category", "")).lower() == "snap"
         self._host_key = device.get("hostKey", "")
         self._video_password = (video_password or "").strip()
         self._remote = remote
-        self._vvp_video_id = int(device.get("deviceID") or 0) & 0xFF
-        # The app sets this live-stream flag for the normal viewer path.
-        # Battery HEVC/E2EE cameras can stall if local sessions clear it.
-        self._vvp_stream_flag = 1
-        self._vvp_quality = (
-            int(vvp_quality)
-            if vvp_quality is not None
-            else best_quality_profile(device)
-        )
+        self._vvp_stream_id = stream_id_for_quality(device, vvp_quality)
+        app_profile = str(getattr(api, "app_profile", "") or "").lower()
+        self._vvp_stream_flag = 0 if app_profile == "cloudedge" else 1
 
         self.on_video = on_video
         self.on_audio = on_audio
@@ -546,7 +546,7 @@ class P2PStreamer:
                     except Exception:
                         pass
 
-        kcp = KcpTunnel(_send_udp)
+        kcp = KcpTunnel(_send_udp, recv_wnd=KCP_WND)
         licence_id = format_licence_id(str(self._sn_num))
         vvp_seq = 0
         last_heartbeat = 0.0
@@ -574,9 +574,8 @@ class P2PStreamer:
                 host_key=host_key,
                 param=param,
                 licence_id=licence_id,
-                video_id=self._vvp_video_id,
+                stream_id=self._vvp_stream_id,
                 stream_flag=self._vvp_stream_flag,
-                quality=self._vvp_quality,
             )
             vvp_seq += 1
             return packet
@@ -668,6 +667,11 @@ class P2PStreamer:
             gap_backlog = _kcp_gap_backlog()
             if not gap_backlog:
                 udp_idle = now_ts - last_udp_time if last_udp_time > 0 else -1.0
+                payload_idle = (
+                    now_ts - last_kcp_payload_time
+                    if last_kcp_payload_time > 0
+                    else -1.0
+                )
                 if now_ts - last_ack_probe > 0.35 and kcp.send_ack_probe():
                     last_ack_probe = now_ts
                 if stall_time > 1.2 and (udp_idle < 0 or udp_idle > 0.8):
@@ -685,31 +689,21 @@ class P2PStreamer:
                         "payload_idle=%.2fs recv_buf=%d queued=%d partial=%d",
                         stall_time,
                         udp_idle,
-                        (
-                            now_ts - last_kcp_payload_time
-                            if last_kcp_payload_time > 0
-                            else -1.0
-                        ),
+                        payload_idle,
                         len(getattr(kcp, "recv_buf", {}) or {}),
                         len(getattr(kcp, "recv_queue", []) or []),
                         len(getattr(kcp, "recv_frag_buf", []) or []),
                     )
                 return
 
-            is_hevc = self._video_codec == "hevc"
             if now_ts - last_gap_nudge > 0.08 and kcp.send_gap_nudge():
                 last_gap_nudge = now_ts
 
-            if is_hevc:
-                skip_wait = 1.6 if gap_backlog > 96 else 2.4
-                skip_interval = 1.0
-                max_gaps = None if gap_backlog > 256 or stall_time > 4.0 else 2
-                keyframe_wait = 8.0
-            else:
-                skip_wait = 1.2 if gap_backlog > 96 else 2.0
-                skip_interval = 0.45
-                max_gaps = None if gap_backlog > 96 or stall_time > 2.5 else 2
-                keyframe_wait = KEYFRAME_WAIT_AFTER_GAP_S
+            recovery = gap_recovery_for(self._video_codec)
+            skip_wait = recovery.skip_wait_s
+            skip_interval = recovery.skip_interval_s
+            max_gaps = recovery.max_gaps(gap_backlog, stall_time)
+            keyframe_wait = recovery.keyframe_wait_s
 
             if stall_time <= skip_wait or now_ts - last_gap_skip <= skip_interval:
                 return
@@ -803,6 +797,11 @@ class P2PStreamer:
             )
             if video_stale and now >= last_start_live + START_LIVE_RETRY_S:
                 _send_start_live("retry", now)
+            elif (
+                last_video_time > 0.0
+                and now >= last_start_live + START_LIVE_KEEPALIVE_S
+            ):
+                _send_start_live("keepalive", now)
 
             if now >= turn_refresh:
                 try:
