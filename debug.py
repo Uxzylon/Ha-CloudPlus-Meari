@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import importlib.util
 import logging
+import math
 import os
 import re
 import signal
 import shutil
+import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2207,7 +2211,7 @@ def _build_stream_recorder_cmd(
         "warning",
         "-nostdin",
         "-rw_timeout",
-        "5000000",
+        "20000000",
         "-fflags",
         "+discardcorrupt+nobuffer",
         "-analyzeduration",
@@ -2276,7 +2280,7 @@ def _build_pcm_recorder_cmd(
         "warning",
         "-nostdin",
         "-rw_timeout",
-        "5000000",
+        "20000000",
         "-fflags",
         "+discardcorrupt+nobuffer",
         "-analyzeduration",
@@ -2305,6 +2309,200 @@ def _build_pcm_recorder_cmd(
     return cmd
 
 
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(round((len(ordered) - 1) * pct)))
+    return ordered[idx]
+
+
+def _mulaw_to_pcm16(byte: int) -> int:
+    uval = (~byte) & 0xFF
+    sign = uval & 0x80
+    exponent = (uval >> 4) & 0x07
+    mantissa = uval & 0x0F
+    sample = (((mantissa << 3) + 0x84) << exponent) - 0x84
+    return -sample if sign else sample
+
+
+def _pcm_quality_metrics(
+    samples: list[int],
+    sample_rate: int,
+    prefix: str,
+) -> dict[str, Any]:
+    if not samples:
+        return {}
+    duration = len(samples) / max(1, sample_rate)
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    peak = max(abs(sample) for sample in samples)
+    deltas = [abs(samples[idx] - samples[idx - 1]) for idx in range(1, len(samples))]
+    delta_rms = (
+        math.sqrt(sum(delta * delta for delta in deltas) / len(deltas))
+        if deltas
+        else 0.0
+    )
+    zero_crossings = sum(
+        1
+        for idx in range(1, len(samples))
+        if (samples[idx] < 0) != (samples[idx - 1] < 0)
+    )
+    hard_jumps = sum(1 for delta in deltas if delta >= 18000)
+    clipped = sum(1 for sample in samples if abs(sample) >= 32760)
+    return {
+        f"{prefix}_sample_rate": sample_rate,
+        f"{prefix}_duration_s": round(duration, 2),
+        f"{prefix}_rms": round(rms, 1),
+        f"{prefix}_peak": peak,
+        f"{prefix}_clip_pct": round(100.0 * clipped / len(samples), 4),
+        f"{prefix}_hard_jumps_per_s": round(hard_jumps / max(duration, 0.001), 3),
+        f"{prefix}_delta_rms": round(delta_rms, 1),
+        f"{prefix}_delta_rms_ratio": round(delta_rms / max(rms, 1.0), 3),
+        f"{prefix}_zero_crossings_per_s": round(
+            zero_crossings / max(duration, 0.001),
+            1,
+        ),
+    }
+
+
+class RawAudioMonitor:
+    """Small debug-only monitor for camera G.711 payload health."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frames = 0
+        self._bytes = 0
+        self._lengths: collections.Counter[int] = collections.Counter()
+        self._arrival_gaps: list[float] = []
+        self._last_at = 0.0
+        self._samples: list[int] = []
+
+    def add(self, payload: bytes) -> None:
+        if not payload:
+            return
+        now = time.monotonic()
+        samples = [_mulaw_to_pcm16(byte) for byte in payload]
+        with self._lock:
+            if self._last_at > 0:
+                self._arrival_gaps.append(now - self._last_at)
+            self._last_at = now
+            self._frames += 1
+            self._bytes += len(payload)
+            self._lengths[len(payload)] += 1
+            self._samples.extend(samples)
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            gaps = list(self._arrival_gaps)
+            samples = list(self._samples)
+            result: dict[str, Any] = {
+                "raw_audio_frames": self._frames,
+                "raw_audio_bytes": self._bytes,
+                "raw_audio_payload_lengths": self._lengths.most_common(6),
+            }
+        if gaps:
+            gap_ms = [gap * 1000.0 for gap in gaps]
+            result.update(
+                {
+                    "raw_audio_arrival_median_ms": round(statistics.median(gap_ms), 1),
+                    "raw_audio_arrival_p95_ms": round(_percentile(gap_ms, 0.95), 1),
+                    "raw_audio_arrival_max_ms": round(max(gap_ms), 1),
+                    "raw_audio_arrival_gaps_over_80ms": sum(
+                        1 for gap in gaps if gap > 0.08
+                    ),
+                }
+            )
+        result.update(_pcm_quality_metrics(samples, 8000, "raw_ulaw"))
+        return result
+
+
+def _muxer_audio_snapshot(coord: Any) -> dict[str, Any]:
+    muxer = getattr(coord, "_muxer", None)
+    getter = getattr(muxer, "audio_debug_snapshot", None)
+    if not callable(getter):
+        return {}
+    try:
+        return dict(getter())
+    except Exception:
+        return {}
+
+
+def _print_compact_metrics(title: str, metrics: dict[str, Any], keys: list[str]) -> None:
+    if not metrics:
+        return
+    print(f"  {title}:")
+    for key in keys:
+        if key in metrics:
+            print(f"    {key}: {metrics[key]}")
+
+
+def _print_audio_crackle_diagnostics(
+    raw_metrics: dict[str, Any],
+    pcm_metrics: dict[str, Any],
+    mux_metrics: dict[str, Any],
+) -> None:
+    print("\nAudio crackle diagnostics")
+    print("-" * 78)
+    _print_compact_metrics(
+        "camera raw mu-law",
+        raw_metrics,
+        [
+            "raw_audio_frames",
+            "raw_audio_payload_lengths",
+            "raw_audio_arrival_median_ms",
+            "raw_audio_arrival_p95_ms",
+            "raw_audio_arrival_max_ms",
+            "raw_audio_arrival_gaps_over_80ms",
+            "raw_ulaw_rms",
+            "raw_ulaw_peak",
+            "raw_ulaw_clip_pct",
+            "raw_ulaw_hard_jumps_per_s",
+            "raw_ulaw_delta_rms_ratio",
+        ],
+    )
+    _print_compact_metrics(
+        "decoded player audio",
+        pcm_metrics,
+        [
+            "pcm_duration_s",
+            "pcm_audible_pct",
+            "pcm_max_silence_gap_s",
+            "pcm_short_gaps_under_200ms",
+            "pcm_rms",
+            "pcm_peak",
+            "pcm_clip_pct",
+            "pcm_hard_jumps_per_s",
+            "pcm_delta_rms_ratio",
+            "pcm_zero_crossings_per_s",
+        ],
+    )
+    _print_compact_metrics(
+        "mux audio pacing",
+        mux_metrics,
+        [
+            "mux_audio_frames",
+            "mux_audio_silence_frames",
+            "mux_audio_max_emit_gap_s",
+            "mux_audio_next_pts",
+            "mux_video_last_pts",
+        ],
+    )
+    flags = []
+    if float(raw_metrics.get("raw_ulaw_clip_pct", 0.0) or 0.0) > 0.05:
+        flags.append("raw-clipping")
+    if float(raw_metrics.get("raw_ulaw_hard_jumps_per_s", 0.0) or 0.0) > 0.5:
+        flags.append("raw-hard-jumps")
+    if float(pcm_metrics.get("pcm_clip_pct", 0.0) or 0.0) > 0.05:
+        flags.append("decoded-clipping")
+    if float(pcm_metrics.get("pcm_hard_jumps_per_s", 0.0) or 0.0) > 0.5:
+        flags.append("decoded-hard-jumps")
+    if float(mux_metrics.get("mux_audio_max_emit_gap_s", 0.0) or 0.0) > 0.25:
+        flags.append("mux-pacing-gap")
+    if int(raw_metrics.get("raw_audio_arrival_gaps_over_80ms", 0) or 0) > 20:
+        flags.append("raw-arrival-jitter")
+    print(f"  audio_artifact_flags: {flags}")
+
+
 def _analyze_pcm_audio(
     wav_path: str,
     log: logging.Logger,
@@ -2322,9 +2520,6 @@ def _analyze_pcm_audio(
       pcm_max_silence_gap_s, pcm_avg_rms, pcm_max_rms,
       pcm_audible_segments (count of continuous audible runs),
     """
-    import struct
-    import math
-
     result: dict[str, Any] = {}
 
     if not os.path.isfile(wav_path) or os.path.getsize(wav_path) < 100:
@@ -2351,6 +2546,10 @@ def _analyze_pcm_audio(
     total_duration = total_samples / sample_rate
 
     result["pcm_duration_s"] = round(total_duration, 2)
+    all_samples = list(
+        struct.unpack(f"<{total_samples}h", pcm_data[: total_samples * 2])
+    )
+    result.update(_pcm_quality_metrics(all_samples, sample_rate, "pcm"))
 
     # Classify each chunk
     chunk_rms_values: list[float] = []
@@ -2884,6 +3083,7 @@ async def cmd_stream(args) -> int:
     recorder_proc: subprocess.Popen | None = None
     recorder_log_fh = None
     pcm_recorder_proc: subprocess.Popen | None = None
+    raw_audio_monitor = RawAudioMonitor()
     recorder_started_mono: float | None = None
     player_started_mono: float | None = None
     live_ready_mono: float | None = None
@@ -2952,6 +3152,17 @@ async def cmd_stream(args) -> int:
             )
 
         coord, dev, mods = await _create_coordinator(args)
+        muxer = getattr(coord, "_muxer", None)
+        write_audio = getattr(muxer, "write_audio", None)
+        if callable(write_audio):
+            original_write_audio = write_audio
+
+            def _debug_write_audio(payload: bytes) -> None:
+                raw_audio_monitor.add(payload)
+                original_write_audio(payload)
+
+            setattr(muxer, "write_audio", _debug_write_audio)
+
         # Apply quality override from CLI
         quality_arg = getattr(args, "quality", None)
         if quality_arg is not None:
@@ -3528,6 +3739,18 @@ async def cmd_stream(args) -> int:
                     _print_player_decode_correlation(coord, player_decode_corr_state)
                     _print_stream_join_diagnostics(coord)
 
+            _t_pcm = time.time()
+            pcm_metrics = _analyze_pcm_audio(pcm_record_path, log)
+            log.info(
+                "PCM audio crackle analysis completed in %.1fs",
+                time.time() - _t_pcm,
+            )
+            _print_audio_crackle_diagnostics(
+                raw_audio_monitor.summary(),
+                pcm_metrics,
+                _muxer_audio_snapshot(coord),
+            )
+
             recorder_only_timestamp_discontinuities = False
             ts_minor_glitch = False
             if full_mode:
@@ -3639,9 +3862,6 @@ async def cmd_stream(args) -> int:
                         run_failed = True
 
                 # --- PCM audio content analysis ---
-                _t2 = time.time()
-                pcm_metrics = _analyze_pcm_audio(pcm_record_path, log)
-                log.info("PCM analysis completed in %.1fs", time.time() - _t2)
                 if pcm_metrics:
                     print("\nPCM audio analysis (actual audible content)")
                     print("-" * 78)
