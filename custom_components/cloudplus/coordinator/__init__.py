@@ -40,6 +40,10 @@ BATTERY_POLL_INTERVAL = 300.0
 STATUS_POLL_INTERVAL = 300.0
 LIVE_VIDEO_STALL_RESTART_S = 4.0
 LIVE_STARTUP_STALL_RESTART_S = 25.0
+LIVE_VIDEO_MIN_INTERVAL = 1.0 / 30.0
+LIVE_VIDEO_MAX_INTERVAL = 5.0
+LIVE_VIDEO_INTERVAL_ALPHA = 0.30
+LIVE_VIDEO_INTERVAL_RESET_S = 1.0
 
 
 class CloudEdgeMeariCoordinator:
@@ -125,6 +129,8 @@ class CloudEdgeMeariCoordinator:
         self._last_p2p_video_time = 0.0
         self._last_p2p_audio_time = 0.0
         self._last_video_time = 0.0
+        self._last_mux_video_mono = 0.0
+        self._last_mux_video_interval_s = 0.0
         self._p2p_video_frames = 0
         self._live_deadline = 0.0
         self._idle_video_frame: bytes | None = None
@@ -821,9 +827,38 @@ class CloudEdgeMeariCoordinator:
         self._note_stale_stream_restart()
         self._stop_streamer(join_timeout=2)
         self._muxer.reset_live_timing()
+        self._reset_live_mux_timing()
 
     def _note_stale_stream_restart(self) -> None:
         self._downgrade_auto_quality()
+
+    def _reset_live_mux_timing(self) -> None:
+        self._last_mux_video_mono = 0.0
+        self._last_mux_video_interval_s = 0.0
+
+    def _next_live_video_interval(self, now: float) -> float | None:
+        last = self._last_mux_video_mono
+        self._last_mux_video_mono = now
+        if last <= 0.0:
+            return None
+
+        interval = max(
+            LIVE_VIDEO_MIN_INTERVAL,
+            min(LIVE_VIDEO_MAX_INTERVAL, now - last),
+        )
+        if interval >= LIVE_VIDEO_INTERVAL_RESET_S:
+            self._last_mux_video_interval_s = 0.0
+            return interval
+
+        previous = self._last_mux_video_interval_s
+        smoothed = interval
+        if previous > 0.0:
+            smoothed = (
+                previous * (1.0 - LIVE_VIDEO_INTERVAL_ALPHA)
+                + interval * LIVE_VIDEO_INTERVAL_ALPHA
+            )
+        self._last_mux_video_interval_s = smoothed
+        return smoothed
 
     def _downgrade_auto_quality(self) -> bool:
         if self._vvp_quality is not None:
@@ -937,6 +972,7 @@ class CloudEdgeMeariCoordinator:
         self._p2p_session_generation += 1
         self._stream_started_at = time.monotonic()
         self._stream_started_keyframe = False
+        self._reset_live_mux_timing()
 
         def stream_allowed() -> bool:
             return (
@@ -955,6 +991,7 @@ class CloudEdgeMeariCoordinator:
                 self._video_codec = detected
                 self._muxer.stop()
                 self._stream_started_keyframe = False
+                self._reset_live_mux_timing()
 
             self._remember_codec_params(self._video_codec, payload)
             if not self._codec_params_ready(self._video_codec):
@@ -972,7 +1009,10 @@ class CloudEdgeMeariCoordinator:
                 self._video_codec,
                 advertised_fps=self._video_mux_target_fps,
             )
-            self._muxer.write_video(payload)
+            self._muxer.write_video(
+                payload,
+                pts_interval_s=self._next_live_video_interval(now),
+            )
             if grab_only and is_keyframe and self._p2p_streamer is not None:
                 self._p2p_streamer.request_stop()
 

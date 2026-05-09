@@ -10,11 +10,17 @@ import subprocess
 import threading
 import time
 
+AUDIO_GAIN_DB = 0.0
+G711_SAMPLE_RATE = 8000
+SILENCE_CHUNK = b"\xff" * (G711_SAMPLE_RATE // 25)
+SILENCE_AFTER_S = 0.20
+AAC_LOW_WATER_FRAMES = 16
+
 
 class AacAudioEncoder:
     """Encode camera mu-law audio into ADTS frames for MPEG-TS injection."""
 
-    def __init__(self, *, gain_db: float = 24.0) -> None:
+    def __init__(self, *, gain_db: float = AUDIO_GAIN_DB) -> None:
         self._gain_db = gain_db
         self._proc: subprocess.Popen | None = None
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=120)
@@ -22,10 +28,16 @@ class AacAudioEncoder:
         self._running = False
         self._writer: threading.Thread | None = None
         self._reader: threading.Thread | None = None
+        self._last_real_audio_at = 0.0
 
     def start(self) -> None:
         if self._proc is not None:
             return
+        audio_filter = (
+            ["-filter:a", f"volume={self._gain_db:.1f}dB"]
+            if abs(self._gain_db) > 0.01
+            else []
+        )
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -39,8 +51,7 @@ class AacAudioEncoder:
             "1",
             "-i",
             "pipe:0",
-            "-filter:a",
-            f"volume={self._gain_db:.1f}dB,alimiter=limit=0.92",
+            *audio_filter,
             "-c:a",
             "aac",
             "-profile:a",
@@ -50,7 +61,7 @@ class AacAudioEncoder:
             "-ac",
             "1",
             "-b:a",
-            "32k",
+            "64k",
             "-flush_packets",
             "1",
             "-f",
@@ -95,14 +106,17 @@ class AacAudioEncoder:
                     pass
         self._drain_queue()
         self._frames.clear()
+        self._last_real_audio_at = 0.0
 
     def clear(self) -> None:
         self._drain_queue()
         self._frames.clear()
+        self._last_real_audio_at = 0.0
 
     def write_mulaw(self, payload: bytes) -> None:
         if not payload:
             return
+        self._last_real_audio_at = time.monotonic()
         try:
             self._queue.put_nowait(payload)
             return
@@ -123,6 +137,13 @@ class AacAudioEncoder:
         except IndexError:
             return None
 
+    def frame_count(self) -> int:
+        return len(self._frames)
+
+    def silence_allowed(self) -> bool:
+        last_real = self._last_real_audio_at
+        return last_real <= 0.0 or time.monotonic() - last_real > SILENCE_AFTER_S
+
     def _drain_queue(self) -> None:
         while True:
             try:
@@ -138,24 +159,23 @@ class AacAudioEncoder:
         except Exception:
             return
 
-        silence = b"\xff" * 160
-        next_silence_at = time.monotonic()
         while self._running and self._proc is proc and proc.poll() is None:
             try:
-                payload = self._queue.get(timeout=0.02)
+                payload = self._queue.get(timeout=0.04)
             except queue.Empty:
-                now = time.monotonic()
-                if now < next_silence_at:
+                payload = self._silence_payload()
+                if payload is None:
                     continue
-                payload = silence
-                next_silence_at = now + 0.02
-            else:
-                next_silence_at = time.monotonic() + min(
-                    0.2, max(0.02, len(payload) / 8000.0)
-                )
 
             if not self._write_fd(fd, payload, proc):
                 return
+
+    def _silence_payload(self) -> bytes | None:
+        if not self.silence_allowed():
+            return None
+        if len(self._frames) >= AAC_LOW_WATER_FRAMES or self._queue.qsize() >= 4:
+            return None
+        return SILENCE_CHUNK
 
     def _read_loop(self, proc: subprocess.Popen) -> None:
         if proc.stdout is None:
