@@ -38,7 +38,7 @@ KCP_CMD_WASK = 83  # 0x53 - window probe request
 KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
 KCP_MSS = 1176  # 0x498 - max segment size
-KCP_WND = 512  # Conservative receive window; avoids overrunning weaker cameras.
+KCP_WND = 1024  # Matches the Android SDK; daylight keyframes can exceed 512 segments.
 
 # IVA frame constants
 IVA_MAGIC = b"\xff\x01"

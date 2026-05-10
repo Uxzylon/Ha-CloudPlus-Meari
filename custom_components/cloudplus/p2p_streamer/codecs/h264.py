@@ -5,9 +5,9 @@ from __future__ import annotations
 from .base import GapRecoveryPolicy
 
 GAP_RECOVERY = GapRecoveryPolicy(
-    skip_wait_s=4.0,
-    skip_interval_s=1.2,
-    keyframe_wait_s=2.0,
+    skip_wait_s=2.2,
+    skip_interval_s=1.0,
+    keyframe_wait_s=0.0,
 )
 
 
