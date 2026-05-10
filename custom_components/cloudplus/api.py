@@ -405,7 +405,7 @@ class MeariApiClient:
             result_code = str(data.get("resultCode", ""))
             if result_code == "1001":
                 if idx > 1:
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "Login succeeded after password apostrophe normalization for account %s",
                         self.email,
                     )
@@ -428,7 +428,7 @@ class MeariApiClient:
             # Some accounts/devices intermittently return 1023 for this endpoint
             # even when auth is valid. Keep defaults and continue.
             if result_code == "1023":
-                _LOGGER.warning(
+                _LOGGER.info(
                     "IoT config returned 1023 for %s; continuing with default endpoints",
                     self.email,
                 )

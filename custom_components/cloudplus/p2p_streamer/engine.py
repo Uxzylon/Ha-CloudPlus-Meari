@@ -42,13 +42,15 @@ from .codec import (
     parse_stream_frame,
     split_stream_frames,
 )
-from .quality import stream_id_for_quality
+from .quality import ADAPTIVE_STREAM_ID, stream_id_for_quality
 
 _LOGGER = logging.getLogger(__name__)
 
-START_LIVE_KEEPALIVE_S = 12.0
+START_LIVE_KEEPALIVE_S = 5.0
 START_LIVE_IDLE_NUDGE_S = 1.0
 START_LIVE_RETRY_S = 1.5
+SOURCE_IDLE_RECONNECT_S = 4.0
+ADAPTIVE_SOURCE_IDLE_RECONNECT_S = 3.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 
@@ -327,7 +329,9 @@ class P2PStreamer:
     ) -> tuple[int, int]:
         sig = None
         try:
-            sig_ip, sig_port = _resolve_signaling_server()
+            sig_ip, sig_port = _resolve_signaling_server(
+                openapi_server_hint=getattr(self._api, "openapi_server", None),
+            )
             sig = MsgSvrClient(sig_ip, sig_port)
             self._active_sig = sig
             sig.connect()
@@ -561,6 +565,8 @@ class P2PStreamer:
         last_gap_skip = 0.0
         last_stall_debug = 0.0
         wait_for_keyframe_until = 0.0
+        pending_payloads: list[bytes] = []
+        reconnect_idle_source = False
         turn_refresh = time.time() + 60.0
         auth_fallback_at = (
             time.time() + AUTH_FALLBACK_NO_VIDEO_S if allow_auth_fallback else 0.0
@@ -599,22 +605,28 @@ class P2PStreamer:
             for cand in camera_candidates:
                 if not cand.get("ip") or not cand.get("port"):
                     continue
-                turn.send_ice_binding(
-                    cand["ip"],
-                    cand["port"],
-                    ice_ufrag,
-                    camera_ufrag,
-                    camera_pwd,
-                )
-                if not self._remote and _is_private_ip(cand["ip"]):
-                    _send_direct_ice_binding(
-                        turn.sock,
+                try:
+                    turn.send_ice_binding(
                         cand["ip"],
                         cand["port"],
                         ice_ufrag,
                         camera_ufrag,
                         camera_pwd,
                     )
+                except Exception:
+                    pass
+                if not self._remote and _is_private_ip(cand["ip"]):
+                    try:
+                        _send_direct_ice_binding(
+                            turn.sock,
+                            cand["ip"],
+                            cand["port"],
+                            ice_ufrag,
+                            camera_ufrag,
+                            camera_pwd,
+                        )
+                    except Exception:
+                        pass
 
         def _handle_kcp_payload(payload: bytes) -> bool:
             nonlocal wait_for_keyframe_until
@@ -635,15 +647,30 @@ class P2PStreamer:
                     wait_for_keyframe_until = 0.0
             return self._video_count > before
 
-        def _drain_kcp_queue() -> bool:
+        def _queue_kcp_payload(payload: bytes) -> None:
             nonlocal last_kcp_payload_time
-            saw_video = False
+            last_kcp_payload_time = time.time()
+            pending_payloads.append(payload)
+
+        def _drain_kcp_queue() -> bool:
+            queued_any = False
             while True:
                 queued = kcp.poll_data()
                 if queued is None:
                     break
-                last_kcp_payload_time = time.time()
-                saw_video = _handle_kcp_payload(queued) or saw_video
+                _queue_kcp_payload(queued)
+                queued_any = True
+            return queued_any
+
+        def _process_pending_payloads() -> bool:
+            nonlocal last_video_time
+            saw_video = False
+            payloads = pending_payloads[:]
+            pending_payloads.clear()
+            for payload in payloads:
+                saw_video = _handle_kcp_payload(payload) or saw_video
+            if saw_video:
+                last_video_time = time.time()
             return saw_video
 
         def _kcp_gap_backlog() -> int:
@@ -657,6 +684,7 @@ class P2PStreamer:
             return max(1, max(above) - next_sn + 1)
 
         def _attempt_gap_recovery(now_ts: float) -> None:
+            nonlocal reconnect_idle_source
             nonlocal candidate_fanout_until
             nonlocal last_ack_probe, last_gap_nudge, last_gap_skip
             nonlocal last_stall_debug, wait_for_keyframe_until, last_video_time
@@ -682,6 +710,17 @@ class P2PStreamer:
                         now_ts,
                         min_interval=START_LIVE_RETRY_S,
                     )
+                idle_reconnect_s = (
+                    ADAPTIVE_SOURCE_IDLE_RECONNECT_S
+                    if self._vvp_stream_id == ADAPTIVE_STREAM_ID
+                    else SOURCE_IDLE_RECONNECT_S
+                )
+                if stall_time >= idle_reconnect_s:
+                    _LOGGER.warning(
+                        "P2P source idle %.1fs; reconnecting session",
+                        stall_time,
+                    )
+                    reconnect_idle_source = True
                 if now_ts - last_stall_debug >= 2.0:
                     last_stall_debug = now_ts
                     _LOGGER.debug(
@@ -710,11 +749,11 @@ class P2PStreamer:
             if kcp.skip_gap(max_gaps=max_gaps, require_iva_start=True):
                 last_gap_skip = now_ts
                 wait_for_keyframe_until = now_ts + keyframe_wait
-                if _drain_kcp_queue():
-                    last_video_time = time.time()
+                _drain_kcp_queue()
+                _process_pending_payloads()
 
         def _handle_peer_packet(packet) -> None:
-            nonlocal last_kcp_payload_time, last_udp_time, last_video_time
+            nonlocal last_udp_time
             last_udp_time = time.time()
             peer = packet.peer
             if peer is None and not packet.via_turn:
@@ -763,13 +802,10 @@ class P2PStreamer:
                 if processed is not None:
                     typ, payload = processed
                     if typ in ("data", "iva_data", "iva") and payload:
-                        last_kcp_payload_time = time.time()
-                        if _handle_kcp_payload(payload):
-                            last_video_time = time.time()
+                        _queue_kcp_payload(payload)
                     elif typ == "handshake":
                         kcp.retransmit_unacked()
-                if _drain_kcp_queue():
-                    last_video_time = time.time()
+                _drain_kcp_queue()
 
         kcp.send_handshake()
         _send_start_live("initial")
@@ -798,7 +834,9 @@ class P2PStreamer:
             if video_stale and now >= last_start_live + START_LIVE_RETRY_S:
                 _send_start_live("retry", now)
             elif (
-                last_video_time > 0.0
+                START_LIVE_KEEPALIVE_S > 0.0
+                and self._vvp_stream_id != ADAPTIVE_STREAM_ID
+                and last_video_time > 0.0
                 and now >= last_start_live + START_LIVE_KEEPALIVE_S
             ):
                 _send_start_live("keepalive", now)
@@ -810,10 +848,13 @@ class P2PStreamer:
                     pass
                 turn_refresh = now + 60.0
 
-            packets = recv_peer_packets(turn, timeout=0.08, max_packets=512)
+            packets = recv_peer_packets(turn, timeout=0.08, max_packets=2048)
             if not packets:
+                _process_pending_payloads()
                 _attempt_gap_recovery(now)
                 kcp.flush_acks()
+                if reconnect_idle_source:
+                    return (self._video_count, self._total_bytes)
                 continue
 
             for packet in packets:
@@ -821,8 +862,12 @@ class P2PStreamer:
                     break
                 _handle_peer_packet(packet)
 
+            _drain_kcp_queue()
+            _process_pending_payloads()
             _attempt_gap_recovery(time.time())
             kcp.flush_acks()
+            if reconnect_idle_source:
+                return (self._video_count, self._total_bytes)
 
         try:
             kcp.send_iva_data(_next_vvp(VVP_CMD_STOP, param=0))

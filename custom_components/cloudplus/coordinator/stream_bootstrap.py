@@ -27,10 +27,12 @@ class StreamBootstrap:
         self._buf = bytearray()
         self._pending_group = bytearray()
         self._pending_has_idr = False
+        self._pending_nal_types: set[int] = set()
         self._pending_probe_tail = b""
         self._generation = 0
         self._frames_since_seed = 0
         self._codec = "hevc"
+        self._seed_strong = False
 
     def snapshot(self) -> bytes:
         if self._seed and self._pending_group:
@@ -53,6 +55,7 @@ class StreamBootstrap:
             "frames_since_seed": self._frames_since_seed,
             "collecting": bool(self._pending_group),
             "pending_has_idr": self._pending_has_idr,
+            "strong": self._seed_strong,
         }
 
     def update(self, data: bytes) -> None:
@@ -78,6 +81,7 @@ class StreamBootstrap:
                 self._finish_pending_group()
                 self._pending_group = bytearray()
                 self._pending_has_idr = False
+                self._pending_nal_types.clear()
                 self._pending_probe_tail = b""
 
             if self._pending_group:
@@ -94,7 +98,7 @@ class StreamBootstrap:
         if not self._pending_group:
             return
 
-        if self._pending_has_idr:
+        if self._pending_has_idr and self._pending_has_codec_params():
             self._buf = bytearray()
             if self._pat_packet:
                 self._buf.extend(self._pat_packet)
@@ -103,6 +107,7 @@ class StreamBootstrap:
             self._buf.extend(self._pending_group)
             self._generation += 1
             self._frames_since_seed = 0
+            self._seed_strong = True
             self._publish_seed()
         elif self._seed:
             self._append_to_seed(self._pending_group)
@@ -113,6 +118,7 @@ class StreamBootstrap:
         if len(self._buf) > self._max_bytes:
             self._seed = b""
             self._buf.clear()
+            self._seed_strong = False
             return
         self._publish_seed()
 
@@ -121,15 +127,22 @@ class StreamBootstrap:
             self._seed = bytes(self._buf)
 
     def _scan_video_packet(self, packet: bytes) -> None:
-        if self._pending_has_idr:
-            return
         payload = self._video_payload(packet)
         if not payload:
             return
         probe = self._pending_probe_tail + payload
-        if self._contains_idr(probe):
-            self._pending_has_idr = True
-        self._pending_probe_tail = probe[-8:]
+        for nal_type in self._nal_types(probe):
+            self._pending_nal_types.add(nal_type)
+            if self._codec == "h264" and nal_type == 5:
+                self._pending_has_idr = True
+            elif self._codec == "hevc" and nal_type in {19, 20}:
+                self._pending_has_idr = True
+        self._pending_probe_tail = probe[-64:]
+
+    def _pending_has_codec_params(self) -> bool:
+        if self._codec == "h264":
+            return {7, 8}.issubset(self._pending_nal_types)
+        return {32, 33, 34}.issubset(self._pending_nal_types)
 
     @staticmethod
     def _codec_from_pmt(packet: bytes) -> str | None:
@@ -176,7 +189,8 @@ class StreamBootstrap:
             return b""
         return packet[off:TS_PACKET_SIZE]
 
-    def _contains_idr(self, data: bytes) -> bool:
+    def _nal_types(self, data: bytes) -> list[int]:
+        out: list[int] = []
         i = 0
         while i + 5 < len(data):
             if data[i] != 0 or data[i + 1] != 0:
@@ -190,14 +204,13 @@ class StreamBootstrap:
                 i += 1
                 continue
             if nal_start + 1 >= len(data):
-                return False
+                break
 
-            if self._codec == "h264" and data[nal_start] & 0x1F == 5:
-                return True
-
-            hevc_type = (data[nal_start] >> 1) & 0x3F
-            tid_plus1 = data[nal_start + 1] & 0x07
-            if self._codec == "hevc" and tid_plus1 and hevc_type in {19, 20}:
-                return True
+            if self._codec == "h264":
+                out.append(data[nal_start] & 0x1F)
+            else:
+                tid_plus1 = data[nal_start + 1] & 0x07
+                if tid_plus1:
+                    out.append((data[nal_start] >> 1) & 0x3F)
             i = nal_start + 1
-        return False
+        return out
