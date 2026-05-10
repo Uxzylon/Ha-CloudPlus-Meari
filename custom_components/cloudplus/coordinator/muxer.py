@@ -32,7 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 VIDEO_QUEUE_FRAMES = 30
 AUDIO_START_BUFFER_FRAMES = 4
 AUDIO_EMIT_LIMIT = 3
-AUDIO_MAX_LEAD_TICKS = 27000
+AUDIO_MAX_LEAD_TICKS = AAC_FRAME_TICKS * 3
 
 
 class FfmpegMuxer:
@@ -345,8 +345,6 @@ class FfmpegMuxer:
                 break
             frame = self._audio.pop_frame()
             if frame is None:
-                if not self._audio.silence_allowed():
-                    break
                 frame = AAC_SILENCE_FRAME
                 self._audio_silence_frames += 1
             self._next_audio_pts += AAC_FRAME_TICKS
@@ -426,6 +424,7 @@ class FfmpegMuxer:
             except queue.Empty:
                 continue
 
+            self._queue_video_time(frame_mono, pts_interval_s)
             view = memoryview(payload)
             while view and self._running and self._proc is proc and proc.poll() is None:
                 try:
@@ -441,11 +440,15 @@ class FfmpegMuxer:
                 if written <= 0:
                     return
                 view = view[written:]
+
+    def _queue_video_time(
+        self, frame_mono: float, pts_interval_s: float | None
+    ) -> None:
+        try:
+            self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
+        except queue.Full:
             try:
+                self._video_time_queue.get_nowait()
                 self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
-            except queue.Full:
-                try:
-                    self._video_time_queue.get_nowait()
-                    self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
-                except queue.Empty:
-                    pass
+            except queue.Empty:
+                pass

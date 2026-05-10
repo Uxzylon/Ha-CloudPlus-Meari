@@ -24,7 +24,15 @@ from ..const import (
     IOT_CODE_VIDEO_ENCRYPTION,
     PTZ_DIRECTIONS,
 )
-from ..p2p_streamer import P2PStreamer, parse_quality_profiles
+from ..p2p_streamer import (
+    ADAPTIVE_STREAM_ID,
+    P2PStreamer,
+    auto_quality_profile,
+    parse_quality_profiles,
+    safe_quality_profile,
+    stream_id_for_quality,
+    supports_adaptive_stream,
+)
 from ..p2p_streamer.codecs import detect_codec
 from .iot import iot_value, normalize_iot_values, parse_capabilities, supports_feature
 from .motion import MotionEventListener
@@ -36,14 +44,22 @@ _LOGGER = logging.getLogger(__name__)
 IDLE_ADVERTISED_FPS = 15.0
 IDLE_REFRESH_INTERVAL = 1.0
 IDLE_NO_CLIENT_SLEEP = 1.0
+IDLE_FRAME_RETRY_INITIAL_S = 20.0
+IDLE_FRAME_RETRY_MAX_S = 180.0
 BATTERY_POLL_INTERVAL = 300.0
 STATUS_POLL_INTERVAL = 300.0
-LIVE_VIDEO_STALL_RESTART_S = 4.0
+LIVE_VIDEO_STALL_RESTART_S = 12.0
 LIVE_STARTUP_STALL_RESTART_S = 25.0
+LIVE_VIDEO_DEFAULT_INTERVAL = 1.0 / 15.0
 LIVE_VIDEO_MIN_INTERVAL = 1.0 / 30.0
-LIVE_VIDEO_MAX_INTERVAL = 5.0
-LIVE_VIDEO_INTERVAL_ALPHA = 0.30
-LIVE_VIDEO_INTERVAL_RESET_S = 1.0
+LIVE_VIDEO_MAX_INTERVAL = 0.25
+LIVE_VIDEO_INTERVAL_ALPHA = 0.25
+LIVE_VIDEO_INTERVAL_RESET_S = 0.75
+LIVE_VIDEO_OUTLIER_FACTOR = 3.0
+LIVE_ADAPTIVE_IPC_MUX_HOLD_S = 8.0
+LIVE_ADAPTIVE_IPC_MUX_QUIET_S = 2.5
+LIVE_P2P_VIDEO_GAP_S = 1.0
+LIVE_WAKE_KEEPALIVE_S = 20.0
 
 
 class CloudEdgeMeariCoordinator:
@@ -131,6 +147,10 @@ class CloudEdgeMeariCoordinator:
         self._last_video_time = 0.0
         self._last_mux_video_mono = 0.0
         self._last_mux_video_interval_s = 0.0
+        self._last_p2p_video_gap_time = 0.0
+        self._live_mux_ready = False
+        self._live_first_video_time = 0.0
+        self._keep_live_mux_on_restart = False
         self._p2p_video_frames = 0
         self._live_deadline = 0.0
         self._idle_video_frame: bytes | None = None
@@ -592,7 +612,8 @@ class CloudEdgeMeariCoordinator:
 
         last_battery_poll = time.monotonic()
         last_status_poll = time.monotonic()
-        next_grab_retry = time.monotonic() + 30.0
+        idle_retry_s = IDLE_FRAME_RETRY_INITIAL_S
+        next_grab_retry = time.monotonic() + idle_retry_s
         while self._running:
             now = time.monotonic()
             if now - last_battery_poll >= BATTERY_POLL_INTERVAL:
@@ -608,8 +629,19 @@ class CloudEdgeMeariCoordinator:
                 and now >= next_grab_retry
             ):
                 self._send_wake()
-                self._run_initial_frame_grab()
-                next_grab_retry = time.monotonic() + 60.0
+                if self._run_initial_frame_grab():
+                    idle_retry_s = IDLE_FRAME_RETRY_INITIAL_S
+                else:
+                    _LOGGER.warning(
+                        "Idle frame unavailable for %s; retrying in %.0fs",
+                        self._sn_num,
+                        idle_retry_s,
+                    )
+                    idle_retry_s = min(
+                        IDLE_FRAME_RETRY_MAX_S,
+                        idle_retry_s * 1.5,
+                    )
+                next_grab_retry = time.monotonic() + idle_retry_s
 
             self._consume_wake_event()
             if self._motion_detected and self._motion_wake_enabled:
@@ -659,7 +691,7 @@ class CloudEdgeMeariCoordinator:
             if not worker.is_alive() and self._stream_thread is worker:
                 self._stream_thread = None
 
-    def _run_initial_frame_grab(self) -> None:
+    def _run_initial_frame_grab(self) -> bool:
         self._set_camera_awake(True)
         self._idle_frame_ready.clear()
         self._start_streamer_once(grab_only=True)
@@ -667,17 +699,27 @@ class CloudEdgeMeariCoordinator:
         while self._running and time.monotonic() < deadline:
             if self._idle_frame_ready.wait(timeout=0.2):
                 break
+        got_frame = self._idle_frame_ready.is_set()
         self._stop_streamer(join_timeout=4)
         self._set_camera_awake(False)
+        return got_frame
 
     def _run_live_until_deadline(self) -> None:
         self._set_camera_awake(True)
+        next_wake_keepalive = time.monotonic() + LIVE_WAKE_KEEPALIVE_S
         while self._running and time.monotonic() < self._live_deadline:
             now = time.monotonic()
             self._consume_wake_event()
-            if not self._stream_thread or not self._stream_thread.is_alive():
+            if self._is_snap and now >= next_wake_keepalive:
+                self._send_wake()
+                next_wake_keepalive = now + LIVE_WAKE_KEEPALIVE_S
+            worker = self._stream_thread
+            if worker is None or not worker.is_alive():
+                keep_mux = worker is not None or self._keep_live_mux_on_restart
                 self._stream_thread = None
-                self._muxer.stop()
+                self._keep_live_mux_on_restart = False
+                if not keep_mux:
+                    self._muxer.stop()
                 self._start_streamer_once()
             elif self._stream_video_stale(now):
                 self._restart_stale_stream(now, context="live")
@@ -690,6 +732,7 @@ class CloudEdgeMeariCoordinator:
                 continue
             worker.join(timeout=0.5)
             if not worker.is_alive() and self._stream_thread is worker:
+                self._keep_live_mux_on_restart = True
                 self._stream_thread = None
                 time.sleep(0.5)
 
@@ -825,8 +868,8 @@ class CloudEdgeMeariCoordinator:
             reason,
         )
         self._note_stale_stream_restart()
+        self._keep_live_mux_on_restart = True
         self._stop_streamer(join_timeout=2)
-        self._muxer.reset_live_timing()
         self._reset_live_mux_timing()
 
     def _note_stale_stream_restart(self) -> None:
@@ -839,18 +882,25 @@ class CloudEdgeMeariCoordinator:
     def _next_live_video_interval(self, now: float) -> float | None:
         last = self._last_mux_video_mono
         self._last_mux_video_mono = now
+        if self._video_codec == "hevc":
+            return None
         if last <= 0.0:
             return None
 
+        previous = self._last_mux_video_interval_s
+        fallback = previous if previous > 0.0 else LIVE_VIDEO_DEFAULT_INTERVAL
+        raw_interval = max(LIVE_VIDEO_MIN_INTERVAL, now - last)
+        if raw_interval >= LIVE_VIDEO_INTERVAL_RESET_S:
+            return fallback
+        if previous > 0.0 and raw_interval > max(
+            LIVE_VIDEO_MAX_INTERVAL, previous * LIVE_VIDEO_OUTLIER_FACTOR
+        ):
+            return fallback
+
         interval = max(
             LIVE_VIDEO_MIN_INTERVAL,
-            min(LIVE_VIDEO_MAX_INTERVAL, now - last),
+            min(LIVE_VIDEO_MAX_INTERVAL, raw_interval),
         )
-        if interval >= LIVE_VIDEO_INTERVAL_RESET_S:
-            self._last_mux_video_interval_s = 0.0
-            return interval
-
-        previous = self._last_mux_video_interval_s
         smoothed = interval
         if previous > 0.0:
             smoothed = (
@@ -869,7 +919,11 @@ class CloudEdgeMeariCoordinator:
         current = (
             self._adaptive_vvp_quality
             if self._adaptive_vvp_quality is not None
-            else profiles[-1]
+            else (
+                auto_quality_profile(self._device)
+                if supports_adaptive_stream(self._device)
+                else safe_quality_profile(self._device)
+            )
         )
         lower = [quality for quality in profiles if quality < current]
         if not lower:
@@ -973,6 +1027,9 @@ class CloudEdgeMeariCoordinator:
         self._stream_started_at = time.monotonic()
         self._stream_started_keyframe = False
         self._reset_live_mux_timing()
+        self._last_p2p_video_gap_time = self._stream_started_at
+        self._live_mux_ready = False
+        self._live_first_video_time = 0.0
 
         def stream_allowed() -> bool:
             return (
@@ -983,9 +1040,21 @@ class CloudEdgeMeariCoordinator:
             if not stream_allowed():
                 return
             now = time.monotonic()
+            previous_video_time = self._last_p2p_video_time
             self._last_p2p_video_time = now
             self._last_video_time = now
             self._p2p_video_frames += 1
+            if self._live_first_video_time <= 0.0:
+                self._live_first_video_time = now
+                self._last_p2p_video_gap_time = now
+            if (
+                previous_video_time >= self._stream_started_at
+                and now - previous_video_time >= LIVE_P2P_VIDEO_GAP_S
+            ):
+                self._last_p2p_video_gap_time = now
+                if not self._live_mux_ready:
+                    self._muxer.reset_live_timing()
+                    self._reset_live_mux_timing()
             detected = detect_codec(payload, default=self._video_codec)
             if detected != self._video_codec:
                 self._video_codec = detected
@@ -1005,6 +1074,8 @@ class CloudEdgeMeariCoordinator:
             payload = self._with_codec_params(self._video_codec, payload)
             if is_keyframe:
                 self._remember_idle_frame(self._video_codec, payload)
+            if self._hold_startup_mux(now):
+                return
             self._muxer.start(
                 self._video_codec,
                 advertised_fps=self._video_mux_target_fps,
@@ -1038,6 +1109,26 @@ class CloudEdgeMeariCoordinator:
 
         self._stream_thread = threading.Thread(target=_worker, daemon=True)
         self._stream_thread.start()
+
+    def _hold_startup_mux(self, now: float) -> bool:
+        if self._live_mux_ready:
+            return False
+        if not self._stream_uses_adaptive_id():
+            self._live_mux_ready = True
+            return False
+        first_video_time = self._live_first_video_time or self._stream_started_at
+        if now - first_video_time < LIVE_ADAPTIVE_IPC_MUX_HOLD_S:
+            return True
+        if now - self._last_p2p_video_gap_time < LIVE_ADAPTIVE_IPC_MUX_QUIET_S:
+            return True
+        self._live_mux_ready = True
+        return False
+
+    def _stream_uses_adaptive_id(self) -> bool:
+        return (
+            stream_id_for_quality(self._device, self._stream_quality())
+            == ADAPTIVE_STREAM_ID
+        )
 
     def _count_recent_gap_events(self, *, severity: str, within_s: float) -> int:
         _ = severity
@@ -1154,7 +1245,10 @@ class CloudEdgeMeariCoordinator:
         _ = max_frames
         if not seed:
             seed = self._stream_server.bootstrap_snapshot()
-        return (bool(seed), "validated-idr" if seed else "seed-empty")
+        strong = bool(seed) and bool(
+            self._stream_server.bootstrap_state().get("strong", False)
+        )
+        return (strong, "idr-with-params" if strong else "seed-not-strong")
 
     def get_gap_skip_events_snapshot(self) -> list[dict[str, Any]]:
         return []
@@ -1175,8 +1269,9 @@ class CloudEdgeMeariCoordinator:
             self._stream_idr_seed = self._stream_server.bootstrap_snapshot()
             self._stream_idr_seed_generation = seed_generation
         seed_valid = bool(bootstrap.get("ready", False))
+        seed_strong = seed_valid and bool(bootstrap.get("strong", False))
         backlog_frame_target = 60 if self._video_codec == "hevc" else 45
-        backlog_ready = seed_valid and self._p2p_video_frames > backlog_frame_target
+        backlog_ready = seed_strong and self._p2p_video_frames > backlog_frame_target
         startup_safe = video_age_s < 1.0 and backlog_ready
         required_generation = max(1, int(self._startup_safe_min_seed_generation))
         return {
@@ -1191,9 +1286,13 @@ class CloudEdgeMeariCoordinator:
                 )
             ),
             "seed_valid": seed_valid,
-            "seed_strong": seed_valid,
+            "seed_strong": seed_strong,
             "seed_video_bytes": int(bootstrap.get("bytes", 0) or 0),
-            "seed_strength_reason": "validated-idr" if seed_valid else "seed-empty",
+            "seed_strength_reason": (
+                "idr-with-params"
+                if seed_strong
+                else "seed-awaiting-params" if seed_valid else "seed-empty"
+            ),
             "seed_mono": 0.0,
             "seed_generation": seed_generation,
             "required_seed_generation": required_generation,

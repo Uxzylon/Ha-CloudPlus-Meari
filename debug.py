@@ -816,7 +816,9 @@ async def _await_hevc_clean_startup_seed(
         frames_since_seed = int(last_state.get("frames_since_seed", 0) or 0)
         preferred_join_mode = str(last_state.get("preferred_join_mode", "") or "")
         # strict path currently marks decode-probed frames as clean+decoded
-        decode_probed = "decoded" in reason or "validated" in reason
+        decode_probed = (
+            "decoded" in reason or "validated" in reason or "params" in reason
+        )
         if startup_safe and seed_strong and decode_probed and frames_since_seed >= 3:
             probe_fn = getattr(coord, "_probe_bootstrap_seed_decode", None)
             seed_bytes = bytes(getattr(coord, "_stream_idr_seed", b""))
@@ -949,15 +951,19 @@ async def _await_adaptive_player_launch_gate(
             + (0.6 if severe_active else 0.0),
         )
         launch_budget_s = max(
-            2.8 if codec == "h264" else 3.8,
+            4.5 if codec == "h264" else 3.8,
             min(
-                7.0 if codec == "h264" else 9.5,
+                8.0 if codec == "h264" else 9.5,
                 1.0 + stable_quiet_s + (0.12 * fast_frames) + wait_penalty_s,
             ),
         )
         waited_s = now_mono - gate_started_mono
         stale_source_s = max(1.4, min(3.1, 0.11 * fast_frames + 0.55))
-        decode_probed = "decoded" in seed_reason or "validated" in seed_reason
+        decode_probed = (
+            "decoded" in seed_reason
+            or "validated" in seed_reason
+            or "params" in seed_reason
+        )
 
         last_state.update(
             {
@@ -1010,6 +1016,8 @@ async def _await_adaptive_player_launch_gate(
             and frames_since_gate >= max(8, fast_frames - 2)
             and stable_for_s >= max(0.8, fast_quiet_s)
             and video_age_s < 0.7
+            and seed_strong
+            and seed_generation >= required_generation
             and recent_severe <= 1
             and not severe_active
         ):
@@ -1759,7 +1767,7 @@ def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
         visual_issues.append(
             f"stats-freeze:{float(result['player_stats_max_gap_s']):.2f}s"
         )
-    if float(result.get("player_silent_showinfo_max_gap_s", 0.0) or 0.0) > 1.0:
+    if float(result.get("player_silent_showinfo_max_gap_s", 0.0) or 0.0) > 1.2:
         visual_issues.append(
             f"showinfo-silence:{float(result['player_silent_showinfo_max_gap_s']):.2f}s"
         )
@@ -2427,7 +2435,9 @@ def _muxer_audio_snapshot(coord: Any) -> dict[str, Any]:
         return {}
 
 
-def _print_compact_metrics(title: str, metrics: dict[str, Any], keys: list[str]) -> None:
+def _print_compact_metrics(
+    title: str, metrics: dict[str, Any], keys: list[str]
+) -> None:
     if not metrics:
         return
     print(f"  {title}:")
@@ -3245,7 +3255,7 @@ async def cmd_stream(args) -> int:
             gate_ready, gate_state = await _await_adaptive_player_launch_gate(
                 coord,
                 start_frames=start_frames,
-                timeout=11.0 if active_codec == "hevc" else 8.0,
+                timeout=11.0 if active_codec == "hevc" else 14.0,
             )
             logging.getLogger(__name__).info(
                 "Player launch gate %s after %.2fs (reason=%s, preferred=%s, backlog_ready=%s, frames=%s, stable_for=%.2fs, video_age=%.2fs, generation=%s/%s, budget=%.2fs)",
@@ -3645,7 +3655,7 @@ async def cmd_stream(args) -> int:
                     runtime_codec = str(
                         getattr(coord, "_video_codec", "") or ""
                     ).lower()
-                    runtime_stall_timeout = 6 if runtime_codec == "hevc" else 8
+                    runtime_stall_timeout = 10 if runtime_codec == "hevc" else 14
                     if (
                         runtime_codec in {"h264", "hevc"}
                         and not runtime_stall_timeout_logged

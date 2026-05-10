@@ -44,6 +44,24 @@ def best_quality_profile(device: dict[str, Any]) -> int:
     return max(profiles.keys())
 
 
+def safe_quality_profile(device: dict[str, Any]) -> int:
+    """Pick the most compatible explicit profile for non-adaptive auto mode."""
+    profiles = parse_quality_profiles(device)
+    if not profiles:
+        return 0
+    return min(profiles.keys())
+
+
+def auto_quality_profile(device: dict[str, Any]) -> int:
+    """Pick a conservative non-adaptive default profile."""
+    profiles = sorted(parse_quality_profiles(device))
+    if not profiles:
+        return 0
+    if len(profiles) >= 3:
+        return profiles[-2]
+    return profiles[-1]
+
+
 def supports_adaptive_stream(device: dict[str, Any]) -> bool:
     """Return true when the SDK exposes stream id 105 (Auto)."""
     try:
@@ -60,9 +78,11 @@ def stream_id_for_quality(device: dict[str, Any], quality: int | None) -> int:
     """Map our profile id to the VVP stream id used by the Meari SDK."""
     profiles = parse_quality_profiles(device)
     if quality is None:
-        if supports_adaptive_stream(device):
-            return ADAPTIVE_STREAM_ID
-        quality = best_quality_profile(device)
+        quality = (
+            auto_quality_profile(device)
+            if supports_adaptive_stream(device)
+            else safe_quality_profile(device)
+        )
 
     stream_id = int(quality)
     if stream_id >= BPS2_STREAM_ID_BASE:
