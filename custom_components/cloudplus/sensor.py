@@ -159,7 +159,10 @@ class CloudEdgeMeariChargeStatusSensor(SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self._coordinator.available and self._coordinator.battery_percent is not None
+        return (
+            self._coordinator.available
+            and self._coordinator.battery_percent is not None
+        )
 
     @property
     def native_value(self) -> str | None:

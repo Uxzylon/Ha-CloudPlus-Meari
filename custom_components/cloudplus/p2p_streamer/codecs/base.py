@@ -15,7 +15,10 @@ class GapRecoveryPolicy:
     full_skip_after_s: float = 5.0
 
     def max_gaps(self, gap_backlog: int, stall_time_s: float) -> int | None:
-        if gap_backlog > self.full_skip_backlog or stall_time_s > self.full_skip_after_s:
+        if (
+            gap_backlog > self.full_skip_backlog
+            or stall_time_s > self.full_skip_after_s
+        ):
             return None
         return 2
 
