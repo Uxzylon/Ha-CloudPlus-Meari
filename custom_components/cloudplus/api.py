@@ -626,6 +626,28 @@ class MeariApiClient:
         )
         return resp.get("iot", {})
 
+    def get_device_iot_values(
+        self,
+        sn_num: str,
+        codes: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Fetch selected IoT values for a device via OpenAPI."""
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "get", "name": "iot", "iot": list(codes)},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "get",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
+        return resp.get("iot", {})
+
     def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
         """Set a single IoT config value on the device via OpenAPI."""
         dev_uuid = format_sn(sn_num)

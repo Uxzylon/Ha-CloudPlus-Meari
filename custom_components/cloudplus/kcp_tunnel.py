@@ -37,14 +37,18 @@ KCP_CMD_ACK = 82  # 0x52 - acknowledgment
 KCP_CMD_WASK = 83  # 0x53 - window probe request
 KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
-KCP_MSS = 1176  # 0x498 - max segment size
-KCP_WND = 1024  # Matches the Android SDK; daylight keyframes can exceed 512 segments.
+KCP_MSS = 1176  # Outbound control payloads are tiny; keep plenty of UDP headroom.
+KCP_WND = 1024  # Matches the official app's advertised receive window.
+KCP_ACK_BATCH_SEGMENTS = 16
+KCP_ACK_FLUSH_INTERVAL_S = 0.01
 
 # IVA frame constants
 IVA_MAGIC = b"\xff\x01"
 IVA_FRAME_SIZE = 20
 IVA_TYPE_HANDSHAKE = 0x7012
 IVA_TYPE_DATA = 0x7010
+VVP_FRAME_MAGIC = b"\x00\x00\x01"
+VVP_FRAME_TYPES = {0xF9, 0xFA, 0xFC, 0xFD, 0xFE}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +100,16 @@ def parse_iva_frame(data):
         return None
     payload = data[IVA_FRAME_SIZE : IVA_FRAME_SIZE + data_len] if data_len > 0 else b""
     return type_marker, session_id1, session_id2, payload
+
+
+def _starts_complete_message(data: bytes) -> bool:
+    if data.startswith(IVA_MAGIC):
+        return True
+    return (
+        len(data) >= 4
+        and data.startswith(VVP_FRAME_MAGIC)
+        and data[3] in VVP_FRAME_TYPES
+    )
 
 
 def build_kcp_segment(cmd, sn=0, una=0, wnd=KCP_WND, ts=0, frg=0, data=b""):
@@ -198,7 +212,7 @@ class KcpTunnel:
         self.ts_base = int(time.time() * 1000) & 0xFFFFFFFF
         self.handshake_done = False
 
-        # Session IDs - consistent across all frames in this session
+        # Local defaults retained for callers that need explicit IVA ids.
         self.session_id1 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
         self.session_id2 = int.from_bytes(os.urandom(4), "little") & 0x0FFFFFFF
 
@@ -227,6 +241,7 @@ class KcpTunnel:
 
         # Deferred ACK queue: list of (sn, ts) to send in batch
         self.pending_acks = []
+        self._last_ack_flush_at = time.monotonic()
         self.last_rx_sn = -1
         self.last_rx_ts = 0
 
@@ -241,12 +256,12 @@ class KcpTunnel:
 
     def send_handshake(self):
         """Send IVA handshake frame wrapped in KCP PUSH segment."""
-        frame = build_iva_handshake(self.session_id1, self.session_id2)
+        frame = build_iva_handshake()
         self.send_data(frame)
 
     def wrap_iva(self, data):
-        """Wrap data in IVA data frame with session IDs."""
-        return build_iva_data_frame(data, self.session_id1, self.session_id2)
+        """Wrap data in an IVA data frame like the official app."""
+        return build_iva_data_frame(data)
 
     def send_data(self, data):
         """Send data through KCP. Handles fragmentation if needed."""
@@ -312,6 +327,15 @@ class KcpTunnel:
             return self.recv_queue.pop(0)
         return None
 
+    def ack_flush_due(self) -> bool:
+        """Return true when pending ACKs should be sent immediately."""
+        if len(self.pending_acks) >= KCP_ACK_BATCH_SEGMENTS:
+            return True
+        return (
+            bool(self.pending_acks)
+            and time.monotonic() - self._last_ack_flush_at >= KCP_ACK_FLUSH_INTERVAL_S
+        )
+
     def flush_acks(self):
         """Send all pending ACKs as compound KCP packet(s).
 
@@ -321,6 +345,7 @@ class KcpTunnel:
         """
         if not self.pending_acks:
             return
+        self._last_ack_flush_at = time.monotonic()
 
         # Deduplicate: keep last ts per sn
         by_sn = {}
@@ -335,9 +360,11 @@ class KcpTunnel:
         # Gap skip at 2s is the safety net for persistent losses.
         una = max(self.next_recv_sn, 0)
 
-        # Build compound ACK packet(s), splitting at ~1200 bytes to stay
-        # under typical MTU (each ACK segment is 24 bytes → ~50 per packet)
+        # Stay near an MTU-sized ACK compound like the SDK's 10 ms KCP flush.
+        # This keeps the sender moving without flooding the uplink with tiny
+        # ACK datagrams during high-bitrate bursts.
         buf = bytearray()
+        count = 0
         for sn in sorted(by_sn):
             buf += build_kcp_segment(
                 cmd=KCP_CMD_ACK,
@@ -346,9 +373,11 @@ class KcpTunnel:
                 wnd=self._wnd(),
                 ts=by_sn[sn],
             )
-            if len(buf) >= 1200:
+            count += 1
+            if count >= KCP_ACK_BATCH_SEGMENTS:
                 self.send_func(bytes(buf))
                 buf.clear()
+                count = 0
         if buf:
             self.send_func(bytes(buf))
 
@@ -439,7 +468,7 @@ class KcpTunnel:
                 new_sn = -1
                 for candidate in above:
                     _, candidate_data = self.recv_buf[candidate]
-                    if candidate_data.startswith(IVA_MAGIC):
+                    if _starts_complete_message(candidate_data):
                         new_sn = candidate
                         break
                     del self.recv_buf[candidate]
