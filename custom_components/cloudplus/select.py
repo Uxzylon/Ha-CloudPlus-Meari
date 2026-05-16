@@ -226,7 +226,7 @@ class CloudEdgeMeariStreamHostSelect(SelectEntity):
 # Stream quality profile selector
 # ---------------------------------------------------------------------------
 
-_AUTO_LABEL = "Auto (highest)"
+_AUTO_LABEL = "AUTO"
 
 
 class CloudEdgeMeariStreamQualitySelect(SelectEntity):
@@ -251,7 +251,9 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
         self._unsub_update: Any = None
         # Build option list from device capabilities
         self._profiles = coordinator.quality_profiles  # {int: str}
-        self._label_to_id: dict[str, int | None] = {_AUTO_LABEL: None}
+        self._label_to_id: dict[str, int | None] = {}
+        if coordinator.supports_auto_quality:
+            self._label_to_id[_AUTO_LABEL] = None
         for pid, label in sorted(self._profiles.items()):
             self._label_to_id[label] = pid
         self._attr_options = list(self._label_to_id.keys())
@@ -277,7 +279,9 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
     def current_option(self) -> str:
         quality = self._coordinator.vvp_quality
         if quality is None:
-            return _AUTO_LABEL
+            if self._profiles:
+                return self._profiles[max(self._profiles)]
+            return None
         return self._profiles.get(quality, _AUTO_LABEL)
 
     async def async_select_option(self, option: str) -> None:

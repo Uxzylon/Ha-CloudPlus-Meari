@@ -7,8 +7,10 @@ from .mpegts import (
     PMT_PID,
     TS_PACKET_SIZE,
     VIDEO_PID,
+    codec_from_pmt_packet,
     packet_pid,
 )
+from ..p2p_streamer.codecs import CodecName, nal_types, spec_for
 
 MAX_BOOTSTRAP_BYTES = 32 * 1024 * 1024
 
@@ -27,10 +29,12 @@ class StreamBootstrap:
         self._buf = bytearray()
         self._pending_group = bytearray()
         self._pending_has_idr = False
+        self._pending_nal_types: set[int] = set()
         self._pending_probe_tail = b""
         self._generation = 0
         self._frames_since_seed = 0
-        self._codec = "hevc"
+        self._codec = CodecName.HEVC
+        self._seed_strong = False
 
     def snapshot(self) -> bytes:
         if self._seed and self._pending_group:
@@ -53,6 +57,7 @@ class StreamBootstrap:
             "frames_since_seed": self._frames_since_seed,
             "collecting": bool(self._pending_group),
             "pending_has_idr": self._pending_has_idr,
+            "strong": self._seed_strong,
         }
 
     def update(self, data: bytes) -> None:
@@ -70,7 +75,7 @@ class StreamBootstrap:
                 self._pat_packet = packet
             elif pid == PMT_PID:
                 self._pmt_packet = packet
-                codec = self._codec_from_pmt(packet)
+                codec = codec_from_pmt_packet(packet)
                 if codec:
                     self._codec = codec
 
@@ -78,6 +83,7 @@ class StreamBootstrap:
                 self._finish_pending_group()
                 self._pending_group = bytearray()
                 self._pending_has_idr = False
+                self._pending_nal_types.clear()
                 self._pending_probe_tail = b""
 
             if self._pending_group:
@@ -94,7 +100,7 @@ class StreamBootstrap:
         if not self._pending_group:
             return
 
-        if self._pending_has_idr:
+        if self._pending_has_idr and self._pending_has_codec_params():
             self._buf = bytearray()
             if self._pat_packet:
                 self._buf.extend(self._pat_packet)
@@ -103,6 +109,7 @@ class StreamBootstrap:
             self._buf.extend(self._pending_group)
             self._generation += 1
             self._frames_since_seed = 0
+            self._seed_strong = True
             self._publish_seed()
         elif self._seed:
             self._append_to_seed(self._pending_group)
@@ -113,6 +120,7 @@ class StreamBootstrap:
         if len(self._buf) > self._max_bytes:
             self._seed = b""
             self._buf.clear()
+            self._seed_strong = False
             return
         self._publish_seed()
 
@@ -121,39 +129,19 @@ class StreamBootstrap:
             self._seed = bytes(self._buf)
 
     def _scan_video_packet(self, packet: bytes) -> None:
-        if self._pending_has_idr:
-            return
         payload = self._video_payload(packet)
         if not payload:
             return
         probe = self._pending_probe_tail + payload
-        if self._contains_idr(probe):
-            self._pending_has_idr = True
-        self._pending_probe_tail = probe[-8:]
+        spec = spec_for(self._codec)
+        for nal_type in nal_types(self._codec, probe):
+            self._pending_nal_types.add(nal_type)
+            if nal_type in spec.keyframe_nal_types:
+                self._pending_has_idr = True
+        self._pending_probe_tail = probe[-64:]
 
-    @staticmethod
-    def _codec_from_pmt(packet: bytes) -> str | None:
-        payload = StreamBootstrap._payload(packet)
-        if not payload:
-            return None
-        pointer = payload[0]
-        off = 1 + pointer
-        if off + 12 > len(payload) or payload[off] != 0x02:
-            return None
-        section_length = ((payload[off + 1] & 0x0F) << 8) | payload[off + 2]
-        end = min(len(payload), off + 3 + section_length - 4)
-        pos = off + 12 + (((payload[off + 10] & 0x0F) << 8) | payload[off + 11])
-        while pos + 5 <= end:
-            stream_type = payload[pos]
-            elementary_pid = ((payload[pos + 1] & 0x1F) << 8) | payload[pos + 2]
-            es_info_len = ((payload[pos + 3] & 0x0F) << 8) | payload[pos + 4]
-            if elementary_pid == VIDEO_PID:
-                if stream_type == 0x1B:
-                    return "h264"
-                if stream_type == 0x24:
-                    return "hevc"
-            pos += 5 + es_info_len
-        return None
+    def _pending_has_codec_params(self) -> bool:
+        return spec_for(self._codec).param_nal_types.issubset(self._pending_nal_types)
 
     @staticmethod
     def _video_payload(packet: bytes) -> bytes:
@@ -175,29 +163,3 @@ class StreamBootstrap:
         if off >= TS_PACKET_SIZE:
             return b""
         return packet[off:TS_PACKET_SIZE]
-
-    def _contains_idr(self, data: bytes) -> bool:
-        i = 0
-        while i + 5 < len(data):
-            if data[i] != 0 or data[i + 1] != 0:
-                i += 1
-                continue
-            if data[i + 2] == 1:
-                nal_start = i + 3
-            elif data[i + 2] == 0 and data[i + 3] == 1:
-                nal_start = i + 4
-            else:
-                i += 1
-                continue
-            if nal_start + 1 >= len(data):
-                return False
-
-            if self._codec == "h264" and data[nal_start] & 0x1F == 5:
-                return True
-
-            hevc_type = (data[nal_start] >> 1) & 0x3F
-            tid_plus1 = data[nal_start + 1] & 0x07
-            if self._codec == "hevc" and tid_plus1 and hevc_type in {19, 20}:
-                return True
-            i = nal_start + 1
-        return False

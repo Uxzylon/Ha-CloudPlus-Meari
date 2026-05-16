@@ -1,9 +1,10 @@
-"""Stream frame decryption, parsing, and HEVC/H.264 NAL-unit utilities."""
+"""Stream frame decryption and camera frame parsing."""
 
 from __future__ import annotations
 
 import struct
 import threading
+from dataclasses import dataclass
 
 from Crypto.Cipher import DES3
 
@@ -22,6 +23,44 @@ from .protocol import (
 MAX_FRAME_DATA_BYTES = 8 * 1024 * 1024
 VIDEO_ENCRYPTED_HEADER_BYTES = 0x80
 _TLS = threading.local()
+
+
+@dataclass(frozen=True)
+class StreamFrame:
+    frame_type: int
+    header_size: int
+    payload: bytes
+    timestamp_ms: int | None = None
+    sequence: int | None = None
+
+
+class FrameSequenceTracker:
+    """Drop duplicate/backward VVP video frames and honor keyframe gates."""
+
+    def __init__(self) -> None:
+        self._last: int | None = None
+        self._await_keyframe = False
+
+    def reset(self) -> None:
+        self._last = None
+        self._await_keyframe = False
+
+    def require_keyframe(self) -> None:
+        self._await_keyframe = True
+
+    def should_drop(self, sequence: int | None, *, recovery: bool) -> bool:
+        if recovery:
+            self._last = sequence
+            self._await_keyframe = False
+            return False
+        if sequence is None:
+            return self._await_keyframe
+        if self._last is not None:
+            delta = (sequence - self._last) & 0xFFFFFFFF
+            if delta == 0 or delta > 0x80000000:
+                return True
+        self._last = sequence
+        return self._await_keyframe
 
 
 def _stream_cipher():
@@ -149,33 +188,38 @@ def parse_stream_frame(data: bytes):
     if frame_type == STREAM_TYPE_IFRAME:
         if len(data) < 0x3C:
             return None
+        sequence = struct.unpack_from("<I", data, 0x10)[0]
+        timestamp_ms = struct.unpack_from("<I", data, 0x30)[0]
         data_len = struct.unpack_from("<I", data, 0x38)[0]
         if data_len > 0 and len(data) < 0x3C + data_len:
             return None
         payload = data[0x3C : 0x3C + data_len] if data_len > 0 else data[0x3C:]
-        return (frame_type, 0x3C, payload)
+        return StreamFrame(frame_type, 0x3C, payload, timestamp_ms, sequence)
     elif frame_type == STREAM_TYPE_PFRAME:
         if len(data) < 0x34:
             return None
+        sequence = struct.unpack_from("<I", data, 0x08)[0]
+        timestamp_ms = struct.unpack_from("<I", data, 0x28)[0]
         data_len = struct.unpack_from("<I", data, 0x30)[0]
         if data_len > 0 and len(data) < 0x34 + data_len:
             return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
-        return (frame_type, 0x34, payload)
+        return StreamFrame(frame_type, 0x34, payload, timestamp_ms, sequence)
     elif frame_type == STREAM_TYPE_AUDIO:
         if len(data) < 0x34:
             return None
+        timestamp_ms = struct.unpack_from("<I", data, 0x28)[0]
         data_len = struct.unpack_from("<I", data, 0x30)[0]
         if data_len > 0 and len(data) < 0x34 + data_len:
             return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
-        return (frame_type, 0x34, payload)
+        return StreamFrame(frame_type, 0x34, payload, timestamp_ms)
     elif frame_type == STREAM_TYPE_INFO:
         if len(data) < 8:
             return None
         data_len = struct.unpack_from("<H", data, 6)[0]
         payload = data[8 : 8 + data_len] if data_len > 0 else data[8:]
-        return (frame_type, 8, payload)
+        return StreamFrame(frame_type, 8, payload)
     return None
 
 
@@ -213,91 +257,3 @@ def split_stream_frames(data: bytes) -> list[bytes]:
     if not chunks:
         return [data]
     return chunks
-
-
-# ---------------------------------------------------------------------------
-# HEVC / H.264 NAL-unit utilities
-# ---------------------------------------------------------------------------
-
-
-def _find_annexb_start_code(data: bytes, start: int) -> tuple[int, int]:
-    """Return (index, length) for next Annex-B start code, or (-1, 0)."""
-    n = len(data)
-    i = max(0, start)
-    while i + 3 < n:
-        if data[i] == 0 and data[i + 1] == 0:
-            if data[i + 2] == 1:
-                return (i, 3)
-            if i + 3 < n and data[i + 2] == 0 and data[i + 3] == 1:
-                return (i, 4)
-        i += 1
-    return (-1, 0)
-
-
-def _iter_annexb_nals(data: bytes):
-    """Yield NAL unit payloads from Annex-B byte stream."""
-    pos = 0
-    n = len(data)
-    while True:
-        start, sc_len = _find_annexb_start_code(data, pos)
-        if start < 0:
-            break
-        nal_start = start + sc_len
-        next_start, _ = _find_annexb_start_code(data, nal_start)
-        nal_end = next_start if next_start >= 0 else n
-        if nal_end > nal_start:
-            yield data[nal_start:nal_end]
-        if next_start < 0:
-            break
-        pos = next_start
-
-
-def is_idr_video_frame(
-    frame_type: int, payload: bytes, require_param_sets: bool = True
-) -> bool:
-    """Best-effort IDR detection for H.264/H.265 Annex-B payloads.
-
-    Some camera streams label intra frames as I-frame without guaranteeing
-    a true decoder reset point. For gap recovery, only resume on a verified
-    IDR when we can parse NAL units.
-
-    When *require_param_sets* is False the check is relaxed: any frame
-    containing an HEVC IDR VCL (NAL type 19 or 20) is accepted even if
-    VPS/SPS/PPS are absent.  This is appropriate for gap-skip recovery
-    where the coordinator will prepend its cached parameter sets before
-    forwarding the frame to ffmpeg.
-    """
-    if frame_type != STREAM_TYPE_IFRAME:
-        return False
-
-    first_sc, _ = _find_annexb_start_code(payload, 0)
-    if first_sc < 0 or first_sc > 32:
-        return False
-
-    saw_vps = False
-    saw_sps = False
-    saw_pps = False
-    saw_idr = False
-
-    for nal in _iter_annexb_nals(payload):
-        if not nal:
-            continue
-        if len(nal) >= 2 and (nal[1] & 0x07) != 0:
-            hevc_type = (nal[0] >> 1) & 0x3F
-            if hevc_type == 32:
-                saw_vps = True
-            elif hevc_type == 33:
-                saw_sps = True
-            elif hevc_type == 34:
-                saw_pps = True
-            elif hevc_type in (19, 20):
-                saw_idr = True
-            continue
-
-        h264_type = nal[0] & 0x1F
-        if h264_type == 5:
-            return True
-
-    if not require_param_sets:
-        return saw_idr
-    return saw_idr and (saw_vps or saw_sps or saw_pps)

@@ -405,7 +405,7 @@ class MeariApiClient:
             result_code = str(data.get("resultCode", ""))
             if result_code == "1001":
                 if idx > 1:
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "Login succeeded after password apostrophe normalization for account %s",
                         self.email,
                     )
@@ -428,7 +428,7 @@ class MeariApiClient:
             # Some accounts/devices intermittently return 1023 for this endpoint
             # even when auth is valid. Keep defaults and continue.
             if result_code == "1023":
-                _LOGGER.warning(
+                _LOGGER.info(
                     "IoT config returned 1023 for %s; continuing with default endpoints",
                     self.email,
                 )
@@ -622,6 +622,28 @@ class MeariApiClient:
                 "params": params_b64,
                 "deviceid": dev_uuid,
                 "target": "server",
+            },
+        )
+        return resp.get("iot", {})
+
+    def get_device_iot_values(
+        self,
+        sn_num: str,
+        codes: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Fetch selected IoT values for a device via OpenAPI."""
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "get", "name": "iot", "iot": list(codes)},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "get",
+                "params": params_b64,
+                "deviceid": dev_uuid,
             },
         )
         return resp.get("iot", {})

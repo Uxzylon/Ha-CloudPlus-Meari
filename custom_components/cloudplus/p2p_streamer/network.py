@@ -130,7 +130,7 @@ def _resolve_signaling_server(
     *,
     platform_domain_hint: str | None = None,
     openapi_server_hint: str | None = None,
-    timeout_s: float = 2.0,
+    timeout_s: float = 0.7,
 ) -> tuple[str, int]:
     candidates = _resolve_signaling_server_candidates(
         platform_domain_hint=platform_domain_hint,
@@ -146,7 +146,7 @@ def _resolve_signaling_server_candidates(
     *,
     platform_domain_hint: str | None = None,
     openapi_server_hint: str | None = None,
-    timeout_s: float = 2.0,
+    timeout_s: float = 0.7,
 ) -> list[tuple[str, int]]:
     global _SIG_CACHE_ENDPOINT, _SIG_CACHE_EXPIRES_AT
 
@@ -188,6 +188,13 @@ def _resolve_signaling_server_candidates(
             domain_candidates.append(candidate)
 
     ip_candidates: list[str] = []
+    # Fresh captures consistently hit the EU msgsvr here; try it before DNS
+    # answers that can include older, slower endpoints.
+    preferred_ips = ["47.91.76.116"]
+    for ip in preferred_ips:
+        if ip not in ip_candidates:
+            ip_candidates.append(ip)
+
     for domain in domain_candidates:
         try:
             infos = socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -204,14 +211,21 @@ def _resolve_signaling_server_candidates(
             ip_candidates.append(fallback_ip)
 
     ordered_candidates: list[tuple[str, int]] = []
+    resolved: tuple[str, int] | None = None
     for ip in ip_candidates:
         for port in ports:
+            candidate = (ip, port)
+            if candidate in ordered_candidates:
+                continue
             if _probe_tcp_connect(ip, port, timeout_s=timeout_s):
-                resolved = (ip, port)
-                if resolved not in ordered_candidates:
-                    ordered_candidates.append(resolved)
+                resolved = candidate
+                ordered_candidates.append(candidate)
+                break
+        if resolved is not None:
+            break
 
-    # If probe is inconclusive, still provide deterministic fallback candidates.
+    # Keep deterministic fallbacks after the first live endpoint without probing
+    # the whole matrix on every fresh process startup.
     for ip in ip_candidates:
         for port in ports:
             candidate = (ip, port)

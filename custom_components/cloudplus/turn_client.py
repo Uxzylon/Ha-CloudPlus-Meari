@@ -183,9 +183,9 @@ class TurnClient:
         self.sock.settimeout(5.0)
         self.sock.bind(("", 0))
         self.local_port = self.sock.getsockname()[1]
-        # Increase receive buffer to handle video data bursts (4MB)
+        # High-detail scenes can arrive as large UDP bursts.
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
         except Exception:
             pass
 

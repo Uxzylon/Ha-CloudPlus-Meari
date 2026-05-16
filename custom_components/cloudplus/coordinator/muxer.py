@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Callable
 
+from ..p2p_streamer.codecs import demuxer_for
+from ..p2p_streamer.codecs.base import CodecName
 from .audio_encoder import AacAudioEncoder
 from .mpegts import (
     AAC_FRAME_TICKS,
@@ -29,6 +31,11 @@ from .mpegts import (
 
 _LOGGER = logging.getLogger(__name__)
 
+VIDEO_QUEUE_FRAMES = 120
+AUDIO_START_BUFFER_FRAMES = 4
+AUDIO_EMIT_LIMIT = 3
+AUDIO_MAX_LEAD_TICKS = AAC_FRAME_TICKS * 3
+
 
 class FfmpegMuxer:
     """Mux raw H.264/HEVC video and camera mu-law audio without blocking P2P."""
@@ -40,53 +47,72 @@ class FfmpegMuxer:
         self._stderr_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
         self._video_queue: queue.Queue[tuple[bytes, float, float | None]] = queue.Queue(
-            maxsize=120
+            maxsize=VIDEO_QUEUE_FRAMES
         )
         self._video_time_queue: queue.Queue[tuple[float, float | None]] = queue.Queue(
-            maxsize=120
+            maxsize=VIDEO_QUEUE_FRAMES
         )
         self._audio = AacAudioEncoder()
         self._running = False
-        self._codec = "hevc"
+        self._codec = CodecName.HEVC
         self._input_fps = 15.0
+        self._pacing_buffer_s = 0.0
         self._audio_cc = 0
         self._next_audio_pts = -AAC_FRAME_TICKS
         self._audio_started = False
         self._last_video_pts: int | None = None
-        self._last_input_frame_mono = 0.0
         self._video_pts_step_ticks = 6000
         self._current_video_pts = 0
         self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._audio_emit_frames = 0
+        self._audio_silence_frames = 0
+        self._last_audio_emit_mono = 0.0
+        self._audio_emit_max_gap_s = 0.0
+        self._video_pacer_started = False
+        self._next_video_write_mono = 0.0
 
     @property
-    def codec(self) -> str:
+    def codec(self) -> CodecName:
         return self._codec
 
-    def start(self, codec: str, advertised_fps: float = 15.0) -> None:
-        codec_name = (codec or "hevc").lower()
-        if codec_name == "h265":
-            codec_name = "hevc"
-        if codec_name not in {"h264", "hevc"}:
-            codec_name = "hevc"
+    def start(
+        self,
+        codec: CodecName | str,
+        advertised_fps: float = 15.0,
+        pacing_buffer_s: float = 0.0,
+    ) -> None:
+        codec_name = CodecName.parse(codec)
         input_fps = max(1.0, min(60.0, float(advertised_fps or 15.0)))
+        pacing_buffer = max(0.0, min(3.0, float(pacing_buffer_s or 0.0)))
         if (
             self._proc is not None
             and self._codec == codec_name
             and abs(self._input_fps - input_fps) < 0.01
+            and abs(self._pacing_buffer_s - pacing_buffer) < 0.01
         ):
             return
 
         self.stop()
         self._codec = codec_name
         self._input_fps = input_fps
+        self._pacing_buffer_s = pacing_buffer
         self._audio_cc = 0
         self._next_audio_pts = -AAC_FRAME_TICKS
         self._audio_started = False
         self._last_video_pts = None
-        self._last_input_frame_mono = 0.0
         self._video_pts_step_ticks = int(90000 / input_fps)
         self._current_video_pts = 0
         self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._audio_emit_frames = 0
+        self._audio_silence_frames = 0
+        self._last_audio_emit_mono = 0.0
+        self._audio_emit_max_gap_s = 0.0
+        self._video_pacer_started = False
+        self._next_video_write_mono = 0.0
         self._drain_video_queue()
 
         fps_text = f"{input_fps:.3f}"
@@ -98,8 +124,6 @@ class FfmpegMuxer:
             "warning",
             "-fflags",
             "+genpts+igndts+discardcorrupt",
-            "-flags",
-            "low_delay",
             "-probesize",
             "32768",
             "-analyzeduration",
@@ -109,7 +133,7 @@ class FfmpegMuxer:
             "-thread_queue_size",
             "128",
             "-f",
-            codec_name,
+            demuxer_for(codec_name),
             "-i",
             "pipe:0",
             "-map",
@@ -179,6 +203,18 @@ class FfmpegMuxer:
                     pass
         self._drain_video_queue()
 
+    def reset_live_timing(self) -> None:
+        self._drain_video_queue()
+        self._audio.clear()
+        self._audio_started = False
+        self._audio_gate_open = False
+        self._audio_clock_started_at = 0.0
+        self._audio_clock_base_pts = 0
+        self._last_audio_emit_mono = 0.0
+        self._video_pts_step_ticks = int(90000 / self._input_fps)
+        self._video_pacer_started = False
+        self._next_video_write_mono = 0.0
+
     def write_video(
         self,
         payload: bytes,
@@ -245,11 +281,9 @@ class FfmpegMuxer:
                     break
                 pending.extend(data)
 
-            out, saw_video = self._consume_ts(pending)
-            if out:
-                audio = (
-                    self._due_audio_ts() if saw_video and self._audio_gate_open else b""
-                )
+            out, _saw_video = self._consume_ts(pending)
+            audio = self._due_audio_ts() if self._audio_gate_open else b""
+            if out or audio:
                 if audio:
                     out.extend(audio)
                 self._on_ts(bytes(out))
@@ -294,9 +328,8 @@ class FfmpegMuxer:
 
     def _next_video_pts(self) -> int:
         try:
-            frame_mono, pts_interval_s = self._video_time_queue.get_nowait()
+            _frame_mono, pts_interval_s = self._video_time_queue.get_nowait()
         except queue.Empty:
-            frame_mono = time.monotonic()
             pts_interval_s = None
         if pts_interval_s is not None:
             step = max(1, int(max(0.001, pts_interval_s) * 90000))
@@ -304,7 +337,6 @@ class FfmpegMuxer:
             self._current_video_pts = pts
             return pts
 
-        self._observe_video_cadence(frame_mono)
         pts = (
             0
             if self._last_video_pts is None
@@ -313,33 +345,20 @@ class FfmpegMuxer:
         self._current_video_pts = pts
         return pts
 
-    def _observe_video_cadence(self, frame_mono: float) -> None:
-        prev = self._last_input_frame_mono
-        self._last_input_frame_mono = frame_mono
-        if prev <= 0.0:
-            return
-        dt = frame_mono - prev
-        if dt < 0.02 or dt > 0.35:
-            return
-        target = max(1500, min(18000, int(dt * 90000)))
-        self._video_pts_step_ticks = int(
-            (self._video_pts_step_ticks * 0.82) + (target * 0.18)
-        )
-
     def _due_audio_ts(self) -> bytes:
-        if self._last_video_pts is None:
+        target_pts = self._audio_target_pts()
+        if target_pts is None:
             return b""
-        if not self._audio_started:
-            self._next_audio_pts = self._last_video_pts - AAC_FRAME_TICKS
-            self._audio_started = True
         out = bytearray()
         emitted = 0
-        while (
-            self._next_audio_pts + AAC_FRAME_TICKS <= self._last_video_pts
-            and emitted < 32
-        ):
+        while self._next_audio_pts + AAC_FRAME_TICKS <= target_pts:
+            if emitted >= AUDIO_EMIT_LIMIT:
+                break
+            frame = self._audio.pop_frame()
+            if frame is None:
+                frame = AAC_SILENCE_FRAME
+                self._audio_silence_frames += 1
             self._next_audio_pts += AAC_FRAME_TICKS
-            frame = self._audio.pop_frame() or AAC_SILENCE_FRAME
             audio_ts, self._audio_cc = make_audio_ts(
                 frame,
                 self._next_audio_pts,
@@ -347,7 +366,47 @@ class FfmpegMuxer:
             )
             out.extend(audio_ts)
             emitted += 1
+        if emitted:
+            self._note_audio_emit(emitted)
         return bytes(out)
+
+    def _audio_target_pts(self) -> int | None:
+        if self._last_video_pts is None:
+            return None
+        now = time.monotonic()
+        if not self._audio_started:
+            if (
+                not self._audio.silence_allowed()
+                and self._audio.frame_count() < AUDIO_START_BUFFER_FRAMES
+            ):
+                return None
+            self._next_audio_pts = self._last_video_pts - AAC_FRAME_TICKS
+            self._audio_clock_started_at = now
+            self._audio_clock_base_pts = self._last_video_pts
+            self._audio_started = True
+        elapsed_ticks = int(max(0.0, now - self._audio_clock_started_at) * 90000)
+        wall_target = self._audio_clock_base_pts + elapsed_ticks
+        max_lead_target = self._last_video_pts + AUDIO_MAX_LEAD_TICKS
+        return min(max(wall_target, self._last_video_pts), max_lead_target)
+
+    def _note_audio_emit(self, frames: int) -> None:
+        now = time.monotonic()
+        if self._last_audio_emit_mono > 0:
+            self._audio_emit_max_gap_s = max(
+                self._audio_emit_max_gap_s,
+                now - self._last_audio_emit_mono,
+            )
+        self._last_audio_emit_mono = now
+        self._audio_emit_frames += frames
+
+    def audio_debug_snapshot(self) -> dict[str, int | float]:
+        return {
+            "mux_audio_frames": self._audio_emit_frames,
+            "mux_audio_silence_frames": self._audio_silence_frames,
+            "mux_audio_max_emit_gap_s": round(self._audio_emit_max_gap_s, 3),
+            "mux_audio_next_pts": self._next_audio_pts,
+            "mux_video_last_pts": self._last_video_pts or 0,
+        }
 
     def _read_stderr(self, proc: subprocess.Popen) -> None:
         if proc.stderr is None:
@@ -371,11 +430,18 @@ class FfmpegMuxer:
             return
 
         while self._running and self._proc is proc and proc.poll() is None:
+            if not self._video_pacer_started:
+                self._prime_video_pacer()
             try:
                 payload, frame_mono, pts_interval_s = self._video_queue.get(timeout=0.5)
             except queue.Empty:
+                if self._pacing_buffer_s > 0.0:
+                    self._video_pacer_started = False
+                    self._next_video_write_mono = 0.0
                 continue
 
+            self._pace_video_write(pts_interval_s)
+            self._queue_video_time(frame_mono, pts_interval_s)
             view = memoryview(payload)
             while view and self._running and self._proc is proc and proc.poll() is None:
                 try:
@@ -391,11 +457,49 @@ class FfmpegMuxer:
                 if written <= 0:
                     return
                 view = view[written:]
+
+    def _prime_video_pacer(self) -> None:
+        self._video_pacer_started = True
+        if self._pacing_buffer_s <= 0.0:
+            return
+        target = max(1, int(self._input_fps * self._pacing_buffer_s))
+        deadline = time.monotonic() + min(1.6, self._pacing_buffer_s + 0.4)
+        while self._running and self._video_queue.qsize() < target:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        self._next_video_write_mono = time.monotonic()
+
+    def _pace_video_write(self, pts_interval_s: float | None) -> None:
+        if self._pacing_buffer_s <= 0.0:
+            return
+        target = max(1, int(self._input_fps * self._pacing_buffer_s))
+        if self._video_queue.qsize() > target:
+            self._next_video_write_mono = time.monotonic()
+            return
+        interval_s = (
+            max(0.001, float(pts_interval_s))
+            if pts_interval_s is not None
+            else 1.0 / self._input_fps
+        )
+        now = time.monotonic()
+        if self._next_video_write_mono <= 0.0:
+            self._next_video_write_mono = now + interval_s
+            return
+        delay = self._next_video_write_mono - now
+        if delay > 0.0:
+            time.sleep(min(delay, 0.5))
+            now = time.monotonic()
+        self._next_video_write_mono = max(now, self._next_video_write_mono) + interval_s
+
+    def _queue_video_time(
+        self, frame_mono: float, pts_interval_s: float | None
+    ) -> None:
+        try:
+            self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
+        except queue.Full:
             try:
+                self._video_time_queue.get_nowait()
                 self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
-            except queue.Full:
-                try:
-                    self._video_time_queue.get_nowait()
-                    self._video_time_queue.put_nowait((frame_mono, pts_interval_s))
-                except queue.Empty:
-                    pass
+            except queue.Empty:
+                pass
