@@ -24,6 +24,7 @@ Encryption: 3DES ECB with key "__#!HIRCloud5.0!#__" (padded to 24 bytes with zer
 import base64
 import json
 import socket
+import threading
 import time
 import uuid as uuid_mod
 
@@ -162,6 +163,10 @@ class MsgSvrClient:
         self.uuid = None
         self.token = None
         self.webrtcsvr = None  # {ip, port, domain, tag}
+        self.heartbeat_interval_s = 30.0
+        self._registered_at = time.monotonic()
+        self._register_extra: dict[str, str | int] = {}
+        self._io_lock = threading.Lock()
 
     def connect(self):
         """TCP connect to signaling server."""
@@ -170,18 +175,23 @@ class MsgSvrClient:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.sock.connect((self.server_host, self.server_port))
 
-    def _send(self, method, cmd, payload_json):
+    def _send_unlocked(self, method, cmd, payload_json):
         """Build and send a frame."""
         if self.sock is None:
             raise ConnectionError("Signaling socket is closed")
         frame = _build_frame(NODE_CLIENT, method, cmd, payload_json)
         self.sock.sendall(frame)
 
+    def _send(self, method, cmd, payload_json):
+        with self._io_lock:
+            self._send_unlocked(method, cmd, payload_json)
+
     def _recv(self):
         """Receive one frame."""
         if self.sock is None:
             raise ConnectionError("Signaling socket is closed")
-        return _recv_frame(self.sock)
+        with self._io_lock:
+            return _recv_frame(self.sock)
 
     def _send_webrtc(self, inner_json, to_webrtcsvr=True):
         """Send a webrtcsvr-routed message with base64-encoded content."""
@@ -223,14 +233,21 @@ class MsgSvrClient:
 
     # ---- High-level protocol steps ----
 
-    def register(self, client_id, brand="77", app_ver="5.9.2a16", country="FR"):
+    def register(
+        self,
+        client_id,
+        brand="77",
+        app_ver="5.9.2a16",
+        country="FR",
+        sdk_ver: int = 15259,
+    ):
         """Step 1: Register with signaling server. Returns uuid and token."""
         msg = json.dumps(
             {
                 "action": "register",
                 "transport": "tcp",
                 "type": "binary",
-                "ver": 15340,
+                "ver": int(sdk_ver),
                 "runtime": 0,
                 "extra_params": {
                     "brand": brand,
@@ -251,7 +268,50 @@ class MsgSvrClient:
 
         self.uuid = data["uuid"]
         self.token = data["token"]
+        self.heartbeat_interval_s = float(data.get("hb") or 30.0)
+        self._registered_at = time.monotonic()
+        self._register_extra = {
+            "brand": str(brand),
+            "clientid": str(client_id),
+            "v": str(app_ver),
+            "c": str(country),
+            "sdk_ver": int(sdk_ver),
+        }
         return data
+
+    def send_heartbeat(self, *, read_response: bool = False):
+        """Keep the msgsvr session alive during long-running P2P streams."""
+        if not self.uuid or not self.token:
+            return
+        msg = json.dumps(
+            {
+                "uuid": self.uuid,
+                "token": self.token,
+                "ver": int(self._register_extra.get("sdk_ver", 15259)),
+                "runtime": int(max(0.0, time.monotonic() - self._registered_at)),
+                "extra_params": {
+                    key: value
+                    for key, value in self._register_extra.items()
+                    if key != "sdk_ver"
+                },
+            },
+            separators=(",", ":"),
+        )
+        with self._io_lock:
+            self._send_unlocked(METHOD_DIRECT, CMD_HEARTBEAT, msg)
+            if not read_response or self.sock is None:
+                return
+            old_timeout = self.sock.gettimeout()
+            try:
+                self.sock.settimeout(1.0)
+                _recv_frame(self.sock)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.sock.settimeout(old_timeout)
+                except Exception:
+                    pass
 
     def webrtc_hello(self):
         """Step 2: Hello to webrtcsvr, get tag for later SDP exchange."""
@@ -267,6 +327,16 @@ class MsgSvrClient:
 
     def webrtc_hello_full(self):
         """Step 2: Hello to webrtcsvr, capturing full response."""
+        inner, from_info = self._send_webrtc_hello()
+        self.webrtcsvr = {
+            "ip": from_info.get("ip"),
+            "port": from_info.get("port"),
+            "domain": from_info.get("domain", "webrtcsvr.eu"),
+            "tag": inner.get("tag", ""),
+        }
+        return inner
+
+    def _send_webrtc_hello(self):
         content = base64.b64encode(b'{"cmd":"hello"}').decode()
         msg = json.dumps(
             {
@@ -286,17 +356,9 @@ class MsgSvrClient:
         resp = self._recv()
         data = resp["json"]
 
-        # Extract webrtcsvr info from outer "from" field
         from_info = data.get("from", {})
         inner = json.loads(base64.b64decode(data.get("content", "")))
-
-        self.webrtcsvr = {
-            "ip": from_info.get("ip"),
-            "port": from_info.get("port"),
-            "domain": from_info.get("domain", "webrtcsvr.eu"),
-            "tag": inner.get("tag", ""),
-        }
-        return inner
+        return inner, from_info
 
     def query_device_status(self, device_uuid):
         """Step 3: Query device status. Returns status dict."""
