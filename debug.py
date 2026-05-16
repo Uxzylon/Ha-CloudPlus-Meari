@@ -317,6 +317,30 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
     return modules
 
 
+def _codec_module() -> Any:
+    mod = sys.modules.get("custom_components.cloudplus.p2p_streamer.codecs")
+    if mod is None:
+        _bootstrap_integration_modules()
+        mod = sys.modules["custom_components.cloudplus.p2p_streamer.codecs"]
+    return mod
+
+
+def _codec_name(value: Any) -> Any:
+    return _codec_module().CodecName.parse(value)
+
+
+def _coord_codec(coord: Any) -> Any:
+    return _codec_name(getattr(coord, "_video_codec", None))
+
+
+def _codec_text(codec: Any) -> str:
+    return str(getattr(codec, "value", codec)).lower()
+
+
+def _codec_policy(codec: Any) -> Any:
+    return _codec_module().runtime_policy_for(codec)
+
+
 def _select_device(
     devices: list[dict[str, Any]], device_id: int | None, sn: str | None
 ) -> dict[str, Any]:
@@ -366,6 +390,7 @@ class StreamHealthTracker:
         self._stalls_over_3s: int = 0
         self._recovered_stalls: int = 0
         self._max_gap_s: float = 0.0
+        self._stall_events: list[dict[str, float | int]] = []
 
     @staticmethod
     def _default_frame_ts_reader(coord: Any) -> float:
@@ -386,6 +411,24 @@ class StreamHealthTracker:
             self._stalls_over_1s += 1
         if stall_s >= 3.0:
             self._stalls_over_3s += 1
+
+    def _append_stall_event(
+        self,
+        *,
+        start_ts: float,
+        end_ts: float,
+        frames: int,
+    ) -> None:
+        if self._first_frame_ts <= 0.0 or len(self._stall_events) >= 32:
+            return
+        self._stall_events.append(
+            {
+                "start_s": max(0.0, start_ts - self._first_frame_ts),
+                "end_s": max(0.0, end_ts - self._first_frame_ts),
+                "duration_s": max(0.0, end_ts - start_ts),
+                "video_frames": frames,
+            }
+        )
 
     def tick(self, coord: Any) -> None:
         now_mono = time.monotonic()
@@ -408,11 +451,20 @@ class StreamHealthTracker:
             if self._stall_start_ts is not None:
                 stall_s = max(0.0, frame_ts - self._stall_start_ts)
                 self._record_stall(stall_s)
+                self._append_stall_event(
+                    start_ts=self._stall_start_ts,
+                    end_ts=frame_ts,
+                    frames=frame_count,
+                )
                 if self._emit_logs:
+                    start_s = max(0.0, self._stall_start_ts - self._first_frame_ts)
+                    end_s = max(0.0, frame_ts - self._first_frame_ts)
                     self._logger.warning(
-                        "%s stall recovered after %.2fs (video_frames=%d)",
+                        "%s stall recovered after %.2fs at +%.2f..+%.2fs (video_frames=%d)",
                         self._label,
                         stall_s,
+                        start_s,
+                        end_s,
                         frame_count,
                     )
                 self._stall_start_ts = None
@@ -432,15 +484,17 @@ class StreamHealthTracker:
             or (now_mono - self._last_stall_log_mono) >= 2.0
         ):
             if self._emit_logs:
+                start_s = max(0.0, self._stall_start_ts - self._first_frame_ts)
                 self._logger.warning(
-                    "%s stall ongoing %.2fs (video_frames=%d)",
+                    "%s stall ongoing %.2fs from +%.2fs (video_frames=%d)",
                     self._label,
                     stall_s,
+                    start_s,
                     frame_count,
                 )
             self._last_stall_log_mono = now_mono
 
-    def summary(self, coord: Any) -> dict[str, float | int]:
+    def summary(self, coord: Any) -> dict[str, Any]:
         now_mono = time.monotonic()
         frame_count = int(self._frame_count_reader(coord))
         last_frame_ts = float(self._frame_ts_reader(coord))
@@ -468,6 +522,7 @@ class StreamHealthTracker:
             "recovered_stalls_over_1s": self._stalls_over_1s,
             "recovered_stalls_over_3s": self._stalls_over_3s,
             "unresolved_stall_s": unresolved_stall_s,
+            "stall_events": list(self._stall_events),
         }
 
 
@@ -662,7 +717,7 @@ async def _await_preferred_player_bootstrap(
     """Wait until the coordinator can offer ffplay its preferred fresh join mode."""
     deadline = time.monotonic() + timeout
     last_state = _get_startup_bootstrap_state(coord)
-    codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+    policy = _codec_policy(_coord_codec(coord))
 
     while time.monotonic() < deadline:
         last_state = _get_startup_bootstrap_state(coord)
@@ -672,20 +727,12 @@ async def _await_preferred_player_bootstrap(
         frames_since_seed = int(last_state.get("frames_since_seed", 0) or 0)
         video_age_s = float(last_state.get("video_age_s", 999.0) or 999.0)
         if preferred == "ready-backlog" and backlog_ready:
-            if codec == "h264":
-                if (
-                    block_reason in {"ready", "seed-not-fresh"}
-                    and frames_since_seed >= 2
-                    and video_age_s < 0.8
-                ):
-                    return True, last_state
-            else:
-                if block_reason in {
-                    "ready",
-                    "seed-not-fresh",
-                    "seed-awaiting-follow-frames",
-                }:
-                    return True, last_state
+            if (
+                block_reason in policy.preferred_backlog_reasons
+                and frames_since_seed >= policy.preferred_backlog_min_frames
+                and video_age_s < policy.preferred_backlog_max_video_age_s
+            ):
+                return True, last_state
         await asyncio.sleep(0.1)
 
     return False, last_state
@@ -762,12 +809,14 @@ async def _await_player_launch_session_stable(
                 )
             except Exception:
                 severe_recent = 0
-        codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+        codec = _coord_codec(coord)
+        codec_text = _codec_text(codec)
+        policy = _codec_policy(codec)
         quality = getattr(coord, "vvp_quality", None)
         if callable(quality):
             quality = quality()
         if (
-            codec == "hevc"
+            policy.clean_startup_seed
             and preferred_join_mode == "ready-backlog"
             and backlog_ready
             and seed_generation >= required_generation
@@ -777,7 +826,7 @@ async def _await_player_launch_session_stable(
         ):
             last_state["session_generation"] = generation
             last_state["quality"] = quality
-            last_state["codec"] = codec
+            last_state["codec"] = codec_text
             return True, last_state
         if (
             (now_mono - stable_since) >= quiet_s
@@ -787,7 +836,7 @@ async def _await_player_launch_session_stable(
         ):
             last_state["session_generation"] = generation
             last_state["quality"] = quality
-            last_state["codec"] = codec
+            last_state["codec"] = codec_text
             return True, last_state
         await asyncio.sleep(0.1)
 
@@ -796,15 +845,15 @@ async def _await_player_launch_session_stable(
     if callable(quality):
         quality = quality()
     last_state["quality"] = quality
-    last_state["codec"] = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+    last_state["codec"] = _codec_text(_coord_codec(coord))
     return False, last_state
 
 
-async def _await_hevc_clean_startup_seed(
+async def _await_clean_startup_seed(
     coord: Any,
     timeout: float = 12.0,
 ) -> tuple[bool, dict[str, Any]]:
-    """Wait for a fully clean decode-probed startup seed before HEVC launch."""
+    """Wait for a fully clean decode-probed startup seed before player launch."""
     deadline = time.monotonic() + timeout
     last_state = _get_startup_bootstrap_state(coord)
 
@@ -827,7 +876,7 @@ async def _await_hevc_clean_startup_seed(
                     ok_probe, probe_reason = probe_fn(seed_bytes, max_frames=6)
                 except Exception:
                     ok_probe, probe_reason = False, "seed-probe-exception"
-                last_state["hevc_gate_probe_reason"] = probe_reason
+                last_state["clean_seed_probe_reason"] = probe_reason
                 if ok_probe and preferred_join_mode in {"ready", "ready-backlog"}:
                     return True, last_state
             elif preferred_join_mode in {"ready", "ready-backlog"}:
@@ -872,13 +921,16 @@ async def _await_adaptive_player_launch_gate(
             stable_since_mono = now_mono
 
         last_state = _get_startup_bootstrap_state(coord)
-        codec = str(getattr(coord, "_video_codec", "hevc") or "hevc").lower()
+        codec = _coord_codec(coord)
+        codec_text = _codec_text(codec)
+        policy = _codec_policy(codec)
         target_fps = float(getattr(coord, "_video_mux_target_fps", 15.0) or 15.0)
         target_fps = max(8.0, min(30.0, target_fps))
         frames = int(getattr(coord, "_p2p_video_frames", 0) or 0)
         frames_since_gate = max(0, frames - start_frames)
         video_age_s = float(last_state.get("video_age_s", 999.0) or 999.0)
         preferred_join_mode = str(last_state.get("preferred_join_mode", "") or "")
+        adaptive_stream = bool(last_state.get("adaptive_stream", False))
         backlog_ready = bool(last_state.get("backlog_ready", False))
         backlog_target = max(
             2,
@@ -890,11 +942,10 @@ async def _await_adaptive_player_launch_gate(
         seed_strong = bool(last_state.get("seed_strong", False))
         seed_reason = str(last_state.get("seed_strength_reason", "") or "")
 
-        severe_window_s = 4.2 if codec == "h264" else 5.8
         recent_severe = _count_recent_gap_events(
             coord,
             severity="severe",
-            within_s=severe_window_s,
+            within_s=policy.severe_gap_window_s,
         )
         recent_moderate = _count_recent_gap_events(
             coord,
@@ -922,7 +973,7 @@ async def _await_adaptive_player_launch_gate(
                     round(
                         max(
                             backlog_target * 2,
-                            target_fps * (0.55 if codec == "h264" else 0.75),
+                            target_fps * policy.fast_frames_fps_factor,
                         )
                     ),
                 ),
@@ -936,7 +987,7 @@ async def _await_adaptive_player_launch_gate(
                     round(
                         max(
                             backlog_target * 3,
-                            target_fps * (0.85 if codec == "h264" else 1.05),
+                            target_fps * policy.stable_frames_fps_factor,
                         )
                     ),
                 ),
@@ -951,9 +1002,9 @@ async def _await_adaptive_player_launch_gate(
             + (0.6 if severe_active else 0.0),
         )
         launch_budget_s = max(
-            4.5 if codec == "h264" else 3.8,
+            policy.launch_budget_min_s,
             min(
-                8.0 if codec == "h264" else 9.5,
+                policy.launch_budget_max_s,
                 1.0 + stable_quiet_s + (0.12 * fast_frames) + wait_penalty_s,
             ),
         )
@@ -967,7 +1018,7 @@ async def _await_adaptive_player_launch_gate(
 
         last_state.update(
             {
-                "codec": codec,
+                "codec": codec_text,
                 "session_generation": generation,
                 "launch_gate_started_mono": gate_started_mono,
                 "launch_gate_wait_s": waited_s,
@@ -992,7 +1043,7 @@ async def _await_adaptive_player_launch_gate(
             and backlog_ready
             and seed_generation >= required_generation
             and frames_since_gate >= fast_frames
-            and stable_for_s >= min(fast_quiet_s, 1.25 if codec == "h264" else 1.5)
+            and stable_for_s >= min(fast_quiet_s, policy.fast_quiet_cap_s)
             and video_age_s < 0.9
             and not severe_active
         ):
@@ -1012,7 +1063,8 @@ async def _await_adaptive_player_launch_gate(
             return True, last_state
 
         if (
-            codec == "h264"
+            policy.allow_fast_live_flow
+            and not adaptive_stream
             and frames_since_gate >= max(8, fast_frames - 2)
             and stable_for_s >= max(0.8, fast_quiet_s)
             and video_age_s < 0.7
@@ -1021,16 +1073,17 @@ async def _await_adaptive_player_launch_gate(
             and recent_severe <= 1
             and not severe_active
         ):
-            last_state["launch_gate_reason"] = "h264-live-flow"
+            last_state["launch_gate_reason"] = "fast-live-flow"
             return True, last_state
 
         if video_age_s > stale_source_s and frames_since_gate >= max(
             4, fast_frames // 2
         ):
             last_state["launch_gate_reason"] = "source-stale"
-            return False, last_state
+            if not policy.clean_startup_seed:
+                return False, last_state
 
-        if waited_s >= launch_budget_s:
+        if waited_s >= launch_budget_s and not policy.clean_startup_seed:
             last_state["launch_gate_reason"] = "budget-expired"
             return False, last_state
 
@@ -1417,7 +1470,23 @@ def _percentile(values: list[float], q: float) -> float:
     return float(sorted_vals[idx])
 
 
-def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
+def _mux_av_delta_s(mux_metrics: dict[str, Any] | None) -> float | None:
+    if not mux_metrics:
+        return None
+    try:
+        audio_pts = int(mux_metrics.get("mux_audio_next_pts", 0) or 0)
+        video_pts = int(mux_metrics.get("mux_video_last_pts", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if audio_pts <= 0 or video_pts <= 0:
+        return None
+    return (audio_pts - video_pts) / 90000.0
+
+
+def _summarize_player_visual_state(
+    state: dict[str, Any],
+    mux_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     run_started_mono = float(state.get("run_started_mono", 0.0) or 0.0)
     live_ready_mono = float(state.get("live_ready_mono", 0.0) or 0.0)
@@ -1716,8 +1785,15 @@ def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
     av_samples = [float(v) for v in av_samples_raw if isinstance(v, (int, float))]
     av_abs_max = max((abs(v) for v in av_samples), default=0.0)
     av_large_count = sum(1 for v in av_samples if abs(v) >= 0.20)
+    av_baseline = _percentile(av_samples, 0.5)
+    av_residuals = [v - av_baseline for v in av_samples]
+    av_jitter_abs_max = max((abs(v) for v in av_residuals), default=0.0)
+    av_jitter_large_count = sum(1 for v in av_residuals if abs(v) >= 0.20)
     result["player_av_drift_abs_max_s"] = round(av_abs_max, 3)
     result["player_av_drift_over_200ms_count"] = int(av_large_count)
+    result["player_av_drift_baseline_s"] = round(av_baseline, 3)
+    result["player_av_drift_jitter_abs_max_s"] = round(av_jitter_abs_max, 3)
+    result["player_av_drift_jitter_over_200ms_count"] = int(av_jitter_large_count)
 
     dynamic_render_threshold = max(0.25, min(1.2, render_median * 4.2))
     dynamic_pts_threshold = max(0.12, min(0.8, pts_median * 3.8))
@@ -1840,9 +1916,18 @@ def _summarize_player_visual_state(state: dict[str, Any]) -> dict[str, Any]:
             "visible-pts-stall-excess:"
             f"{steady_visible_pts_stall_excess_s:.2f}s>{visible_stall_budget_excess_s:.2f}s"
         )
-    if av_large_count >= 25 or av_abs_max >= 0.90:
+    mux_av_delta = _mux_av_delta_s(mux_metrics)
+    if mux_av_delta is not None:
+        result["mux_av_delta_s"] = round(mux_av_delta, 3)
+    mux_av_synced = mux_av_delta is not None and abs(mux_av_delta) <= 0.35
+    av_jitter_issue = av_jitter_abs_max >= 0.45 or (
+        av_jitter_abs_max >= 0.35 and av_jitter_large_count >= 25
+    )
+    if av_jitter_issue and not mux_av_synced:
         visual_issues.append(
-            f"audio-sync-instability:max={av_abs_max:.3f}s,count={av_large_count}"
+            "audio-sync-instability:"
+            f"jitter={av_jitter_abs_max:.3f}s,count={av_jitter_large_count},"
+            f"baseline={av_baseline:.3f}s"
         )
     result["player_visual_has_issues"] = bool(visual_issues)
     if visual_issues:
@@ -2124,7 +2209,7 @@ def _print_ts_decode_correlation(
 async def cmd_list(args) -> int:
     mods = _bootstrap_integration_modules()
     MeariApiClient = mods["api"].MeariApiClient
-    parse_quality_profiles = mods["p2p_streamer"].parse_quality_profiles
+    quality_options = mods["p2p_streamer"].quality_options
 
     api = _login_api_with_fallback(MeariApiClient, args)
 
@@ -2136,9 +2221,16 @@ async def cmd_list(args) -> int:
         print(f"Camera devices (snap/ipc/doorbell): {len(api.get_camera_devices())}")
     print("=" * 78)
     for i, dev in enumerate(api.devices.values(), start=1):
-        profiles = parse_quality_profiles(dev)
+        profiles = quality_options(dev)
         profiles_str = (
-            ", ".join(f"{k}={v}" for k, v in sorted(profiles.items()))
+            ", ".join(
+                (
+                    opt.label
+                    if opt.is_auto
+                    else (f"{opt.label}={opt.detail}" if opt.detail else opt.label)
+                )
+                for opt in profiles
+            )
             if profiles
             else "none"
         )
@@ -2154,10 +2246,19 @@ async def cmd_list(args) -> int:
     return 0
 
 
+def _parse_quality_arg(value: str) -> int | None:
+    text = str(value).strip().lower()
+    if text in {"auto", "adaptive"}:
+        return None
+    names = {"sd": 0, "hd": 1, "qhd": 2, "fhd": 2}
+    if text in names:
+        return names[text]
+    return int(text, 0)
+
+
 def _build_stream_player_cmd(
     url: str,
     duration: int = 0,
-    codec: str = "hevc",
 ) -> list[str]:
     """Build ffplay command for visible live playback."""
     if not shutil.which("ffplay"):
@@ -2177,8 +2278,6 @@ def _build_stream_player_cmd(
         "CloudEdge live",
         "-fflags",
         fflags,
-        "-flags",
-        "low_delay",
     ]
     if include_framedrop:
         cmd.extend(["-framedrop"])
@@ -3176,7 +3275,7 @@ async def cmd_stream(args) -> int:
         # Apply quality override from CLI
         quality_arg = getattr(args, "quality", None)
         if quality_arg is not None:
-            coord.set_vvp_quality(quality_arg)
+            coord.set_vvp_quality(_parse_quality_arg(quality_arg))
         adaptive_recovery_for_player = bool(args.wake and args.play)
         setattr(coord, "_p2p_allow_lossy_gap_skip", False)
         setattr(coord, "_p2p_adaptive_lossy_gap_skip", adaptive_recovery_for_player)
@@ -3209,8 +3308,8 @@ async def cmd_stream(args) -> int:
             # In player mode, a first keyframe may appear before a stable live
             # session is established. Keep self-healing enabled by default so
             # playback does not freeze on a static frame.
-            # Keep conservative defaults here. During the active playback loop
-            # we use runtime codec state to shorten HEVC recovery windows.
+            # Keep conservative defaults here. During active playback the
+            # codec policy supplies the recovery window.
             # New daytime signaling paths can take >15s before first stable
             # keyframe; avoid preempting bootstrap too aggressively.
             effective_stall_timeout = 30
@@ -3240,11 +3339,12 @@ async def cmd_stream(args) -> int:
                 live_ready_mono = time.monotonic()
 
         if args.play:
-            active_codec = str(getattr(coord, "_video_codec", "hevc")).lower()
+            active_codec = _coord_codec(coord)
+            active_codec_text = _codec_text(active_codec)
+            active_policy = _codec_policy(active_codec)
             player_cmd = _build_stream_player_cmd(
                 url,
                 duration=0,
-                codec=active_codec,
             )
             start_frames = int(getattr(coord, "_p2p_video_frames", 0))
             if live_ready_mono is None:
@@ -3255,7 +3355,7 @@ async def cmd_stream(args) -> int:
             gate_ready, gate_state = await _await_adaptive_player_launch_gate(
                 coord,
                 start_frames=start_frames,
-                timeout=11.0 if active_codec == "hevc" else 14.0,
+                timeout=active_policy.launch_gate_timeout_s,
             )
             logging.getLogger(__name__).info(
                 "Player launch gate %s after %.2fs (reason=%s, preferred=%s, backlog_ready=%s, frames=%s, stable_for=%.2fs, video_age=%.2fs, generation=%s/%s, budget=%.2fs)",
@@ -3271,14 +3371,14 @@ async def cmd_stream(args) -> int:
                 gate_state.get("required_seed_generation", 0),
                 float(gate_state.get("launch_gate_budget_s", 0.0) or 0.0),
             )
-            if active_codec == "hevc" and gate_ready:
-                need_hevc_cleanup = bool(
+            if active_policy.clean_startup_seed and gate_ready:
+                need_clean_seed = bool(
                     str(gate_state.get("launch_gate_reason", "") or "")
                     == "ready-backlog"
                     and not bool(gate_state.get("seed_decode_probed", False))
                 )
-                if need_hevc_cleanup:
-                    bounded_hevc_wait_s = max(
+                if need_clean_seed:
+                    bounded_seed_wait_s = max(
                         0.9,
                         min(
                             2.4,
@@ -3297,28 +3397,30 @@ async def cmd_stream(args) -> int:
                         ),
                     )
                     logging.getLogger(__name__).info(
-                        "HEVC fast backlog launch is ready but not decode-probed yet; waiting up to %.2fs for a cleaner startup seed",
-                        bounded_hevc_wait_s,
+                        "%s fast backlog launch is ready but not decode-probed yet; waiting up to %.2fs for a cleaner startup seed",
+                        active_codec_text.upper(),
+                        bounded_seed_wait_s,
                     )
-                    hevc_seed_ready, hevc_seed_state = (
-                        await _await_hevc_clean_startup_seed(
+                    clean_seed_ready, clean_seed_state = (
+                        await _await_clean_startup_seed(
                             coord,
-                            timeout=bounded_hevc_wait_s,
+                            timeout=bounded_seed_wait_s,
                         )
                     )
-                    gate_state = {**gate_state, **hevc_seed_state}
-                    if hevc_seed_ready:
+                    gate_state = {**gate_state, **clean_seed_state}
+                    if clean_seed_ready:
                         gate_state["launch_gate_reason"] = "ready-backlog-clean-seed"
                     logging.getLogger(__name__).info(
-                        "HEVC fast backlog cleanup %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
-                        "ready" if hevc_seed_ready else "expired; keeping fast launch",
+                        "%s fast backlog cleanup %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
+                        active_codec_text.upper(),
+                        "ready" if clean_seed_ready else "expired; keeping fast launch",
                         gate_state.get("seed_strength_reason", ""),
-                        gate_state.get("hevc_gate_probe_reason", ""),
+                        gate_state.get("clean_seed_probe_reason", ""),
                         gate_state.get("startup_safe", False),
                         float(gate_state.get("video_age_s", 999.0) or 999.0),
                     )
-            if active_codec == "hevc" and not gate_ready:
-                bounded_hevc_wait_s = max(
+            if active_policy.clean_startup_seed and not gate_ready:
+                bounded_seed_wait_s = max(
                     1.4,
                     min(
                         4.0,
@@ -3338,7 +3440,7 @@ async def cmd_stream(args) -> int:
                         * int(gate_state.get("recent_moderate_gap_count", 0) or 0),
                     ),
                 )
-                try_short_hevc_wait = bool(
+                try_short_clean_seed_wait = bool(
                     float(gate_state.get("video_age_s", 999.0) or 999.0) < 1.2
                     and int(gate_state.get("recent_severe_gap_count", 0) or 0) == 0
                     and (
@@ -3348,30 +3450,33 @@ async def cmd_stream(args) -> int:
                         == "ready-backlog"
                     )
                 )
-                if try_short_hevc_wait:
+                if try_short_clean_seed_wait:
                     logging.getLogger(__name__).info(
-                        "HEVC launch gate missed its fast budget; waiting up to %.2fs more for a cleaner startup seed",
-                        bounded_hevc_wait_s,
+                        "%s launch gate missed its fast budget; waiting up to %.2fs more for a cleaner startup seed",
+                        active_codec_text.upper(),
+                        bounded_seed_wait_s,
                     )
-                    hevc_seed_ready, hevc_seed_state = (
-                        await _await_hevc_clean_startup_seed(
+                    clean_seed_ready, clean_seed_state = (
+                        await _await_clean_startup_seed(
                             coord,
-                            timeout=bounded_hevc_wait_s,
+                            timeout=bounded_seed_wait_s,
                         )
                     )
-                    gate_state = {**gate_state, **hevc_seed_state}
-                    gate_ready = gate_ready or hevc_seed_ready
+                    gate_state = {**gate_state, **clean_seed_state}
+                    gate_ready = gate_ready or clean_seed_ready
                     logging.getLogger(__name__).info(
-                        "HEVC bounded clean-seed wait %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
-                        "ready" if hevc_seed_ready else "expired; launching anyway",
+                        "%s bounded clean-seed wait %s (reason=%s, probe=%s, startup_safe=%s, video_age=%.2fs)",
+                        active_codec_text.upper(),
+                        "ready" if clean_seed_ready else "expired; launching anyway",
                         gate_state.get("seed_strength_reason", ""),
-                        gate_state.get("hevc_gate_probe_reason", ""),
+                        gate_state.get("clean_seed_probe_reason", ""),
                         gate_state.get("startup_safe", False),
                         float(gate_state.get("video_age_s", 999.0) or 999.0),
                     )
                 else:
                     logging.getLogger(__name__).warning(
-                        "HEVC launch gate expired and the source is already too stale or unstable; launching immediately"
+                        "%s launch gate expired and the source is already too stale or unstable; launching immediately",
+                        active_codec_text.upper(),
                     )
             player_visual_state["player_launch_gate_reason"] = str(
                 gate_state.get("launch_gate_reason", "unknown")
@@ -3652,17 +3757,14 @@ async def cmd_stream(args) -> int:
 
             if effective_stall_timeout > 0:
                 if args.play:
-                    runtime_codec = str(
-                        getattr(coord, "_video_codec", "") or ""
-                    ).lower()
-                    runtime_stall_timeout = 10 if runtime_codec == "hevc" else 14
-                    if (
-                        runtime_codec in {"h264", "hevc"}
-                        and not runtime_stall_timeout_logged
-                    ):
+                    runtime_codec = _coord_codec(coord)
+                    runtime_codec_text = _codec_text(runtime_codec)
+                    runtime_policy = _codec_policy(runtime_codec)
+                    runtime_stall_timeout = runtime_policy.runtime_stall_timeout_s
+                    if not runtime_stall_timeout_logged:
                         logging.getLogger(__name__).info(
                             "Runtime %s recovery timeout active: stall_timeout=%ss",
-                            runtime_codec.upper(),
+                            runtime_codec_text.upper(),
                             runtime_stall_timeout,
                         )
                         runtime_stall_timeout_logged = True
@@ -3721,6 +3823,16 @@ async def cmd_stream(args) -> int:
             unresolved = float(source_summary["unresolved_stall_s"])
             if unresolved > 0.0:
                 print(f"unresolved_stall_s: {unresolved:.2f}")
+            source_stalls = source_summary.get("stall_events", []) or []
+            if source_stalls:
+                print("stall_events:")
+                for event in source_stalls[:8]:
+                    print(
+                        "  "
+                        f"+{float(event['start_s']):.2f}s..+{float(event['end_s']):.2f}s "
+                        f"duration={float(event['duration_s']):.2f}s "
+                        f"frames={int(event['video_frames'])}"
+                    )
 
         # --- TS recording analysis ---
         if args.play:
@@ -3728,7 +3840,13 @@ async def cmd_stream(args) -> int:
             run_failed = False
             _t_player = time.time()
             player_metrics = _analyze_player_log(player_log_path, log)
-            player_metrics.update(_summarize_player_visual_state(player_visual_state))
+            mux_audio_metrics = _muxer_audio_snapshot(coord)
+            player_metrics.update(
+                _summarize_player_visual_state(
+                    player_visual_state,
+                    mux_audio_metrics,
+                )
+            )
             player_metrics["player_has_issues"] = bool(
                 player_metrics.get("player_has_issues", False)
                 or player_metrics.get("player_visual_has_issues", False)
@@ -3758,7 +3876,7 @@ async def cmd_stream(args) -> int:
             _print_audio_crackle_diagnostics(
                 raw_audio_monitor.summary(),
                 pcm_metrics,
-                _muxer_audio_snapshot(coord),
+                mux_audio_metrics,
             )
 
             recorder_only_timestamp_discontinuities = False
@@ -4074,11 +4192,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stream.add_argument(
         "--quality",
-        type=int,
         default=None,
         help=(
-            "Quality profile ID from 'list' (0=SD, 2=QHD/FHD). "
-            "Default: Auto, using adaptive stream when supported."
+            "Quality from 'list' (AUTO, SD, HD, QHD, or numeric profile id). "
+            "Default: AUTO when available, otherwise highest quality."
         ),
     )
     p_stream.add_argument(

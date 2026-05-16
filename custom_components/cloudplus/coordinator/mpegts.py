@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import struct
 
+from ..p2p_streamer.codecs import codec_from_mpegts_stream_type, mpegts_stream_type_for
+from ..p2p_streamer.codecs.base import CodecName
+
 TS_PACKET_SIZE = 188
 PAT_PID = 0x0000
 PMT_PID = 0x1000
@@ -16,6 +19,16 @@ AAC_FRAME_TICKS = 5760  # 1024 samples at 16 kHz in 90 kHz clock ticks.
 
 def packet_pid(packet: bytes) -> int:
     return ((packet[1] & 0x1F) << 8) | packet[2]
+
+
+def _payload(packet: bytes) -> bytes:
+    off = 4
+    afc = (packet[3] >> 4) & 0x03
+    if afc & 0x02:
+        off = 5 + packet[4]
+    if off >= TS_PACKET_SIZE:
+        return b""
+    return packet[off:TS_PACKET_SIZE]
 
 
 def packet_pts(packet: bytes) -> int | None:
@@ -113,8 +126,8 @@ def build_pat_packet(cc: int = 0) -> bytes:
     return _psi_packet(PAT_PID, section, cc)
 
 
-def build_pmt_packet(codec: str, cc: int = 0) -> bytes:
-    video_type = 0x1B if codec == "h264" else 0x24
+def build_pmt_packet(codec: CodecName | str, cc: int = 0) -> bytes:
+    video_type = mpegts_stream_type_for(codec)
     section = bytearray(
         [
             0x02,
@@ -143,6 +156,27 @@ def build_pmt_packet(codec: str, cc: int = 0) -> bytes:
     )
     section.extend(_mpegts_crc32(bytes(section)).to_bytes(4, "big"))
     return _psi_packet(PMT_PID, section, cc)
+
+
+def codec_from_pmt_packet(packet: bytes) -> CodecName | None:
+    payload = _payload(packet)
+    if not payload:
+        return None
+    pointer = payload[0]
+    off = 1 + pointer
+    if off + 12 > len(payload) or payload[off] != 0x02:
+        return None
+    section_length = ((payload[off + 1] & 0x0F) << 8) | payload[off + 2]
+    end = min(len(payload), off + 3 + section_length - 4)
+    pos = off + 12 + (((payload[off + 10] & 0x0F) << 8) | payload[off + 11])
+    while pos + 5 <= end:
+        stream_type = payload[pos]
+        elementary_pid = ((payload[pos + 1] & 0x1F) << 8) | payload[pos + 2]
+        es_info_len = ((payload[pos + 3] & 0x0F) << 8) | payload[pos + 4]
+        if elementary_pid == VIDEO_PID:
+            return codec_from_mpegts_stream_type(stream_type)
+        pos += 5 + es_info_len
+    return None
 
 
 def _psi_packet(pid: int, section: bytes, cc: int) -> bytes:

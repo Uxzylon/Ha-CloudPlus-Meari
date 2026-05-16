@@ -9,6 +9,8 @@ from typing import Deque
 
 from .stream_bootstrap import StreamBootstrap
 
+CLIENT_QUEUE_CHUNKS = 4096
+
 
 class StreamServer:
     def __init__(self) -> None:
@@ -91,7 +93,7 @@ class StreamServer:
             except OSError:
                 break
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            queue: Deque[bytes] = collections.deque(maxlen=512)
+            queue: Deque[bytes] = collections.deque(maxlen=CLIENT_QUEUE_CHUNKS)
             event = threading.Event()
             with self._lock:
                 bootstrap = self._bootstrap.snapshot()
