@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 ADAPTIVE_STREAM_ID = 105
 BPS2_STREAM_ID_BASE = 100
+AUTO_QUALITY_LABEL = "AUTO"
+QUALITY_LABELS = {0: "SD", 1: "HD", 2: "QHD"}
+
+
+@dataclass(frozen=True)
+class QualityOption:
+    quality: int | None
+    label: str
+    stream_id: int
+    detail: str = ""
+    is_auto: bool = False
 
 
 def _capability(device: dict[str, Any]) -> dict[str, Any]:
@@ -44,22 +56,9 @@ def best_quality_profile(device: dict[str, Any]) -> int:
     return max(profiles.keys())
 
 
-def safe_quality_profile(device: dict[str, Any]) -> int:
-    """Pick the most compatible explicit profile for non-adaptive auto mode."""
-    profiles = parse_quality_profiles(device)
-    if not profiles:
-        return 0
-    return min(profiles.keys())
-
-
-def auto_quality_profile(device: dict[str, Any]) -> int:
-    """Pick a conservative non-adaptive default profile."""
-    profiles = sorted(parse_quality_profiles(device))
-    if not profiles:
-        return 0
-    if len(profiles) >= 3:
-        return profiles[-2]
-    return profiles[-1]
+def auto_quality_profile(device: dict[str, Any]) -> int | None:
+    """Return the app-style Auto profile marker, or the highest profile."""
+    return None if supports_adaptive_stream(device) else best_quality_profile(device)
 
 
 def supports_adaptive_stream(device: dict[str, Any]) -> bool:
@@ -74,15 +73,57 @@ def supports_adaptive_stream(device: dict[str, Any]) -> bool:
         return False
 
 
+def quality_label(profile_id: int, detail: str = "") -> str:
+    """Return the app-facing quality label for a bps2 profile id."""
+    return QUALITY_LABELS.get(profile_id, detail or f"Profile {profile_id}")
+
+
+def quality_options(device: dict[str, Any]) -> list[QualityOption]:
+    """Return quality options matching the official app's visible choices."""
+    profiles = parse_quality_profiles(device)
+    options: list[QualityOption] = []
+    if supports_adaptive_stream(device):
+        options.append(
+            QualityOption(
+                quality=None,
+                label=AUTO_QUALITY_LABEL,
+                stream_id=ADAPTIVE_STREAM_ID,
+                is_auto=True,
+            )
+        )
+    for profile_id, detail in sorted(profiles.items()):
+        options.append(
+            QualityOption(
+                quality=profile_id,
+                label=quality_label(profile_id, detail),
+                stream_id=BPS2_STREAM_ID_BASE + profile_id,
+                detail=detail,
+            )
+        )
+    return options
+
+
+def quality_profile_labels(device: dict[str, Any]) -> dict[int, str]:
+    """Return explicit quality profile labels keyed by bps2 profile id."""
+    return {
+        opt.quality: opt.label
+        for opt in quality_options(device)
+        if opt.quality is not None
+    }
+
+
+def default_quality_profile(device: dict[str, Any]) -> int | None:
+    """Default to the highest profile."""
+    return best_quality_profile(device)
+
+
 def stream_id_for_quality(device: dict[str, Any], quality: int | None) -> int:
     """Map our profile id to the VVP stream id used by the Meari SDK."""
     profiles = parse_quality_profiles(device)
     if quality is None:
-        quality = (
-            auto_quality_profile(device)
-            if supports_adaptive_stream(device)
-            else safe_quality_profile(device)
-        )
+        if supports_adaptive_stream(device):
+            return ADAPTIVE_STREAM_ID
+        quality = best_quality_profile(device)
 
     stream_id = int(quality)
     if stream_id >= BPS2_STREAM_ID_BASE:
