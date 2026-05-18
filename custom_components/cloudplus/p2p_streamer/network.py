@@ -172,9 +172,9 @@ def _resolve_signaling_server_candidates(
                 if 1 <= p <= 65535 and p not in ports:
                     ports.append(p)
     if not ports:
-        # Observed in fresh CloudEdge capture (2026-04-29): msgsvr on 18849,
-        # with older deployments still using 28974 and some fallbacks on 9253.
-        ports = [18849, 28974, 9253]
+        # Official app captures show msgsvr rotating across the 18839-18849
+        # family, with older deployments still using 28974.
+        ports = [18849, 18847, 18845, 18843, 18839, 28974, 9253]
 
     domain_candidates: list[str] = []
     for candidate in (
@@ -188,9 +188,9 @@ def _resolve_signaling_server_candidates(
             domain_candidates.append(candidate)
 
     ip_candidates: list[str] = []
-    # Fresh captures consistently hit the EU msgsvr here; try it before DNS
-    # answers that can include older, slower endpoints.
-    preferred_ips = ["47.91.76.116"]
+    # Official captures rotate between both Meari msgsvr ranges. Keep them as
+    # observed candidates before broader DNS/fallback expansion.
+    preferred_ips = ["47.91.76.116", "47.254.142.96"]
     for ip in preferred_ips:
         if ip not in ip_candidates:
             ip_candidates.append(ip)
@@ -206,7 +206,7 @@ def _resolve_signaling_server_candidates(
                 ip_candidates.append(ip)
 
     # Keep known historical/current msgsvr IPs as last-resort only.
-    for fallback_ip in ("47.91.76.116", "47.91.73.19", "47.254.142.96"):
+    for fallback_ip in ("47.91.76.116", "47.254.142.96", "47.91.73.19"):
         if fallback_ip not in ip_candidates:
             ip_candidates.append(fallback_ip)
 
@@ -233,14 +233,25 @@ def _resolve_signaling_server_candidates(
                 ordered_candidates.append(candidate)
 
     if ordered_candidates:
-        _SIG_CACHE_ENDPOINT = ordered_candidates[0]
-        _SIG_CACHE_EXPIRES_AT = time.monotonic() + _SIG_CACHE_TTL_S
-        _LOGGER.info(
-            "Resolved signaling candidates=%s (platform_hint=%s, openapi_hint=%s)",
-            ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:6]),
-            _extract_host(platform_domain_hint),
-            _extract_host(openapi_server_hint),
-        )
+        if resolved is None:
+            _SIG_CACHE_ENDPOINT = None
+            _SIG_CACHE_EXPIRES_AT = 0.0
+            _LOGGER.warning(
+                "No signaling TCP probe succeeded; trying fallbacks=%s "
+                "(platform_hint=%s, openapi_hint=%s)",
+                ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:6]),
+                _extract_host(platform_domain_hint),
+                _extract_host(openapi_server_hint),
+            )
+        else:
+            _SIG_CACHE_ENDPOINT = ordered_candidates[0]
+            _SIG_CACHE_EXPIRES_AT = time.monotonic() + _SIG_CACHE_TTL_S
+            _LOGGER.info(
+                "Resolved signaling candidates=%s (platform_hint=%s, openapi_hint=%s)",
+                ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:6]),
+                _extract_host(platform_domain_hint),
+                _extract_host(openapi_server_hint),
+            )
         return ordered_candidates
 
     fallback = ("47.91.73.19", ports[0])

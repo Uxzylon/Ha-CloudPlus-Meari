@@ -168,10 +168,10 @@ class MsgSvrClient:
         self._register_extra: dict[str, str | int] = {}
         self._io_lock = threading.Lock()
 
-    def connect(self):
+    def connect(self, timeout_s=10.0):
         """TCP connect to signaling server."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10.0)
+        self.sock.settimeout(float(timeout_s))
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.sock.connect((self.server_host, self.server_port))
 

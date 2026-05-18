@@ -17,9 +17,15 @@ from .network import (
     _build_ice_response,
     _get_local_ips,
     _is_private_ip,
-    _resolve_signaling_server,
+    _resolve_signaling_server_candidates,
     _send_direct_ice_binding,
     recv_peer_packets,
+)
+from .sdp import (
+    add_candidate_once,
+    collect_trickle_candidates,
+    format_endpoint,
+    parse_sdp_answer,
 )
 from .codecs import (
     CodecName,
@@ -55,101 +61,7 @@ VVP_HEARTBEAT_S = 10.0
 IVA_HEARTBEAT_S = 3.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
 AUTH_FALLBACK_RESULT = (-1, -1)
-
-
-def _parse_sdp_answer(sdp: str) -> tuple[str, str, list[dict[str, Any]]]:
-    camera_ufrag = ""
-    camera_pwd = ""
-    camera_candidates: list[dict[str, Any]] = []
-    camera_sdp_ip = ""
-    camera_sdp_port = 0
-
-    for line in sdp.replace("\\n", "\n").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("a=ice-ufrag:"):
-            camera_ufrag = line.split(":", 1)[1].strip()
-        elif line.startswith("a=ice-pwd:"):
-            camera_pwd = line.split(":", 1)[1].strip()
-        elif line.startswith("c=IN IP4 "):
-            camera_sdp_ip = line.split("c=IN IP4 ", 1)[1].strip()
-        elif line.startswith("m=audio "):
-            parts = line.split()
-            if len(parts) > 1 and parts[1].isdigit():
-                camera_sdp_port = int(parts[1])
-        elif line.startswith("a=candidate:"):
-            parts = line.split()
-            if len(parts) >= 6:
-                camera_candidates.append(
-                    {
-                        "ip": parts[4],
-                        "port": int(parts[5]),
-                        "type": parts[7] if len(parts) > 7 else "relay",
-                    }
-                )
-
-    if not camera_candidates and camera_sdp_ip and camera_sdp_port:
-        camera_candidates.append(
-            {"ip": camera_sdp_ip, "port": camera_sdp_port, "type": "relay"}
-        )
-
-    return camera_ufrag, camera_pwd, camera_candidates
-
-
-def _collect_trickle_candidates(
-    sig: MsgSvrClient, camera_candidates: list[dict[str, Any]]
-) -> None:
-    old_timeout = sig.sock.gettimeout()
-    try:
-        sig.sock.settimeout(0.5)
-        for _ in range(10):
-            try:
-                extra = sig._recv_webrtc_content()
-            except socket.timeout:
-                break
-            except Exception:
-                break
-            if not isinstance(extra, dict):
-                continue
-            sdp = extra.get("sdp", "")
-            if sdp:
-                _, _, extra_candidates = _parse_sdp_answer(sdp)
-                camera_candidates.extend(extra_candidates)
-            candidate = extra.get("candidate")
-            if isinstance(candidate, dict):
-                cip = candidate.get("ip")
-                cport = candidate.get("port")
-                ctype = candidate.get("type", "relay")
-                if cip and cport:
-                    camera_candidates.append(
-                        {"ip": cip, "port": int(cport), "type": ctype}
-                    )
-    finally:
-        sig.sock.settimeout(old_timeout)
-
-
-def _add_candidate_once(
-    candidates: list[dict[str, Any]],
-    candidate: dict[str, Any],
-) -> bool:
-    ip = candidate.get("ip")
-    port = candidate.get("port")
-    if not ip or not port:
-        return False
-    normalized = {
-        "ip": str(ip),
-        "port": int(port),
-        "type": str(candidate.get("type") or "relay"),
-    }
-    for existing in candidates:
-        if (
-            existing.get("ip") == normalized["ip"]
-            and int(existing.get("port", 0)) == normalized["port"]
-        ):
-            return False
-    candidates.append(normalized)
-    return True
+SIGNALING_CONNECT_TIMEOUT_S = 5.0
 
 
 def _unwrap_iva_payload(data: bytes) -> bytes:
@@ -200,6 +112,8 @@ class P2PStreamer:
         self._video_count = 0
         self._source_video_count = 0
         self._total_bytes = 0
+        self._audio_count = 0
+        self._audio_bytes = 0
         self._video_decrypt: bool | None = None
         self._audio_decrypt: bool | None = None
         self._video_sequence = FrameSequenceTracker()
@@ -207,6 +121,9 @@ class P2PStreamer:
         self._active_sig: MsgSvrClient | None = None
         self._active_sock: socket.socket | None = None
         self._active_stop_live: Callable[[], None] | None = None
+        self._last_signaling_endpoint: tuple[str, int] | None = None
+        self._last_turn_endpoint: tuple[str, int] | None = None
+        self._last_candidate_count = 0
 
     def request_stop(self) -> None:
         self._running = False
@@ -235,6 +152,24 @@ class P2PStreamer:
     @property
     def video_count(self) -> int:
         return self._video_count
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "codec": self._video_codec.value,
+            "stream_id": self._vvp_stream_id,
+            "stream_flag": self._vvp_stream_flag,
+            "video_frames": self._video_count,
+            "source_video_frames": self._source_video_count,
+            "video_bytes": self._total_bytes,
+            "audio_frames": self._audio_count,
+            "audio_bytes": self._audio_bytes,
+            "video_decrypted": self._video_decrypt,
+            "audio_decrypted": self._audio_decrypt,
+            "signaling_endpoint": format_endpoint(self._last_signaling_endpoint),
+            "turn_endpoint": format_endpoint(self._last_turn_endpoint),
+            "candidate_count": self._last_candidate_count,
+        }
 
     def _auth_attempts(self) -> list[tuple[str, bool]]:
         host_key = str(self._host_key or "")
@@ -342,6 +277,8 @@ class P2PStreamer:
                 if self.on_video:
                     self.on_video(media_data, parsed.timestamp_ms)
             elif frame_type == STREAM_TYPE_AUDIO:
+                self._audio_count += 1
+                self._audio_bytes += len(media_data)
                 if self.on_audio:
                     self.on_audio(media_data)
         return saw_keyframe
@@ -353,10 +290,14 @@ class P2PStreamer:
                 self._video_count = 0
                 self._source_video_count = 0
                 self._total_bytes = 0
+                self._audio_count = 0
+                self._audio_bytes = 0
                 self._video_decrypt = None
                 self._audio_decrypt = None
                 self._video_sequence.reset()
                 self._video_codec = CodecName.HEVC
+                self._last_turn_endpoint = None
+                self._last_candidate_count = 0
                 result = self._run_session_once(
                     host_key,
                     allow_auth_fallback=uses_video_password,
@@ -381,35 +322,72 @@ class P2PStreamer:
         *,
         allow_auth_fallback: bool = False,
     ) -> tuple[int, int]:
-        sig = None
-        try:
-            sig_ip, sig_port = _resolve_signaling_server(
-                openapi_server_hint=getattr(self._api, "openapi_server", None),
-            )
-            sig = MsgSvrClient(sig_ip, sig_port)
-            self._active_sig = sig
-            sig.connect()
-            return self._do_stream(
-                sig,
-                host_key,
-                allow_auth_fallback=allow_auth_fallback,
-            )
-        except Exception as err:
-            if not self._running:
-                _LOGGER.debug("P2P session interrupted during stop: %s", err)
-            else:
-                _LOGGER.exception("P2P session failed")
-            return (self._video_count, self._total_bytes)
-        finally:
-            self._active_sig = None
-            self._active_sock = None
-            self._active_stop_live = None
-            if sig is not None:
-                try:
-                    sig.send_logout(self._device_uuid)
-                except Exception:
-                    pass
-                sig.close()
+        candidates = _resolve_signaling_server_candidates(
+            openapi_server_hint=getattr(self._api, "openapi_server", None),
+        )
+        last_error: Exception | None = None
+        for sig_ip, sig_port in candidates:
+            sig = None
+            self._last_signaling_endpoint = (sig_ip, sig_port)
+            try:
+                _LOGGER.info(
+                    "Connecting to signaling %s:%d (profile=%s, stream_id=%s)",
+                    sig_ip,
+                    sig_port,
+                    getattr(self._api, "app_profile", "unknown"),
+                    self._vvp_stream_id,
+                )
+                sig = MsgSvrClient(sig_ip, sig_port)
+                self._active_sig = sig
+                sig.connect(timeout_s=SIGNALING_CONNECT_TIMEOUT_S)
+                return self._do_stream(
+                    sig,
+                    host_key,
+                    allow_auth_fallback=allow_auth_fallback,
+                )
+            except Exception as err:
+                last_error = err
+                if not self._running:
+                    _LOGGER.debug("P2P session interrupted during stop: %s", err)
+                    break
+                _LOGGER.warning(
+                    "Signaling candidate %s:%d failed: %s",
+                    sig_ip,
+                    sig_port,
+                    err,
+                )
+            finally:
+                self._log_session_done()
+                self._active_sig = None
+                self._active_sock = None
+                self._active_stop_live = None
+                if sig is not None:
+                    try:
+                        sig.send_logout(self._device_uuid)
+                    except Exception:
+                        pass
+                    sig.close()
+
+        if last_error is not None and self._running:
+            _LOGGER.debug("All signaling candidates failed: %s", last_error)
+        return (self._video_count, self._total_bytes)
+
+    def _log_session_done(self) -> None:
+        _LOGGER.info(
+            "P2P session done: video_frames=%d source_frames=%d "
+            "video_bytes=%d audio_frames=%d audio_bytes=%d codec=%s "
+            "stream_id=%s candidates=%d signaling=%s turn=%s",
+            self._video_count,
+            self._source_video_count,
+            self._total_bytes,
+            self._audio_count,
+            self._audio_bytes,
+            self._video_codec.value,
+            self._vvp_stream_id,
+            self._last_candidate_count,
+            format_endpoint(self._last_signaling_endpoint),
+            format_endpoint(self._last_turn_endpoint),
+        )
 
     def _do_stream(
         self,
@@ -464,6 +442,7 @@ class P2PStreamer:
             coturn.get("username", ""),
             coturn.get("pwd", ""),
         )
+        self._last_turn_endpoint = (turn.server_ip, turn.server_port)
         turn.connect()
         self._active_sock = turn.sock
         if not turn.allocate():
@@ -529,13 +508,13 @@ class P2PStreamer:
             )
 
         answer = sig.send_offer(device_uuid, "\n".join(sdp_lines) + "\n")
-        camera_ufrag, camera_pwd, camera_candidates = _parse_sdp_answer(
+        camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
             answer.get("sdp", "")
         )
-        _collect_trickle_candidates(sig, camera_candidates)
+        collect_trickle_candidates(sig, camera_candidates)
         deduped_candidates: list[dict[str, Any]] = []
         for cand in camera_candidates:
-            _add_candidate_once(deduped_candidates, cand)
+            add_candidate_once(deduped_candidates, cand)
         camera_candidates = deduped_candidates
 
         if not camera_candidates:
@@ -558,7 +537,7 @@ class P2PStreamer:
 
         complete = sig.send_candidate_complete(device_uuid)
         if isinstance(complete, dict):
-            _, _, complete_candidates = _parse_sdp_answer(complete.get("sdp", ""))
+            _, _, complete_candidates = parse_sdp_answer(complete.get("sdp", ""))
             candidate = complete.get("candidate")
             if isinstance(candidate, dict):
                 cip = candidate.get("ip")
@@ -572,9 +551,10 @@ class P2PStreamer:
                         }
                     )
             for cand in complete_candidates:
-                if _add_candidate_once(camera_candidates, cand):
+                if add_candidate_once(camera_candidates, cand):
                     turn.create_permission(cand["ip"])
                     turn.channel_bind(cand["ip"], cand["port"])
+        self._last_candidate_count = len(camera_candidates)
         try:
             turn.refresh()
         except Exception:
