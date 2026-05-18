@@ -113,8 +113,8 @@ def quality_profile_labels(device: dict[str, Any]) -> dict[int, str]:
 
 
 def default_quality_profile(device: dict[str, Any]) -> int | None:
-    """Default to the highest profile."""
-    return best_quality_profile(device)
+    """Default to app-style Auto when available, else the highest profile."""
+    return auto_quality_profile(device)
 
 
 def stream_id_for_quality(device: dict[str, Any], quality: int | None) -> int:

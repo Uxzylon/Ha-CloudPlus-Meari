@@ -41,8 +41,8 @@ USER_AGENT = (
 APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
     "cloudplus": {
         "source_app": "77",
-        "app_ver": "5.9.2",
-        "app_ver_code": "1024",
+        "app_ver": "6.0.1",
+        "app_ver_code": "1029",
         "redirect_url": REDIRECT_URL,
         "partner_id": "77",
         "ttid": TTID,
@@ -522,6 +522,8 @@ class MeariApiClient:
 
     def _get_devices(self) -> None:
         devices: dict[Any, dict] = {}
+        default_result_code = ""
+        home_error = ""
 
         # Default/home API (works for owner accounts and some shared setups).
         default_payload: Optional[dict[str, Any]] = None
@@ -531,16 +533,17 @@ class MeariApiClient:
             _LOGGER.debug("Default device list failed: %s", err)
 
         if isinstance(default_payload, dict):
-            result_code = str(default_payload.get("resultCode", ""))
-            if result_code == "1001":
+            default_result_code = str(default_payload.get("resultCode", ""))
+            if default_result_code == "1001":
                 self._collect_devices_from_payload(default_payload, devices)
             else:
-                _LOGGER.debug("Default device list returned %s", result_code)
+                _LOGGER.debug("Default device list returned %s", default_result_code)
 
         # Multi-home fallback/augmentation for invited/family homes.
         try:
             homes = self._get_homes()
         except Exception as err:
+            home_error = str(err)
             _LOGGER.debug("Home list discovery failed: %s", err)
             homes = []
 
@@ -553,6 +556,18 @@ class MeariApiClient:
                 devices.update(home_devices)
             except Exception as err:
                 _LOGGER.debug("Home device list failed for home %s: %s", home_id, err)
+
+        if not devices:
+            _LOGGER.warning(
+                "Device discovery returned no cameras for %s "
+                "(profile=%s, api_server=%s, openapi=%s, default_code=%s, home_error=%s)",
+                self.email,
+                self.app_profile,
+                self.api_server or "unknown",
+                self.openapi_server or "unknown",
+                default_result_code or "none",
+                home_error or "none",
+            )
 
         self.devices = devices
 
