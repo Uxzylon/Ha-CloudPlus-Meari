@@ -94,7 +94,7 @@ jobs:
             commit_range="${BEFORE_SHA}..${HEAD_SHA}"
           fi
 
-          commit_lines="$(git log --pretty=format:'- %h %s (%an)' "${commit_range}" || true)"
+          commit_lines="$(git log --no-merges --pretty=format:'- %h %s (%an)' "${commit_range}" || true)"
           if [[ -z "${commit_lines}" ]]; then
             commit_lines="- $(git rev-parse --short "${HEAD_SHA}")"
           fi
