@@ -127,6 +127,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._idle_thread: threading.Thread | None = None
         self._api: MeariApiClient | None = None
         self._p2p_streamer: P2PStreamer | None = None
+        self._last_p2p_diagnostics: dict[str, Any] = {}
         self._motion_listener: MotionEventListener | None = None
         self._wake_event = threading.Event()
         self._idle_stop = threading.Event()
@@ -689,7 +690,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
             self._muxer.write_audio(payload)
 
         def _worker() -> None:
-            self._p2p_streamer = P2PStreamer(
+            streamer = P2PStreamer(
                 api=self._api,
                 device=self._device,
                 on_video=on_video,
@@ -699,8 +700,12 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 vvp_quality=self._stream_quality(),
                 video_password=self._video_password,
             )
-            self._p2p_streamer.run_session()
-            self._p2p_streamer = None
+            self._p2p_streamer = streamer
+            try:
+                streamer.run_session()
+            finally:
+                self._last_p2p_diagnostics = streamer.diagnostics
+                self._p2p_streamer = None
 
         self._stream_thread = threading.Thread(target=_worker, daemon=True)
         self._stream_thread.start()
