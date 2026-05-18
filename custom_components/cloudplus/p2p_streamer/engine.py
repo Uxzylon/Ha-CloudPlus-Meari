@@ -118,6 +118,8 @@ class P2PStreamer:
         self._audio_decrypt: bool | None = None
         self._video_sequence = FrameSequenceTracker()
         self._video_codec = CodecName.HEVC
+        self._first_video_timestamp_ms: int | None = None
+        self._last_video_timestamp_ms: int | None = None
         self._active_sig: MsgSvrClient | None = None
         self._active_sock: socket.socket | None = None
         self._active_stop_live: Callable[[], None] | None = None
@@ -162,6 +164,8 @@ class P2PStreamer:
             "video_frames": self._video_count,
             "source_video_frames": self._source_video_count,
             "video_bytes": self._total_bytes,
+            "video_media_span_s": self._video_media_span_s(),
+            "video_timestamp_fps": self._video_timestamp_fps(),
             "audio_frames": self._audio_count,
             "audio_bytes": self._audio_bytes,
             "video_decrypted": self._video_decrypt,
@@ -170,6 +174,30 @@ class P2PStreamer:
             "turn_endpoint": format_endpoint(self._last_turn_endpoint),
             "candidate_count": self._last_candidate_count,
         }
+
+    def _note_video_timestamp(self, timestamp_ms: int | None) -> None:
+        if timestamp_ms is None:
+            return
+        timestamp = int(timestamp_ms) & 0xFFFFFFFF
+        if self._first_video_timestamp_ms is None:
+            self._first_video_timestamp_ms = timestamp
+        self._last_video_timestamp_ms = timestamp
+
+    def _video_media_span_s(self) -> float:
+        first = self._first_video_timestamp_ms
+        last = self._last_video_timestamp_ms
+        if first is None or last is None:
+            return 0.0
+        delta_ms = (last - first) & 0xFFFFFFFF
+        if delta_ms == 0 or delta_ms > 0x7FFFFFFF:
+            return 0.0
+        return round(delta_ms / 1000.0, 3)
+
+    def _video_timestamp_fps(self) -> float:
+        span_s = self._video_media_span_s()
+        if span_s <= 0.0 or self._source_video_count <= 1:
+            return 0.0
+        return round((self._source_video_count - 1) / span_s, 3)
 
     def _auth_attempts(self) -> list[tuple[str, bool]]:
         host_key = str(self._host_key or "")
@@ -262,6 +290,7 @@ class P2PStreamer:
                     require_param_sets=False,
                 )
                 self._source_video_count += 1
+                self._note_video_timestamp(parsed.timestamp_ms)
                 if wait_for_keyframe and not is_recovery:
                     self._video_sequence.require_keyframe()
                     continue
@@ -296,6 +325,8 @@ class P2PStreamer:
                 self._audio_decrypt = None
                 self._video_sequence.reset()
                 self._video_codec = CodecName.HEVC
+                self._first_video_timestamp_ms = None
+                self._last_video_timestamp_ms = None
                 self._last_turn_endpoint = None
                 self._last_candidate_count = 0
                 result = self._run_session_once(
