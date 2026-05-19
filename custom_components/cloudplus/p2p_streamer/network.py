@@ -25,14 +25,14 @@ from ..turn_client import (
     ATTR_DATA,
     ATTR_XOR_PEER_ADDRESS,
 )
+from .root_discovery import discover_msgsvr_endpoints
 
 _LOGGER = logging.getLogger(__name__)
 
 # Keep successful signaling endpoint for a short period to avoid repeated
 # connect-probe storms during reconnect loops.
 _SIG_CACHE_TTL_S = 180.0
-_SIG_CACHE_ENDPOINT: tuple[str, int] | None = None
-_SIG_CACHE_EXPIRES_AT: float = 0.0
+_SIG_CACHE: dict[str, tuple[tuple[str, int], float]] = {}
 
 
 @dataclass(slots=True)
@@ -105,164 +105,140 @@ def _extract_host(value: str | None) -> str:
     return raw.lower()
 
 
-def _derive_platform_domain_from_openapi(host: str) -> str:
-    if host.startswith("openapi-"):
-        return host[len("openapi-") :]
-    return host
-
-
-def _probe_tcp_connect(ip: str, port: int, timeout_s: float) -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.settimeout(timeout_s)
-        s.connect((ip, port))
-        return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+def _signaling_cache_key(
+    platform_domain_hint: str | None,
+    openapi_server_hint: str | None,
+    api_server_hint: str | None = None,
+    client_id_hint: str | int | None = None,
+) -> str:
+    platform = _extract_host(platform_domain_hint)
+    openapi = _extract_host(openapi_server_hint)
+    api = _extract_host(api_server_hint)
+    return f"{platform}|{openapi}|{api}|{client_id_hint or ''}"
 
 
 def _resolve_signaling_server(
     *,
     platform_domain_hint: str | None = None,
     openapi_server_hint: str | None = None,
+    api_server_hint: str | None = None,
+    client_id_hint: str | int | None = None,
     timeout_s: float = 0.7,
 ) -> tuple[str, int]:
     candidates = _resolve_signaling_server_candidates(
         platform_domain_hint=platform_domain_hint,
         openapi_server_hint=openapi_server_hint,
+        api_server_hint=api_server_hint,
+        client_id_hint=client_id_hint,
         timeout_s=timeout_s,
     )
     if candidates:
         return candidates[0]
-    return ("47.91.73.19", 28974)
+    raise RuntimeError("No signaling endpoints discovered")
+
+
+def _cache_signaling_endpoint(
+    endpoint: tuple[str, int] | None,
+    *,
+    platform_domain_hint: str | None = None,
+    openapi_server_hint: str | None = None,
+    api_server_hint: str | None = None,
+    client_id_hint: str | int | None = None,
+    ttl_s: float = _SIG_CACHE_TTL_S,
+) -> None:
+    if endpoint is None:
+        return
+    cache_key = _signaling_cache_key(
+        platform_domain_hint,
+        openapi_server_hint,
+        api_server_hint,
+        client_id_hint,
+    )
+    _SIG_CACHE[cache_key] = (endpoint, time.monotonic() + ttl_s)
+
+
+def _forget_signaling_endpoint(
+    endpoint: tuple[str, int] | None,
+    *,
+    platform_domain_hint: str | None = None,
+    openapi_server_hint: str | None = None,
+    api_server_hint: str | None = None,
+    client_id_hint: str | int | None = None,
+) -> None:
+    if endpoint is None:
+        return
+    cache_key = _signaling_cache_key(
+        platform_domain_hint,
+        openapi_server_hint,
+        api_server_hint,
+        client_id_hint,
+    )
+    cached_entry = _SIG_CACHE.get(cache_key)
+    if cached_entry and cached_entry[0] == endpoint:
+        _SIG_CACHE.pop(cache_key, None)
 
 
 def _resolve_signaling_server_candidates(
     *,
     platform_domain_hint: str | None = None,
     openapi_server_hint: str | None = None,
+    api_server_hint: str | None = None,
+    client_id_hint: str | int | None = None,
     timeout_s: float = 0.7,
 ) -> list[tuple[str, int]]:
-    global _SIG_CACHE_ENDPOINT, _SIG_CACHE_EXPIRES_AT
-
     now = time.monotonic()
-    if _SIG_CACHE_ENDPOINT is not None and now < _SIG_CACHE_EXPIRES_AT:
-        return [_SIG_CACHE_ENDPOINT]
+    cache_key = _signaling_cache_key(
+        platform_domain_hint,
+        openapi_server_hint,
+        api_server_hint,
+        client_id_hint,
+    )
+    cached_entry = _SIG_CACHE.get(cache_key)
+    cached = None
+    if cached_entry and now < cached_entry[1]:
+        cached = cached_entry[0]
+    elif cached_entry:
+        _SIG_CACHE.pop(cache_key, None)
 
     env_host = _extract_host(os.environ.get("CLOUDPLUS_SIGNALING_HOST"))
     env_port = str(os.environ.get("CLOUDPLUS_SIGNALING_PORT") or "").strip()
     if env_host and env_port.isdigit():
         pinned = (env_host, int(env_port))
-        _SIG_CACHE_ENDPOINT = pinned
-        _SIG_CACHE_EXPIRES_AT = now + _SIG_CACHE_TTL_S
+        _SIG_CACHE[cache_key] = (pinned, now + _SIG_CACHE_TTL_S)
         return [pinned]
 
-    ports: list[int] = []
-    env_ports = str(os.environ.get("CLOUDPLUS_SIGNALING_PORTS") or "").strip()
-    if env_ports:
-        for item in env_ports.split(","):
-            item = item.strip()
-            if item.isdigit():
-                p = int(item)
-                if 1 <= p <= 65535 and p not in ports:
-                    ports.append(p)
-    if not ports:
-        # Official app captures show msgsvr rotating across the 18839-18849
-        # family, with older deployments still using 28974.
-        ports = [18849, 18847, 18845, 18843, 18839, 28974, 9253]
-
-    domain_candidates: list[str] = []
-    for candidate in (
-        _extract_host(platform_domain_hint),
-        _derive_platform_domain_from_openapi(_extract_host(openapi_server_hint)),
-        _extract_host(openapi_server_hint),
-        "euce.mearicloud.com",
-        "mearicloud.com",
-    ):
-        if candidate and candidate not in domain_candidates:
-            domain_candidates.append(candidate)
-
-    ip_candidates: list[str] = []
-    # Official captures rotate between both Meari msgsvr ranges. Keep them as
-    # observed candidates before broader DNS/fallback expansion.
-    preferred_ips = ["47.91.76.116", "47.254.142.96"]
-    for ip in preferred_ips:
-        if ip not in ip_candidates:
-            ip_candidates.append(ip)
-
-    for domain in domain_candidates:
-        try:
-            infos = socket.getaddrinfo(domain, None, socket.AF_INET)
-        except socket.gaierror:
-            continue
-        for info in infos:
-            ip = info[4][0]
-            if ip and ip not in ip_candidates:
-                ip_candidates.append(ip)
-
-    # Keep known historical/current msgsvr IPs as last-resort only.
-    for fallback_ip in ("47.91.76.116", "47.254.142.96", "47.91.73.19"):
-        if fallback_ip not in ip_candidates:
-            ip_candidates.append(fallback_ip)
+    root_endpoints: list[tuple[str, int]] = []
+    if cached is None:
+        root_endpoints = discover_msgsvr_endpoints(
+            platform_domain_hint=platform_domain_hint,
+            openapi_server_hint=openapi_server_hint,
+            api_server_hint=api_server_hint,
+            client_id_hint=client_id_hint,
+            timeout_s=timeout_s,
+        )
 
     ordered_candidates: list[tuple[str, int]] = []
-    resolved: tuple[str, int] | None = None
-    for ip in ip_candidates:
-        for port in ports:
-            candidate = (ip, port)
-            if candidate in ordered_candidates:
-                continue
-            if _probe_tcp_connect(ip, port, timeout_s=timeout_s):
-                resolved = candidate
-                ordered_candidates.append(candidate)
-                break
-        if resolved is not None:
-            break
-
-    # Keep deterministic fallbacks after the first live endpoint without probing
-    # the whole matrix on every fresh process startup.
-    for ip in ip_candidates:
-        for port in ports:
-            candidate = (ip, port)
-            if candidate not in ordered_candidates:
-                ordered_candidates.append(candidate)
+    if cached is not None:
+        ordered_candidates.append(cached)
+    for candidate in root_endpoints:
+        if candidate not in ordered_candidates:
+            ordered_candidates.append(candidate)
 
     if ordered_candidates:
-        if resolved is None:
-            _SIG_CACHE_ENDPOINT = None
-            _SIG_CACHE_EXPIRES_AT = 0.0
-            _LOGGER.warning(
-                "No signaling TCP probe succeeded; trying fallbacks=%s "
-                "(platform_hint=%s, openapi_hint=%s)",
-                ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:6]),
-                _extract_host(platform_domain_hint),
-                _extract_host(openapi_server_hint),
-            )
-        else:
-            _SIG_CACHE_ENDPOINT = ordered_candidates[0]
-            _SIG_CACHE_EXPIRES_AT = time.monotonic() + _SIG_CACHE_TTL_S
-            _LOGGER.info(
-                "Resolved signaling candidates=%s (platform_hint=%s, openapi_hint=%s)",
-                ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:6]),
-                _extract_host(platform_domain_hint),
-                _extract_host(openapi_server_hint),
-            )
+        _LOGGER.info(
+            "Resolved signaling candidates=%s (platform_hint=%s, openapi_hint=%s)",
+            ", ".join(f"{ip}:{port}" for ip, port in ordered_candidates[:8]),
+            _extract_host(platform_domain_hint),
+            _extract_host(openapi_server_hint),
+        )
         return ordered_candidates
 
-    fallback = ("47.91.73.19", ports[0])
     _LOGGER.warning(
-        "Signaling endpoint probe failed; falling back to %s:%d",
-        fallback[0],
-        fallback[1],
+        "No signaling endpoints discovered (platform_hint=%s, openapi_hint=%s)",
+        _extract_host(platform_domain_hint),
+        _extract_host(openapi_server_hint),
     )
-    _SIG_CACHE_ENDPOINT = fallback
-    _SIG_CACHE_EXPIRES_AT = time.monotonic() + min(30.0, _SIG_CACHE_TTL_S)
-    return [fallback]
+    return []
 
 
 # ---------------------------------------------------------------------------
