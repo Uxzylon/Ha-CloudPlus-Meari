@@ -15,6 +15,8 @@ from ..turn_client import BINDING_REQUEST, BINDING_RESPONSE, TurnClient
 from ..kcp_tunnel import KCP_WND, KcpTunnel, parse_iva_frame, parse_kcp_segment
 from .network import (
     _build_ice_response,
+    _cache_signaling_endpoint,
+    _forget_signaling_endpoint,
     _get_local_ips,
     _is_private_ip,
     _resolve_signaling_server_candidates,
@@ -62,6 +64,10 @@ IVA_HEARTBEAT_S = 3.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 SIGNALING_CONNECT_TIMEOUT_S = 5.0
+
+
+class SignalingClusterMiss(RuntimeError):
+    """The MsgSvr endpoint is reachable but does not know this device."""
 
 
 def _unwrap_iva_payload(data: bytes) -> bytes:
@@ -353,8 +359,15 @@ class P2PStreamer:
         *,
         allow_auth_fallback: bool = False,
     ) -> tuple[int, int]:
+        platform_hint = getattr(self._api, "platform_domain", None)
+        openapi_hint = getattr(self._api, "openapi_server", None)
+        api_hint = getattr(self._api, "api_server", None)
+        client_id_hint = getattr(self._api, "user_id", None)
         candidates = _resolve_signaling_server_candidates(
-            openapi_server_hint=getattr(self._api, "openapi_server", None),
+            platform_domain_hint=platform_hint,
+            openapi_server_hint=openapi_hint,
+            api_server_hint=api_hint,
+            client_id_hint=client_id_hint,
         )
         last_error: Exception | None = None
         for sig_ip, sig_port in candidates:
@@ -376,11 +389,30 @@ class P2PStreamer:
                     host_key,
                     allow_auth_fallback=allow_auth_fallback,
                 )
+            except SignalingClusterMiss as err:
+                last_error = err
+                _forget_signaling_endpoint(
+                    self._last_signaling_endpoint,
+                    platform_domain_hint=platform_hint,
+                    openapi_server_hint=openapi_hint,
+                    api_server_hint=api_hint,
+                    client_id_hint=client_id_hint,
+                )
+                if not self._running:
+                    break
+                _LOGGER.info("%s; trying next signaling candidate", err)
             except Exception as err:
                 last_error = err
                 if not self._running:
                     _LOGGER.debug("P2P session interrupted during stop: %s", err)
                     break
+                _forget_signaling_endpoint(
+                    self._last_signaling_endpoint,
+                    platform_domain_hint=platform_hint,
+                    openapi_server_hint=openapi_hint,
+                    api_server_hint=api_hint,
+                    client_id_hint=client_id_hint,
+                )
                 _LOGGER.warning(
                     "Signaling candidate %s:%d failed: %s",
                     sig_ip,
@@ -463,9 +495,22 @@ class P2PStreamer:
             device_status = status.get("status", "unknown")
 
         if device_status != "online":
-            _LOGGER.warning("Camera not online (status=%s)", device_status)
+            message = (
+                f"Camera not online on {format_endpoint(self._last_signaling_endpoint)} "
+                f"(status={device_status})"
+            )
+            if str(device_status).lower() == "offline":
+                raise SignalingClusterMiss(message)
+            _LOGGER.warning("%s", message)
             return (0, 0)
 
+        _cache_signaling_endpoint(
+            self._last_signaling_endpoint,
+            platform_domain_hint=getattr(api, "platform_domain", None),
+            openapi_server_hint=getattr(api, "openapi_server", None),
+            api_server_hint=getattr(api, "api_server", None),
+            client_id_hint=getattr(api, "user_id", None),
+        )
         coturn = sig.request_coturn(device_uuid)
         turn = TurnClient(
             coturn.get("coturn_ip", ""),
