@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 import threading
@@ -49,6 +50,8 @@ IDLE_REFRESH_INTERVAL = 1.0
 IDLE_NO_CLIENT_SLEEP = 1.0
 IDLE_FRAME_RETRY_INITIAL_S = 20.0
 IDLE_FRAME_RETRY_MAX_S = 180.0
+IDLE_GRAB_WAKE_RETRY_S = 8.0
+IDLE_GRAB_STREAM_RETRY_S = 1.5
 BATTERY_POLL_INTERVAL = 300.0
 STATUS_POLL_INTERVAL = 300.0
 LIVE_VIDEO_STALL_RESTART_S = 12.0
@@ -180,6 +183,19 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
 
     async def async_stop(self) -> None:
         self._running = False
+        await self._run_blocking(self._stop_blocking)
+        self._available = False
+        self._set_camera_awake(False)
+        self._fire_update()
+
+    async def _run_blocking(self, func: Callable[[], None]) -> None:
+        add_job = getattr(self.hass, "async_add_executor_job", None)
+        if callable(add_job):
+            await add_job(func)
+        else:
+            await asyncio.to_thread(func)
+
+    def _stop_blocking(self) -> None:
         self._stop_motion_listener()
         self._idle_stop.set()
         self._stop_streamer(join_timeout=4)
@@ -194,9 +210,6 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
             self._thread = None
         self._muxer.stop()
         self._stream_server.stop()
-        self._available = False
-        self._set_camera_awake(False)
-        self._fire_update()
 
     def _watch_loop(self) -> None:
         while self._running:
@@ -236,7 +249,6 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
     def _snap_session_loop(self) -> None:
         self._poll_battery()
         if self._initial_frame_grab and not self._idle_frame_ready.is_set():
-            self._send_wake()
             self._run_initial_frame_grab()
 
         last_battery_poll = time.monotonic()
@@ -257,7 +269,6 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 and not self._idle_frame_ready.is_set()
                 and now >= next_grab_retry
             ):
-                self._send_wake()
                 if self._run_initial_frame_grab():
                     idle_retry_s = IDLE_FRAME_RETRY_INITIAL_S
                 else:
@@ -323,9 +334,19 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
     def _run_initial_frame_grab(self) -> bool:
         self._set_camera_awake(True)
         self._idle_frame_ready.clear()
-        self._start_streamer_once(grab_only=True)
         deadline = time.monotonic() + self._initial_grab_timeout
+        next_wake = 0.0
+        next_stream = 0.0
         while self._running and time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_wake:
+                self._send_wake()
+                next_wake = now + IDLE_GRAB_WAKE_RETRY_S
+            worker = self._stream_thread
+            if (worker is None or not worker.is_alive()) and now >= next_stream:
+                self._stream_thread = None
+                self._start_streamer_once(grab_only=True)
+                next_stream = now + IDLE_GRAB_STREAM_RETRY_S
             if self._idle_frame_ready.wait(timeout=0.2):
                 break
         got_frame = self._idle_frame_ready.is_set()
