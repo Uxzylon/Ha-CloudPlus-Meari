@@ -15,7 +15,7 @@ Wire frame format:
   [6]    len_lo       payload length low byte
   [7]    len_hi|enc   payload length high 7 bits + bit7=encrypted
   [8..N] payload      3DES-ECB encrypted JSON (PKCS5 padded)
-  [N+1]  checksum     XOR of all payload bytes
+  [N+1]  checksum     additive sum of all payload bytes
   [N+2]  0x9D         tail marker
 
 Encryption: 3DES ECB with key "__#!HIRCloud5.0!#__" (padded to 24 bytes with zeros).
@@ -28,125 +28,18 @@ import threading
 import time
 import uuid as uuid_mod
 
-from Crypto.Cipher import DES3
-
-# 3DES ECB key for msgsvr protocol
-MSGSVR_KEY = b"__#!HIRCloud5.0!#__\x00\x00\x00\x00\x00"  # 24 bytes
-
-# Frame constants
-MAGIC = 0xE6
-TAIL = 0x9D
-
-# Node values (byte1)
-NODE_CLIENT = 0xA1
-
-# Method values (byte2)
-METHOD_DIRECT = 0xB1
-METHOD_ROUTED = 0xB2
-
-# Cmd values (byte3)
-CMD_REGISTER = 0xC1
-CMD_WEBRTC = 0xC6
-CMD_STATUS = 0xC7
-CMD_HEARTBEAT = 0xC9
-CMD_CONNECT = 0xD1
-
-# Type (byte4) - always 0xD3 in all captured sessions
-TYPE_DEFAULT = 0xD3
-
-
-def _des3_encrypt(data: bytes) -> bytes:
-    """3DES ECB encrypt with PKCS5 padding."""
-    pad_len = 8 - (len(data) % 8)
-    padded = data + bytes([pad_len] * pad_len)
-    cipher = DES3.new(MSGSVR_KEY, DES3.MODE_ECB)
-    return cipher.encrypt(padded)
-
-
-def _des3_decrypt(data: bytes) -> bytes:
-    """3DES ECB decrypt and remove PKCS5 padding."""
-    if len(data) == 0:
-        return b""
-    # Truncate to block boundary
-    data = data[: len(data) - (len(data) % 8)]
-    if len(data) == 0:
-        return b""
-    cipher = DES3.new(MSGSVR_KEY, DES3.MODE_ECB)
-    decrypted = cipher.decrypt(data)
-    pad_len = decrypted[-1]
-    if 1 <= pad_len <= 8 and all(b == pad_len for b in decrypted[-pad_len:]):
-        return decrypted[:-pad_len]
-    return decrypted.rstrip(b"\x00")
-
-
-def _build_frame(node, method, cmd, payload_json, encrypt=True):
-    """Build a complete msgsvr wire frame."""
-    payload = payload_json.encode("utf-8")
-
-    if encrypt:
-        payload = _des3_encrypt(payload)
-
-    payload_len = len(payload)
-    header = bytearray(8)
-    header[0] = MAGIC
-    header[1] = node
-    header[2] = method
-    header[3] = cmd
-    header[4] = TYPE_DEFAULT
-    header[5] = MAGIC
-    header[6] = payload_len & 0xFF
-    header[7] = ((payload_len >> 8) & 0x7F) | (0x80 if encrypt else 0x00)
-
-    checksum = 0
-    for b in payload:
-        checksum ^= b
-
-    return bytes(header) + payload + bytes([checksum & 0xFF, TAIL])
-
-
-def _recv_exact(sock, n):
-    """Receive exactly n bytes."""
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError(f"Connection closed (got {len(data)}/{n})")
-        data += chunk
-    return data
-
-
-def _recv_frame(sock):
-    """Receive and parse one msgsvr frame."""
-    header = _recv_exact(sock, 8)
-    if header[0] != MAGIC or header[5] != MAGIC:
-        raise ValueError(f"Invalid header magic: {header.hex()}")
-
-    node = header[1]
-    method = header[2]
-    cmd = header[3]
-
-    payload_len = header[6] | ((header[7] & 0x7F) << 8)
-    is_encrypted = bool(header[7] & 0x80)
-
-    # Read payload + checksum byte + tail byte
-    rest = _recv_exact(sock, payload_len + 2)
-    payload = rest[:payload_len]
-
-    if is_encrypted and payload_len > 0:
-        payload = _des3_decrypt(payload)
-
-    try:
-        json_data = json.loads(payload.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        json_data = {"_raw": payload.hex()[:200]}
-
-    return {
-        "node": node,
-        "method": method,
-        "cmd": cmd,
-        "encrypted": is_encrypted,
-        "json": json_data,
-    }
+from .msgsvr_codec import (
+    CMD_CONNECT,
+    CMD_HEARTBEAT,
+    CMD_REGISTER,
+    CMD_STATUS,
+    CMD_WEBRTC,
+    METHOD_DIRECT,
+    METHOD_ROUTED,
+    NODE_CLIENT,
+    build_frame as _build_frame,
+    recv_frame as _recv_frame,
+)
 
 
 class MsgSvrClient:
