@@ -271,19 +271,16 @@ class MsgSvrClient:
 
     def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
-        sid = uuid_mod.uuid4().hex[:16]
+        outer_sid = uuid_mod.uuid4().hex[:16]
         msg = json.dumps(
             {
-                "sid": sid,
+                "sid": outer_sid,
                 "uuid": self.uuid,
                 "params": {
                     "sid": uuid_mod.uuid4().hex[:8] + "00000001",
                     "local": {
                         "ip": local_ips,
                         "port": local_port,
-                    },
-                    "attach": {
-                        "awaken_type": 1,
                     },
                 },
                 "contact": device_contact,
@@ -292,8 +289,19 @@ class MsgSvrClient:
         )
 
         self._send(METHOD_DIRECT, CMD_CONNECT, msg)
-        resp = self._recv()
-        return resp["json"]
+        first = self._recv()["json"]
+
+        msg = json.dumps(
+            {
+                "sid": outer_sid,
+                "uuid": self.uuid,
+                "params": {"attach": {"awaken_type": 1}},
+                "contact": device_contact,
+            },
+            separators=(",", ":"),
+        )
+        self._send(METHOD_DIRECT, CMD_CONNECT, msg)
+        return self._recv()["json"] or first
 
     def request_coturn(self, device_uuid):
         """Step 5: Request TURN credentials via webrtcsvr."""

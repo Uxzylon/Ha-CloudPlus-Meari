@@ -402,9 +402,11 @@ class TurnClient:
         """Send data to a peer through the TURN relay."""
         key = (peer_ip, peer_port)
         if key in self.channels:
-            # ChannelData: [channel:2][length:2][data][padding]
+            # The Meari SDK includes one NUL byte in the ChannelData length.
+            # Receivers ignore it as KCP/STUN padding, and some cameras expect it.
             ch = self.channels[key]
-            frame = struct.pack(">HH", ch, len(data)) + data
+            payload = data + b"\x00"
+            frame = struct.pack(">HH", ch, len(payload)) + payload
             if len(frame) % 4:
                 frame += b"\x00" * (4 - len(frame) % 4)
             self._send(frame)
