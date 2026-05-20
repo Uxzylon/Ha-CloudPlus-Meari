@@ -95,7 +95,12 @@ class CloudEdgeMeariCamera(Camera):
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return the latest camera image (JPEG snapshot)."""
-        return self._coordinator.latest_image
+        return self._coordinator.get_latest_image()
+
+    @property
+    def use_stream_for_stills(self) -> bool:
+        """Keep still images on the cached JPEG path."""
+        return False
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

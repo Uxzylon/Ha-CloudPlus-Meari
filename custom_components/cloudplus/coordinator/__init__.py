@@ -47,7 +47,7 @@ from .stream_server import StreamServer
 _LOGGER = logging.getLogger(__name__)
 
 IDLE_ADVERTISED_FPS = 15.0
-IDLE_REFRESH_INTERVAL = 1.0
+IDLE_REFRESH_INTERVAL = 0.5
 IDLE_NO_CLIENT_SLEEP = 1.0
 IDLE_FRAME_RETRY_INITIAL_S = 20.0
 IDLE_FRAME_RETRY_MAX_S = 180.0
@@ -61,6 +61,8 @@ LIVE_VIDEO_MIN_INTERVAL = 1.0 / 30.0
 LIVE_ADAPTIVE_IPC_MUX_HOLD_S = 0.0
 LIVE_ADAPTIVE_IPC_MUX_QUIET_S = 0.0
 LIVE_P2P_VIDEO_GAP_S = 1.0
+SNAPSHOT_CARD_REFRESH_INTERVAL = 3.0
+SNAPSHOT_CARD_REQUEST_TTL = 30.0
 
 
 class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
@@ -109,6 +111,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._snapshot_conversion_enabled = bool(snapshot_conversion_enabled)
         self._snapshot_convert_interval = max(1.0, float(snapshot_min_interval))
         self._last_snapshot_convert_time = 0.0
+        self._snapshot_requested_until = 0.0
         self._snapshot_convert_lock = threading.Lock()
         self._motion_type = ""
         self._motion_detected = False
@@ -136,8 +139,11 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._wake_event = threading.Event()
         self._idle_stop = threading.Event()
         self._idle_frame_ready = threading.Event()
+        self._idle_frame_refresh = threading.Event()
+        self._idle_stream_reset = threading.Event()
+        self._stream_restart = threading.Event()
 
-        self._stream_server = StreamServer()
+        self._stream_server = StreamServer(self._request_stream_bootstrap)
         self._muxer = FfmpegMuxer(self._stream_server.broadcast)
 
         self._video_codec = CodecName.HEVC
@@ -268,10 +274,15 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
 
             if (
                 self._initial_frame_grab
-                and not self._idle_frame_ready.is_set()
-                and now >= next_grab_retry
+                and (
+                    self._idle_frame_refresh.is_set()
+                    or not self._idle_frame_ready.is_set()
+                )
+                and (self._idle_frame_refresh.is_set() or now >= next_grab_retry)
             ):
+                self._idle_frame_refresh.clear()
                 if self._run_initial_frame_grab():
+                    self._stream_restart.clear()
                     idle_retry_s = IDLE_FRAME_RETRY_INITIAL_S
                 else:
                     _LOGGER.warning(
@@ -304,6 +315,11 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         last_status_poll = time.monotonic()
         while self._running:
             now = time.monotonic()
+            if self._stream_restart.is_set():
+                self._stream_restart.clear()
+                self._stop_streamer(join_timeout=2)
+                self._muxer.stop()
+                self._stream_server.reset_bootstrap()
             if now - last_status_poll >= STATUS_POLL_INTERVAL:
                 self._poll_status()
                 last_status_poll = now
@@ -361,6 +377,14 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         while self._running and time.monotonic() < self._live_deadline:
             now = time.monotonic()
             self._consume_wake_event()
+            if self._stream_restart.is_set():
+                self._stream_restart.clear()
+                self._stop_streamer(join_timeout=2)
+                self._muxer.stop()
+                self._stream_server.reset_bootstrap()
+                self._stream_started_keyframe = False
+                self._reset_live_mux_timing()
+                continue
             worker = self._stream_thread
             if worker is None or not worker.is_alive():
                 keep_mux = worker is not None or self._keep_live_mux_on_restart
@@ -434,10 +458,49 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         )
         self._idle_thread.start()
 
+    def _request_stream_bootstrap(self) -> bool:
+        if not self._running:
+            return False
+        if self._is_snap and not self._camera_awake:
+            return False
+        streamer = self._p2p_streamer
+        if streamer is None:
+            return False
+        streamer.request_keyframe()
+        return True
+
+    def get_latest_image(self) -> bytes | None:
+        self._snapshot_requested_until = time.monotonic() + SNAPSHOT_CARD_REQUEST_TTL
+        return self._latest_image
+
+    def set_vvp_quality(self, quality: int | None) -> None:
+        if quality == self._vvp_quality:
+            return
+        self._vvp_quality = quality
+        self._codec_params.clear(self._video_codec)
+        self._stream_started_keyframe = False
+        self._reset_live_mux_timing()
+        self._stream_restart.set()
+        if self._is_snap:
+            self._idle_frame_ready.clear()
+            self._idle_frame_refresh.set()
+            self._idle_stream_reset.set()
+            with self._idle_frame_lock:
+                self._idle_video_frame = None
+                self._latest_video_kf = None
+            self._latest_image = None
+        self._fire_update()
+
     def _idle_loop(self) -> None:
         next_frame = time.monotonic()
         pts_interval = IDLE_REFRESH_INTERVAL
         while self._running and not self._idle_stop.is_set():
+            if self._idle_stream_reset.is_set():
+                self._idle_stream_reset.clear()
+                self._muxer.stop()
+                self._stream_server.reset_bootstrap()
+                next_frame = time.monotonic()
+
             if self._camera_awake:
                 next_frame = time.monotonic()
                 self._idle_stop.wait(0.1)
@@ -571,9 +634,12 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         if not self._snapshot_conversion_enabled or not payload:
             return
         now = time.monotonic()
+        interval = self._snapshot_convert_interval
+        if now <= self._snapshot_requested_until:
+            interval = min(interval, SNAPSHOT_CARD_REFRESH_INTERVAL)
         if (
             self._latest_image is not None
-            and now - self._last_snapshot_convert_time < self._snapshot_convert_interval
+            and now - self._last_snapshot_convert_time < interval
         ):
             return
         if not self._snapshot_convert_lock.acquire(blocking=False):
