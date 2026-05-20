@@ -15,6 +15,18 @@ def parse_sdp_answer(sdp: str) -> tuple[str, str, list[dict[str, Any]]]:
     camera_sdp_ip = ""
     camera_sdp_port = 0
 
+    def add_candidate(ip: str, port: int, cand_type: str) -> None:
+        if not ip or not port:
+            return
+        candidate = {"ip": ip, "port": int(port), "type": cand_type or "relay"}
+        for existing in camera_candidates:
+            if (
+                existing["ip"] == candidate["ip"]
+                and existing["port"] == candidate["port"]
+            ):
+                return
+        camera_candidates.append(candidate)
+
     for line in sdp.replace("\\n", "\n").splitlines():
         line = line.strip()
         if not line:
@@ -32,18 +44,24 @@ def parse_sdp_answer(sdp: str) -> tuple[str, str, list[dict[str, Any]]]:
         elif line.startswith("a=candidate:"):
             parts = line.split()
             if len(parts) >= 6:
-                camera_candidates.append(
-                    {
-                        "ip": parts[4],
-                        "port": int(parts[5]),
-                        "type": parts[7] if len(parts) > 7 else "relay",
-                    }
+                add_candidate(
+                    parts[4], int(parts[5]), parts[7] if len(parts) > 7 else "relay"
                 )
 
-    if not camera_candidates and camera_sdp_ip and camera_sdp_port:
-        camera_candidates.append(
-            {"ip": camera_sdp_ip, "port": camera_sdp_port, "type": "relay"}
-        )
+    if camera_sdp_ip and camera_sdp_port:
+        media_candidate = {
+            "ip": camera_sdp_ip,
+            "port": camera_sdp_port,
+            "type": "relay",
+        }
+        camera_candidates = [
+            media_candidate,
+            *[
+                cand
+                for cand in camera_candidates
+                if cand["ip"] != camera_sdp_ip or cand["port"] != camera_sdp_port
+            ],
+        ]
 
     return camera_ufrag, camera_pwd, camera_candidates
 
