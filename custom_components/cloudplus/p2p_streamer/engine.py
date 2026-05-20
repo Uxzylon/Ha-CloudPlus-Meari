@@ -12,13 +12,19 @@ from typing import Any, Callable
 from ..api import format_sn
 from ..meari_signaling import MsgSvrClient
 from ..turn_client import BINDING_REQUEST, BINDING_RESPONSE, TurnClient
-from ..kcp_tunnel import KCP_WND, KcpTunnel, parse_iva_frame, parse_kcp_segment
+from ..kcp_tunnel import (
+    KCP_CMD_PUSH,
+    KCP_WND,
+    KcpTunnel,
+    parse_iva_frame,
+    parse_kcp_segment,
+    parse_kcp_segments,
+)
 from .network import (
     _build_ice_response,
     _cache_signaling_endpoint,
     _forget_signaling_endpoint,
     _get_local_ips,
-    _is_private_ip,
     _resolve_signaling_server_candidates,
     _send_direct_ice_binding,
     recv_peer_packets,
@@ -35,6 +41,7 @@ from .codecs import (
     gap_recovery_for,
     identify_codec,
     is_recovery_keyframe,
+    nal_types,
     runtime_policy_for,
 )
 from .protocol import (
@@ -47,6 +54,7 @@ from .protocol import (
     build_vvp_packet,
     format_licence_id,
 )
+from .relay_probe import probe_relay
 from .codec import (
     FrameSequenceTracker,
     decrypt_stream_frame,
@@ -306,6 +314,22 @@ class P2PStreamer:
                 ):
                     continue
                 self._video_codec = detect_codec(media_data, default=self._video_codec)
+                if (
+                    _LOGGER.isEnabledFor(logging.DEBUG)
+                    and self._source_video_count <= 5
+                ):
+                    _LOGGER.debug(
+                        "Video frame #%d type=0x%02x bytes=%d ts=%s seq=%s "
+                        "codec=%s nals=%s recovery=%s",
+                        self._source_video_count,
+                        frame_type,
+                        len(media_data),
+                        parsed.timestamp_ms,
+                        parsed.sequence,
+                        self._video_codec.value,
+                        sorted(nal_types(self._video_codec, media_data)),
+                        is_recovery,
+                    )
                 saw_keyframe = saw_keyframe or is_recovery
                 self._video_count += 1
                 self._total_bytes += len(media_data)
@@ -535,6 +559,7 @@ class P2PStreamer:
                 host_key,
                 status.get("nat", {}),
                 coturn.get("coturn_ip", ""),
+                coturn.get("coturn_host", ""),
                 allow_auth_fallback=allow_auth_fallback,
             )
         finally:
@@ -549,6 +574,7 @@ class P2PStreamer:
         host_key: str,
         device_nat: dict[str, Any],
         coturn_ip: str,
+        coturn_host: str,
         *,
         allow_auth_fallback: bool = False,
     ) -> tuple[int, int]:
@@ -557,10 +583,8 @@ class P2PStreamer:
         ice_pwd = os.urandom(12).hex()
 
         sdp_lines = [
-            "v=0",
-            f"o=- {int(time.time())} {int(time.time())} IN IP4 0.0.0.0",
-            "s=ice",
-            "t=0 0",
+            "n=0 0 0 0 0",
+            "a=transport:auto",
             f"a=ice-ufrag:{ice_ufrag}",
             f"a=ice-pwd:{ice_pwd}",
             f"m=audio {turn.relay_port} RTP / AVP 0",
@@ -578,11 +602,12 @@ class P2PStreamer:
                     f"a=candidate:S{ip_hex} 1 UDP 1862270975 {turn.mapped_ip} {turn.mapped_port} typ srflx"
                 )
         if turn.relay_ip:
-            relay_hex = socket.inet_aton(turn.relay_ip).hex()
+            relay_hex = socket.inet_aton(local_ips[0]).hex()
             sdp_lines.append(
-                f"a=candidate:R{relay_hex} 1 UDP 16777215 {turn.relay_ip} {turn.relay_port} typ srflx"
+                f"a=candidate:S{relay_hex} 1 UDP 1862270975 {turn.relay_ip} {turn.relay_port} typ srflx"
             )
 
+        offer_tag = str((sig.webrtcsvr or {}).get("tag") or "") + "01"
         answer = sig.send_offer(device_uuid, "\n".join(sdp_lines) + "\n")
         camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
             answer.get("sdp", "")
@@ -630,14 +655,37 @@ class P2PStreamer:
                 if add_candidate_once(camera_candidates, cand):
                     turn.create_permission(cand["ip"])
                     turn.channel_bind(cand["ip"], cand["port"])
+        probe_hosts = []
+        for host in (coturn_ip, coturn_host):
+            host = str(host or "").strip()
+            if host and host not in probe_hosts:
+                probe_hosts.append(host)
+        probe_ok = False
+        for probe_host in probe_hosts:
+            probe_ok = probe_relay(probe_host, offer_tag)
+            if probe_ok:
+                break
+        _LOGGER.debug(
+            "TURN relay probe %s for %s tag=%s",
+            "ok" if probe_ok else "failed",
+            ", ".join(probe_hosts) or "unknown",
+            offer_tag,
+        )
         self._last_candidate_count = len(camera_candidates)
+        _LOGGER.debug(
+            "Camera ICE candidates: %s",
+            ", ".join(
+                f"{cand.get('ip')}:{cand.get('port')}:{cand.get('type', '')}"
+                for cand in camera_candidates
+            ),
+        )
         try:
             turn.refresh()
         except Exception:
             pass
 
         confirmed_peer: list[tuple[str, int, bool] | None] = [None]
-        candidate_fanout_until = 0.0
+        candidate_fanout_until = time.time() + 8.0
 
         def _send_udp(data: bytes) -> None:
             fanout = time.time() < candidate_fanout_until
@@ -663,7 +711,7 @@ class P2PStreamer:
                     turn.send_to_peer(cand["ip"], cand["port"], data)
                 except Exception:
                     pass
-                if not self._remote and _is_private_ip(cand["ip"]):
+                if not self._remote and cand.get("type") != "relay":
                     try:
                         turn.sock.sendto(data, (cand["ip"], cand["port"]))
                     except Exception:
@@ -675,9 +723,11 @@ class P2PStreamer:
         last_heartbeat = 0.0
         last_iva_heartbeat = 0.0
         last_start_live = 0.0
+        live_started = False
         last_ice = 0.0
         last_video_time = 0.0
         last_udp_time = 0.0
+        last_kcp_push_time = 0.0
         last_kcp_payload_time = 0.0
         signal_heartbeat_s = max(
             5.0, float(getattr(sig, "heartbeat_interval_s", 30.0) or 30.0)
@@ -728,12 +778,15 @@ class P2PStreamer:
             min_interval: float = 0.0,
             wait_for_recovery_keyframe: bool = False,
         ) -> bool:
-            nonlocal last_start_live, wait_for_keyframe_until
+            nonlocal last_start_live, live_started, last_heartbeat
+            nonlocal wait_for_keyframe_until
             now_ts = time.time() if now_ts is None else now_ts
             if now_ts < last_start_live + min_interval:
                 return False
             kcp.send_iva_data(_next_vvp(VVP_CMD_START_LIVE))
             last_start_live = now_ts
+            live_started = True
+            last_heartbeat = now_ts + VVP_HEARTBEAT_S
             keyframe_wait = gap_recovery_for(self._video_codec).keyframe_wait_s
             if wait_for_recovery_keyframe and keyframe_wait > 0.0:
                 wait_for_keyframe_until = max(
@@ -744,6 +797,8 @@ class P2PStreamer:
             return True
 
         def _send_stop_live() -> None:
+            if not live_started:
+                return
             kcp.send_iva_data(_next_vvp(VVP_CMD_STOP, stream_id=0, stream_flag=0))
             kcp.flush_acks()
 
@@ -761,6 +816,8 @@ class P2PStreamer:
             for cand in camera_candidates:
                 if not cand.get("ip") or not cand.get("port"):
                     continue
+                if cand.get("type") == "relay":
+                    continue
                 try:
                     turn.send_ice_binding(
                         cand["ip"],
@@ -771,7 +828,7 @@ class P2PStreamer:
                     )
                 except Exception:
                     pass
-                if not self._remote and _is_private_ip(cand["ip"]):
+                if not self._remote and cand.get("type") != "relay":
                     try:
                         _send_direct_ice_binding(
                             turn.sock,
@@ -839,15 +896,28 @@ class P2PStreamer:
                 return 0
             return max(1, max(above) - next_sn + 1)
 
+        def _video_wait_s(now_ts: float) -> float:
+            if last_video_time > 0.0:
+                return now_ts - last_video_time
+            if last_kcp_push_time > 0.0:
+                return now_ts - last_kcp_push_time
+            if last_kcp_payload_time > 0.0:
+                return now_ts - last_kcp_payload_time
+            if last_start_live > 0.0 and (
+                getattr(kcp, "recv_buf", None) or getattr(kcp, "recv_frag_buf", None)
+            ):
+                return now_ts - last_start_live
+            return 0.0
+
         def _attempt_gap_recovery(now_ts: float) -> None:
             nonlocal reconnect_idle_source
             nonlocal candidate_fanout_until
             nonlocal last_ack_probe, last_gap_nudge, last_gap_skip
             nonlocal last_stall_debug, wait_for_keyframe_until, last_video_time
-            if last_video_time <= 0.0 or now_ts - last_video_time <= 0.8:
+            stall_time = _video_wait_s(now_ts)
+            if stall_time <= 0.8:
                 return
 
-            stall_time = now_ts - last_video_time
             gap_backlog = _kcp_gap_backlog()
             if not gap_backlog:
                 udp_idle = now_ts - last_udp_time if last_udp_time > 0 else -1.0
@@ -858,12 +928,17 @@ class P2PStreamer:
                 )
                 if now_ts - last_ack_probe > 0.35 and kcp.send_ack_probe():
                     last_ack_probe = now_ts
-                if stall_time > 1.2 and (udp_idle < 0 or udp_idle > 0.8):
+                if stall_time > 1.2:
                     candidate_fanout_until = max(candidate_fanout_until, now_ts + 4.0)
+                kcp_pending = bool(
+                    getattr(kcp, "recv_buf", None)
+                    or getattr(kcp, "recv_queue", None)
+                    or getattr(kcp, "recv_frag_buf", None)
+                )
                 idle_reconnect_s = runtime_policy_for(
                     self._video_codec
                 ).source_idle_reconnect_s
-                if stall_time >= idle_reconnect_s:
+                if stall_time >= idle_reconnect_s and not kcp_pending:
                     _LOGGER.warning(
                         "P2P source idle %.1fs; reconnecting session",
                         stall_time,
@@ -871,20 +946,26 @@ class P2PStreamer:
                     reconnect_idle_source = True
                 if now_ts - last_stall_debug >= 2.0:
                     last_stall_debug = now_ts
+                    rx = kcp.receive_snapshot()
                     _LOGGER.debug(
                         "Video stalled %.2fs without KCP gap: udp_idle=%.2fs "
-                        "payload_idle=%.2fs recv_buf=%d queued=%d partial=%d",
+                        "payload_idle=%.2fs recv_buf=%d queued=%d partial=%d "
+                        "partial_bytes=%d first=%s last=%s",
                         stall_time,
                         udp_idle,
                         payload_idle,
-                        len(getattr(kcp, "recv_buf", {}) or {}),
-                        len(getattr(kcp, "recv_queue", []) or []),
-                        len(getattr(kcp, "recv_frag_buf", []) or []),
+                        rx["recv_buf"],
+                        rx["queued"],
+                        rx["partial"],
+                        rx["partial_bytes"],
+                        rx["partial_first"],
+                        rx["partial_last"],
                     )
                 return
 
             if now_ts - last_gap_nudge > 0.08 and kcp.send_gap_nudge():
                 last_gap_nudge = now_ts
+                candidate_fanout_until = max(candidate_fanout_until, now_ts + 4.0)
 
             recovery = gap_recovery_for(self._video_codec)
             skip_wait = recovery.skip_wait_s
@@ -894,14 +975,19 @@ class P2PStreamer:
 
             if stall_time <= skip_wait or now_ts - last_gap_skip <= skip_interval:
                 return
-            if kcp.skip_gap(max_gaps=max_gaps, require_iva_start=True):
+            if kcp.skip_gap(
+                max_gaps=max_gaps,
+                require_iva_start=True,
+                start_frame_types={STREAM_TYPE_IFRAME},
+            ):
                 last_gap_skip = now_ts
+                self._video_sequence.require_keyframe()
                 wait_for_keyframe_until = now_ts + keyframe_wait
                 _drain_kcp_queue()
                 _process_pending_payloads()
 
         def _handle_peer_packet(packet) -> None:
-            nonlocal last_udp_time
+            nonlocal last_udp_time, last_kcp_push_time
             last_udp_time = time.time()
             peer = packet.peer
             if peer is None and not packet.via_turn:
@@ -913,16 +999,6 @@ class P2PStreamer:
                 and not packet.via_turn
                 and packet.source[0] == getattr(turn, "server_ip", None)
             )
-            if (
-                peer is not None
-                and confirmed_peer[0] is None
-                and not is_turn_server_stun
-            ):
-                direct = (
-                    not packet.via_turn and not self._remote and _is_private_ip(peer[0])
-                )
-                confirmed_peer[0] = (peer[0], peer[1], direct)
-
             if parsed:
                 msg_type = parsed.get("type")
                 if msg_type == BINDING_REQUEST and peer is not None:
@@ -930,11 +1006,7 @@ class P2PStreamer:
                         response = _build_ice_response(
                             parsed, ice_pwd, peer[0], peer[1]
                         )
-                        if (
-                            not packet.via_turn
-                            and not self._remote
-                            and _is_private_ip(peer[0])
-                        ):
+                        if not packet.via_turn and not self._remote:
                             turn.sock.sendto(response, peer)
                         else:
                             turn.send_to_peer(peer[0], peer[1], response)
@@ -945,7 +1017,28 @@ class P2PStreamer:
                     kcp.retransmit_unacked()
                     return
 
-            if parse_kcp_segment(packet.data) or packet.data[0:2] == b"\xff\x01":
+            segments = parse_kcp_segments(packet.data)
+            first_segment = parse_kcp_segment(packet.data) if not segments else None
+            is_iva = packet.data[0:2] == b"\xff\x01"
+            is_kcp = bool(segments or first_segment or is_iva)
+            if is_kcp:
+                if (
+                    peer is not None
+                    and confirmed_peer[0] is None
+                    and not is_turn_server_stun
+                    and peer[0] != getattr(turn, "server_ip", None)
+                ):
+                    direct = not packet.via_turn and not self._remote
+                    confirmed_peer[0] = (peer[0], peer[1], direct)
+                    _LOGGER.debug(
+                        "Confirmed media peer %s via %s",
+                        format_endpoint(peer),
+                        "direct" if direct else "turn",
+                    )
+                if is_iva or (first_segment and first_segment["cmd"] == KCP_CMD_PUSH):
+                    last_kcp_push_time = time.time()
+                elif any(seg["cmd"] == KCP_CMD_PUSH for seg in segments):
+                    last_kcp_push_time = time.time()
                 processed = kcp.process_input(packet.data)
                 if kcp.ack_flush_due():
                     kcp.flush_acks()
@@ -954,14 +1047,16 @@ class P2PStreamer:
                     if typ in ("data", "iva_data", "iva") and payload:
                         _queue_kcp_payload(payload)
                     elif typ == "handshake":
+                        kcp.flush_acks()
                         kcp.retransmit_unacked()
+                        if not live_started:
+                            _send_start_live("handshake", time.time())
                 _drain_kcp_queue()
 
         kcp.send_handshake()
         now = time.time()
         last_iva_heartbeat = now + IVA_HEARTBEAT_S
-        _send_start_live("initial", now)
-        last_heartbeat = now + VVP_HEARTBEAT_S
+        last_heartbeat = float("inf")
 
         while self._running:
             now = time.time()
@@ -984,7 +1079,7 @@ class P2PStreamer:
                     ).start()
                 next_signal_heartbeat = now + signal_heartbeat_s
 
-            if now >= last_heartbeat:
+            if live_started and now >= last_heartbeat:
                 kcp.send_iva_data(
                     _next_vvp(VVP_CMD_HEARTBEAT, stream_id=0, stream_flag=0)
                 )
@@ -995,10 +1090,18 @@ class P2PStreamer:
                 last_iva_heartbeat = now + IVA_HEARTBEAT_S
 
             waiting_first_video = last_video_time <= 0.0
-            waiting_first_payload = last_kcp_payload_time <= 0.0
-            if (
+            waiting_first_partial = bool(
+                getattr(kcp, "recv_buf", None) or getattr(kcp, "recv_frag_buf", None)
+            )
+            kcp_rx_idle = (
+                now - last_kcp_push_time if last_kcp_push_time > 0.0 else float("inf")
+            )
+            if not live_started:
+                if kcp.handshake_done:
+                    _send_start_live("handshake", now)
+            elif (
                 waiting_first_video
-                and waiting_first_payload
+                and (not waiting_first_partial or kcp_rx_idle >= START_LIVE_RETRY_S)
                 and now >= last_start_live + START_LIVE_RETRY_S
             ):
                 _send_start_live("retry", now)

@@ -302,8 +302,11 @@ def _unwrap_peer_packet(turn, raw: bytes, addr: tuple[str, int]) -> PeerPacket:
                 peer = (peer_ip, peer_port)
         return PeerPacket(data, addr, peer, True, _parse_stun(data))
 
-    peer = None if addr[0] == getattr(turn, "server_ip", None) else addr
-    return PeerPacket(raw, addr, peer, False, msg)
+    if msg:
+        return PeerPacket(raw, addr, None, False, msg)
+    if addr[0] == getattr(turn, "server_ip", None):
+        return PeerPacket(raw, addr, None, True, None)
+    return PeerPacket(raw, addr, addr, False, None)
 
 
 def recv_peer_packet(turn, timeout: float = 1.0) -> PeerPacket | None:

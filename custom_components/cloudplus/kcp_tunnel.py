@@ -39,8 +39,9 @@ KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
 KCP_MSS = 1176  # Outbound control payloads are tiny; keep plenty of UDP headroom.
 KCP_WND = 1024  # Matches the official app's advertised receive window.
-KCP_ACK_BATCH_SEGMENTS = 16
+KCP_ACK_BATCH_SEGMENTS = 3
 KCP_ACK_FLUSH_INTERVAL_S = 0.01
+KCP_ACK_PROBE_SEGMENTS = 32
 
 # IVA frame constants
 IVA_MAGIC = b"\xff\x01"
@@ -102,13 +103,18 @@ def parse_iva_frame(data):
     return type_marker, session_id1, session_id2, payload
 
 
-def _starts_complete_message(data: bytes) -> bool:
+def _starts_complete_message(
+    data: bytes,
+    *,
+    frame_types: set[int] | None = None,
+) -> bool:
     if data.startswith(IVA_MAGIC):
-        return True
+        return frame_types is None
     return (
         len(data) >= 4
         and data.startswith(VVP_FRAME_MAGIC)
         and data[3] in VVP_FRAME_TYPES
+        and (frame_types is None or data[3] in frame_types)
     )
 
 
@@ -184,7 +190,8 @@ def parse_kcp_segments(raw):
 
     if not segments:
         return []
-    if any(raw[pos:]):
+    trailer = raw[pos:]
+    if len(trailer) > 1 and any(trailer):
         return []
     return segments
 
@@ -229,8 +236,9 @@ class KcpTunnel:
         # Accumulates KCP fragment data for multi-fragment messages.
         # frg counts DOWN: N-1, N-2, ..., 0.  frg==0 means last fragment.
         self.recv_frag_buf = []
+        self.recv_frag_meta = []
 
-        # Receive buffer for out-of-order segments: sn -> (frg, data)
+        # Receive buffer for out-of-order segments: sn -> (frg, data, ts)
         self.recv_buf = {}
         # Next expected receive sequence number for ordered delivery
         # Initialized to -1 (sentinel); set to peer's first sn on first PUSH
@@ -241,6 +249,7 @@ class KcpTunnel:
 
         # Deferred ACK queue: list of (sn, ts) to send in batch
         self.pending_acks = []
+        self.recent_acks = []
         self._last_ack_flush_at = time.monotonic()
         self.last_rx_sn = -1
         self.last_rx_ts = 0
@@ -253,6 +262,20 @@ class KcpTunnel:
         """Advertise remaining receive slots without overstating backlog."""
         used = len(self.recv_buf) + len(self.recv_queue) + len(self.recv_frag_buf)
         return max(0, self.recv_wnd - used)
+
+    def _remember_ack(self, sn, ts):
+        self.pending_acks.append((sn, ts))
+        self.recent_acks.append((sn, ts))
+        if len(self.recent_acks) > KCP_ACK_PROBE_SEGMENTS * 2:
+            del self.recent_acks[:-KCP_ACK_PROBE_SEGMENTS]
+
+    def _append_fragment(self, sn, frg, data):
+        self.recv_frag_buf.append(data)
+        self.recv_frag_meta.append((sn, frg, len(data)))
+
+    def _clear_fragments(self):
+        self.recv_frag_buf = []
+        self.recv_frag_meta = []
 
     def send_handshake(self):
         """Send IVA handshake frame wrapped in KCP PUSH segment."""
@@ -360,9 +383,8 @@ class KcpTunnel:
         # Gap skip at 2s is the safety net for persistent losses.
         una = max(self.next_recv_sn, 0)
 
-        # Stay near an MTU-sized ACK compound like the SDK's 10 ms KCP flush.
-        # This keeps the sender moving without flooding the uplink with tiny
-        # ACK datagrams during high-bitrate bursts.
+        # The SDK tends to ACK in small compounds during media bursts; keeping
+        # this tight helps sender-side loss recovery on jittery links.
         buf = bytearray()
         count = 0
         for sn in sorted(by_sn):
@@ -399,12 +421,13 @@ class KcpTunnel:
         una = max(self.next_recv_sn, 0)
         buf = bytearray()
         for sn in above_gap:
+            seg_ts = self.recv_buf[sn][2]
             buf += build_kcp_segment(
                 cmd=KCP_CMD_ACK,
                 sn=sn,
                 una=una,
                 wnd=self._wnd(),
-                ts=self._ts(),
+                ts=seg_ts,
             )
             if len(buf) >= 1200:
                 self.send_func(bytes(buf))
@@ -414,25 +437,51 @@ class KcpTunnel:
         return True
 
     def send_ack_probe(self):
-        """Repeat the latest cumulative ACK to unstick a quiet sender."""
-        if self.next_recv_sn < 0 or self.last_rx_sn < 0:
+        """Repeat recent ACKs as one compound packet to unstick a quiet sender."""
+        if self.next_recv_sn < 0 or not self.recent_acks:
             return False
-        self.send_func(
-            build_kcp_segment(
+        by_sn = {}
+        for sn, ts in self.recent_acks[-KCP_ACK_PROBE_SEGMENTS:]:
+            by_sn[sn] = ts
+        una = max(self.next_recv_sn, 0)
+        buf = bytearray()
+        for sn in sorted(by_sn):
+            buf += build_kcp_segment(
                 cmd=KCP_CMD_ACK,
-                sn=self.last_rx_sn,
-                una=max(self.next_recv_sn, 0),
+                sn=sn,
+                una=una,
                 wnd=self._wnd(),
-                ts=self.last_rx_ts,
+                ts=by_sn[sn],
             )
-        )
+            if len(buf) >= 1200:
+                self.send_func(bytes(buf))
+                buf.clear()
+        if buf:
+            self.send_func(bytes(buf))
         return True
+
+    def receive_snapshot(self):
+        """Return compact receive-side state for transport diagnostics."""
+        partial_bytes = sum(size for _, _, size in self.recv_frag_meta)
+        first = self.recv_frag_meta[0] if self.recv_frag_meta else None
+        last = self.recv_frag_meta[-1] if self.recv_frag_meta else None
+        return {
+            "next_sn": self.next_recv_sn,
+            "last_rx_sn": self.last_rx_sn,
+            "recv_buf": len(self.recv_buf),
+            "queued": len(self.recv_queue),
+            "partial": len(self.recv_frag_buf),
+            "partial_bytes": partial_bytes,
+            "partial_first": first,
+            "partial_last": last,
+        }
 
     def skip_gap(
         self,
         max_gaps: int | None = None,
         *,
         require_iva_start: bool = False,
+        start_frame_types: set[int] | None = None,
     ):
         """Skip past persistent gaps to unblock delivery.
 
@@ -444,6 +493,8 @@ class KcpTunnel:
         When require_iva_start is true, stale fragments before the next IVA
         frame boundary are discarded so lossy recovery never emits a partial
         KCP message as video.
+        start_frame_types can narrow that resume point to specific VVP frame
+        types, e.g. I-frames during startup recovery.
         Returns True if any gap was skipped and messages may be available.
         """
         if self.next_recv_sn < 0 or not self.recv_buf:
@@ -465,34 +516,39 @@ class KcpTunnel:
                 break
             new_sn = above[0]
             if require_iva_start:
-                new_sn = -1
+                resume_sn = -1
                 for candidate in above:
-                    _, candidate_data = self.recv_buf[candidate]
-                    if _starts_complete_message(candidate_data):
-                        new_sn = candidate
+                    _, candidate_data, _ = self.recv_buf[candidate]
+                    if _starts_complete_message(
+                        candidate_data,
+                        frame_types=start_frame_types,
+                    ):
+                        resume_sn = candidate
                         break
+                if resume_sn < 0:
+                    break
+                new_sn = resume_sn
+                for candidate in [sn for sn in above if sn < new_sn]:
                     del self.recv_buf[candidate]
                     stale_fragments += 1
-                if new_sn < 0:
-                    break
             gap_size = new_sn - self.next_recv_sn
             total_gaps += gap_size
             gaps_skipped += 1
             # Discard any partial fragment state (the missing segment
             # was likely a fragment boundary, so existing fragments are stale)
-            self.recv_frag_buf = []
+            self._clear_fragments()
             self.next_recv_sn = new_sn
             any_skipped = True
 
             # Assemble contiguous segments after the gap
             while self.next_recv_sn in self.recv_buf:
-                frg, data = self.recv_buf[self.next_recv_sn]
-                self.recv_frag_buf.append(data)
+                frg, data, _ = self.recv_buf[self.next_recv_sn]
+                self._append_fragment(self.next_recv_sn, frg, data)
                 del self.recv_buf[self.next_recv_sn]
                 self.next_recv_sn += 1
                 if frg == 0:
                     complete = b"".join(self.recv_frag_buf)
-                    self.recv_frag_buf = []
+                    self._clear_fragments()
                     self.recv_queue.append(complete)
 
             # If next_recv_sn is now in recv_buf (no gap), we're done
@@ -555,32 +611,39 @@ class KcpTunnel:
             # Skip duplicate/retransmitted segments we've already processed
             if self.next_recv_sn >= 0 and sn < self.next_recv_sn:
                 # Queue ACK with current cumulative una to help sender advance
-                self.pending_acks.append((seg["sn"], seg["ts"]))
+                self._remember_ack(seg["sn"], seg["ts"])
                 return ("dup", sn)
 
-            self.recv_buf[sn] = (seg["frg"], seg["data"])
+            self.recv_buf[sn] = (seg["frg"], seg["data"], seg["ts"])
+            self._remember_ack(seg["sn"], seg["ts"])
 
-            # Initialize next_recv_sn on first PUSH segment received
-            # (camera may start at sn=1 if sn=0 was used for IVA handshake)
             if self.next_recv_sn < 0:
-                self.next_recv_sn = sn
+                starts = sorted(
+                    candidate_sn
+                    for candidate_sn, (_, data, _) in self.recv_buf.items()
+                    if _starts_complete_message(data)
+                )
+                if not starts:
+                    return ("fragment", seg["data"])
+                self.next_recv_sn = starts[0]
+                stale_sns = [old for old in self.recv_buf if old < self.next_recv_sn]
+                for stale_sn in stale_sns:
+                    del self.recv_buf[stale_sn]
+                self._clear_fragments()
 
             # Try to assemble complete messages from recv_buf
             messages = []
             while self.next_recv_sn in self.recv_buf:
-                frg, data = self.recv_buf[self.next_recv_sn]
-                self.recv_frag_buf.append(data)
+                frg, data, _ = self.recv_buf[self.next_recv_sn]
+                self._append_fragment(self.next_recv_sn, frg, data)
                 del self.recv_buf[self.next_recv_sn]
                 self.next_recv_sn += 1
 
                 if frg == 0:
                     # Last fragment - assemble complete message
                     complete = b"".join(self.recv_frag_buf)
-                    self.recv_frag_buf = []
+                    self._clear_fragments()
                     messages.append(complete)
-
-            # Queue ACK for batched sending (flush_acks() sends all at once)
-            self.pending_acks.append((seg["sn"], seg["ts"]))
 
             if not messages:
                 # No complete message yet - still accumulating fragments
