@@ -72,6 +72,7 @@ IVA_HEARTBEAT_S = 3.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 SIGNALING_CONNECT_TIMEOUT_S = 5.0
+CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S = 4.0
 
 
 class SignalingClusterMiss(RuntimeError):
@@ -140,9 +141,11 @@ class P2PStreamer:
         self._last_signaling_endpoint: tuple[str, int] | None = None
         self._last_turn_endpoint: tuple[str, int] | None = None
         self._last_candidate_count = 0
+        self._keyframe_request = threading.Event()
 
     def request_stop(self) -> None:
         self._running = False
+        self._keyframe_request.set()
         stop_live = self._active_stop_live
         if stop_live is not None:
             try:
@@ -164,6 +167,10 @@ class P2PStreamer:
                 sock.close()
             except OSError:
                 pass
+
+    def request_keyframe(self) -> None:
+        """Ask the running live session to nudge the camera toward a fresh IDR."""
+        self._keyframe_request.set()
 
     @property
     def video_count(self) -> int:
@@ -737,6 +744,7 @@ class P2PStreamer:
         last_ack_probe = 0.0
         last_gap_nudge = 0.0
         last_gap_skip = 0.0
+        last_client_keyframe_request = 0.0
         last_stall_debug = 0.0
         wait_for_keyframe_until = 0.0
         pending_payloads: list[bytes] = []
@@ -1084,6 +1092,14 @@ class P2PStreamer:
                     _next_vvp(VVP_CMD_HEARTBEAT, stream_id=0, stream_flag=0)
                 )
                 last_heartbeat = now + VVP_HEARTBEAT_S
+
+            if self._keyframe_request.is_set():
+                self._keyframe_request.clear()
+                if live_started and now >= (
+                    last_client_keyframe_request + CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S
+                ):
+                    _send_start_live("client-join", now, min_interval=0.5)
+                    last_client_keyframe_request = now
 
             if now >= last_iva_heartbeat:
                 kcp.send_handshake()
