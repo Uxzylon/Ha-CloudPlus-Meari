@@ -112,9 +112,33 @@ def quality_profile_labels(device: dict[str, Any]) -> dict[int, str]:
     }
 
 
+def parse_quality_setting(device: dict[str, Any], raw: Any) -> int | None:
+    """Parse a stored quality option into a profile id, or None for Auto."""
+    if raw is None or raw == "":
+        return default_quality_profile(device)
+
+    text = str(raw).strip()
+    if text.upper() == AUTO_QUALITY_LABEL:
+        return None
+
+    profiles = parse_quality_profiles(device)
+    try:
+        profile_id = int(text)
+    except (TypeError, ValueError):
+        labels = {opt.label.upper(): opt.quality for opt in quality_options(device)}
+        return labels.get(text.upper(), default_quality_profile(device))
+
+    if profile_id in profiles:
+        return profile_id
+    explicit_id = profile_id - BPS2_STREAM_ID_BASE
+    if profile_id >= BPS2_STREAM_ID_BASE and explicit_id in profiles:
+        return explicit_id
+    return default_quality_profile(device)
+
+
 def default_quality_profile(device: dict[str, Any]) -> int | None:
-    """Default to app-style Auto when available, else the highest profile."""
-    return auto_quality_profile(device)
+    """Default to the highest explicit profile; Auto must be selected explicitly."""
+    return best_quality_profile(device)
 
 
 def stream_id_for_quality(device: dict[str, Any], quality: int | None) -> int:

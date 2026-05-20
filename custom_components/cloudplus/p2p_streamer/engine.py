@@ -437,7 +437,7 @@ class P2PStreamer:
                     api_server_hint=api_hint,
                     client_id_hint=client_id_hint,
                 )
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "Signaling candidate %s:%d failed: %s",
                     sig_ip,
                     sig_port,
@@ -456,7 +456,7 @@ class P2PStreamer:
                     sig.close()
 
         if last_error is not None and self._running:
-            _LOGGER.debug("All signaling candidates failed: %s", last_error)
+            _LOGGER.warning("All signaling candidates failed: %s", last_error)
         return (self._video_count, self._total_bytes)
 
     def _log_session_done(self) -> None:
