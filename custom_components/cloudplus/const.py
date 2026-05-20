@@ -13,6 +13,7 @@ CONF_DEVICE_NAME = "device_name"
 CONF_HOST_KEY = "host_key"
 CONF_MOTION_TIMEOUT = "motion_timeout"
 CONF_VIDEO_PASSWORD = "video_password"
+CONF_STREAM_QUALITY = "stream_quality"
 
 DEFAULT_MOTION_TIMEOUT = 120
 DEFAULT_COUNTRY_CODE = "FR"
