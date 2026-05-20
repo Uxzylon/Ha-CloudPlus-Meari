@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import CONF_STREAM_QUALITY, DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
 from .meari_commands import (
     ALARM_FREQUENCY,
@@ -279,6 +279,8 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
     def current_option(self) -> str:
         quality = self._coordinator.vvp_quality
         if quality is None:
+            if self._coordinator.supports_auto_quality:
+                return _AUTO_LABEL
             if self._profiles:
                 return self._profiles[max(self._profiles)]
             return None
@@ -286,6 +288,11 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Change stream quality profile."""
+        if option not in self._label_to_id:
+            return
         quality_id = self._label_to_id.get(option)
         self._coordinator.set_vvp_quality(quality_id)
+        options = dict(self._entry.options)
+        options[CONF_STREAM_QUALITY] = _AUTO_LABEL if quality_id is None else quality_id
+        self.hass.config_entries.async_update_entry(self._entry, options=options)
         self.async_write_ha_state()

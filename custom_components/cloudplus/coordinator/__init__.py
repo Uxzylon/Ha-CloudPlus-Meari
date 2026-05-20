@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from ..api import MeariApiClient
 from ..const import (
+    CONF_STREAM_QUALITY,
     DEFAULT_APP_PROFILE,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_MOTION_TIMEOUT,
@@ -22,7 +23,7 @@ from ..const import (
 from ..p2p_streamer import (
     ADAPTIVE_STREAM_ID,
     P2PStreamer,
-    default_quality_profile,
+    parse_quality_setting,
     stream_id_for_quality,
 )
 from ..p2p_streamer.codecs import (
@@ -163,7 +164,8 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._stream_idr_seed_generation = 0
         self._startup_safe_min_seed_generation = 0
 
-        self._vvp_quality: int | None = None
+        quality_setting = entry.options.get(CONF_STREAM_QUALITY) if entry else None
+        self._vvp_quality: int | None = parse_quality_setting(device, quality_setting)
         self._codec_params = CodecParameterCache()
         self._stream_started_keyframe = False
 
@@ -554,9 +556,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         return max(0.001, delta_ms / 1000.0)
 
     def _stream_quality(self) -> int | None:
-        if self._vvp_quality is not None:
-            return self._vvp_quality
-        return default_quality_profile(self._device)
+        return self._vvp_quality
 
     def _remember_idle_frame(self, codec: str, payload: bytes) -> None:
         frame = bytes(payload)
