@@ -8,6 +8,7 @@ from .mpegts import (
     TS_PACKET_SIZE,
     VIDEO_PID,
     codec_from_pmt_packet,
+    packet_has_random_access,
     packet_pid,
 )
 from ..p2p_streamer.codecs import CodecName, nal_types, spec_for
@@ -37,11 +38,17 @@ class StreamBootstrap:
         self._seed_strong = False
 
     def snapshot(self) -> bytes:
+        if self._pending_has_idr:
+            fresh = self._fresh_pending_seed()
+            if fresh:
+                return self._trim_to_video_start(fresh)
         if self._seed and self._pending_group:
             combined_len = len(self._seed) + len(self._pending_group)
             if combined_len <= self._max_bytes:
-                return self._seed + bytes(self._pending_group)
-        return self._seed
+                return self._trim_to_video_start(
+                    self._seed + bytes(self._pending_group)
+                )
+        return self._trim_to_video_start(self._seed)
 
     def state(self) -> dict[str, int | bool]:
         bytes_ready = len(self._seed)
@@ -127,6 +134,52 @@ class StreamBootstrap:
     def _publish_seed(self) -> None:
         if len(self._buf) <= self._max_bytes:
             self._seed = bytes(self._buf)
+
+    def _fresh_pending_seed(self) -> bytes:
+        if not self._pending_group:
+            return b""
+        seed = bytearray()
+        if self._pat_packet:
+            seed.extend(self._pat_packet)
+        if self._pmt_packet:
+            seed.extend(self._pmt_packet)
+        seed.extend(self._pending_group)
+        if len(seed) > self._max_bytes:
+            return b""
+        return bytes(seed)
+
+    def _trim_to_video_start(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        usable = (len(data) // TS_PACKET_SIZE) * TS_PACKET_SIZE
+        if usable <= 0:
+            return b""
+
+        first_video = -1
+        first_random_access = -1
+        for off in range(0, usable, TS_PACKET_SIZE):
+            packet = data[off : off + TS_PACKET_SIZE]
+            if packet[0] != 0x47 or packet_pid(packet) != VIDEO_PID:
+                continue
+            if first_video < 0:
+                first_video = off
+            if packet_has_random_access(packet):
+                first_random_access = off
+                break
+
+        start = first_random_access if first_random_access >= 0 else first_video
+        if start < 0:
+            return b""
+        if start == 0:
+            return data[:usable]
+
+        seed = bytearray()
+        if self._pat_packet:
+            seed.extend(self._pat_packet)
+        if self._pmt_packet:
+            seed.extend(self._pmt_packet)
+        seed.extend(data[start:usable])
+        return bytes(seed)
 
     def _scan_video_packet(self, packet: bytes) -> None:
         payload = self._video_payload(packet)

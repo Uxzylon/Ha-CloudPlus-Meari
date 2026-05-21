@@ -127,11 +127,12 @@ def _contact_endpoints(response: dict) -> list[tuple[str, int]]:
     if not 1 <= port <= 65535:
         return []
 
-    host = _host(response.get("host") or contact.get("host") or contact.get("domain"))
-    endpoints = [(ip, port) for ip in (_resolve_ips(host) if host else [])]
+    endpoints = []
     contact_ip = _host(contact.get("ip"))
     if contact_ip:
         endpoints.append((contact_ip, port))
+    host = _host(response.get("host") or contact.get("host") or contact.get("domain"))
+    endpoints.extend((ip, port) for ip in (_resolve_ips(host) if host else []))
     return _dedupe(endpoints)
 
 
@@ -175,9 +176,10 @@ def _parent_queries(
     code: str,
     client_id_hint: str | int | None,
 ) -> list[dict]:
+    native_uuid = _conf_body(code="", client_id_hint=client_id_hint, parent=True)
     native = _conf_body(code=code, client_id_hint=client_id_hint, parent=True)
     fallback = _conf_body(code="", client_id_hint=None, parent=True)
-    return _dedupe((native, fallback))
+    return _dedupe((native_uuid, native, fallback))
 
 
 def _root_queries(
@@ -185,10 +187,11 @@ def _root_queries(
     code: str,
     client_id_hint: str | int | None,
 ) -> list[dict]:
+    native_uuid = _conf_body(code="", client_id_hint=client_id_hint)
     native = _conf_body(code=code, client_id_hint=client_id_hint)
+    native_no_uuid = _conf_body(code="", client_id_hint=None)
     region_only = _conf_body(code=code, client_id_hint=None)
-    fallback = _conf_body(code="", client_id_hint=None)
-    return _dedupe((native, region_only, fallback))
+    return _dedupe((native_uuid, native_no_uuid, native, region_only))
 
 
 def discover_msgsvr_endpoints(

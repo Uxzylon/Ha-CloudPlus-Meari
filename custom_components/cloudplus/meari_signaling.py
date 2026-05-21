@@ -49,9 +49,10 @@ class MsgSvrClient:
     negotiation, and SDP offer/answer exchange via webrtcsvr.
     """
 
-    def __init__(self, server_host, server_port=28974):
+    def __init__(self, server_host, server_port=28974, *, session_index: int = 1):
         self.server_host = server_host
         self.server_port = server_port
+        self.session_index = max(1, min(99, int(session_index or 1)))
         self.sock = None
         self.uuid = None
         self.token = None
@@ -60,6 +61,12 @@ class MsgSvrClient:
         self._registered_at = time.monotonic()
         self._register_extra: dict[str, str | int] = {}
         self._io_lock = threading.Lock()
+
+    def _session_suffix(self) -> str:
+        return f"{self.session_index:02d}"
+
+    def _session_id(self) -> str:
+        return f"{self.uuid}:{self._session_suffix()}"
 
     def connect(self, timeout_s=10.0):
         """TCP connect to signaling server."""
@@ -133,24 +140,29 @@ class MsgSvrClient:
         app_ver="5.9.2a16",
         country="FR",
         sdk_ver: int = 15259,
+        client_uuid: str | None = None,
     ):
         """Step 1: Register with signaling server. Returns uuid and token."""
-        msg = json.dumps(
-            {
-                "action": "register",
-                "transport": "tcp",
-                "type": "binary",
-                "ver": int(sdk_ver),
-                "runtime": 0,
-                "extra_params": {
-                    "brand": brand,
-                    "clientid": str(client_id),
-                    "v": app_ver,
-                    "c": country,
-                },
+        body = {
+            "action": "register",
+            "transport": "tcp",
+            "type": "binary",
+            "nat": {
+                "local_port": self.sock.getsockname()[1] if self.sock else 0,
+                "medium": [{"mode": "xts", "transport": "udp", "type": "binary"}],
             },
-            separators=(",", ":"),
-        )
+            "ver": int(sdk_ver),
+            "runtime": 0,
+            "extra_params": {
+                "brand": brand,
+                "clientid": str(client_id),
+                "v": app_ver,
+                "c": country,
+            },
+        }
+        if client_uuid:
+            body["uuid"] = str(client_uuid)
+        msg = json.dumps(body, separators=(",", ":"))
 
         self._send(METHOD_DIRECT, CMD_REGISTER, msg)
         resp = self._recv()
@@ -305,7 +317,7 @@ class MsgSvrClient:
 
     def request_coturn(self, device_uuid):
         """Step 5: Request TURN credentials via webrtcsvr."""
-        sid = f"{self.uuid}:01"
+        sid = self._session_id()
         self._send_webrtc(
             {
                 "cmd": "option",
@@ -319,8 +331,8 @@ class MsgSvrClient:
 
     def send_offer(self, device_uuid, sdp):
         """Step 6: Send SDP offer with ICE candidates."""
-        sid = f"{self.uuid}:01"
-        tag = self.webrtcsvr["tag"] + "01"
+        sid = self._session_id()
+        tag = self.webrtcsvr["tag"] + self._session_suffix()
 
         self._send_webrtc(
             {
@@ -338,7 +350,7 @@ class MsgSvrClient:
 
     def send_candidate_complete(self, device_uuid):
         """Step 7: Signal ICE candidate negotiation complete."""
-        sid = f"{self.uuid}:01"
+        sid = self._session_id()
         self._send_webrtc(
             {
                 "cmd": "candidate",
@@ -356,7 +368,7 @@ class MsgSvrClient:
 
     def send_logout(self, device_uuid):
         """Disconnect session."""
-        sid = f"{self.uuid}:01"
+        sid = self._session_id()
         self._send_webrtc(
             {
                 "cmd": "logout",
