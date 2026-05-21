@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import socket
 import threading
@@ -45,8 +46,8 @@ from .codecs import (
     runtime_policy_for,
 )
 from .protocol import (
-    VVP_CMD_STOP,
     VVP_CMD_HEARTBEAT,
+    VVP_CMD_STOP,
     VVP_CMD_START_LIVE,
     STREAM_TYPE_AUDIO,
     STREAM_TYPE_IFRAME,
@@ -66,13 +67,13 @@ from .quality import stream_id_for_quality
 
 _LOGGER = logging.getLogger(__name__)
 
-START_LIVE_RETRY_S = 1.5
-VVP_HEARTBEAT_S = 10.0
 IVA_HEARTBEAT_S = 3.0
+VVP_HEARTBEAT_S = 10.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 SIGNALING_CONNECT_TIMEOUT_S = 5.0
 CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S = 4.0
+_CLIENT_SESSION_LOCK = threading.Lock()
 
 
 class SignalingClusterMiss(RuntimeError):
@@ -90,6 +91,52 @@ def _unwrap_iva_payload(data: bytes) -> bytes:
     return data
 
 
+def _client_uuid_for(api: Any, client_id: str | None = None) -> str:
+    override = str(os.environ.get("CLOUDPLUS_CLIENT_UUID") or "").strip().lower()
+    if len(override) == 16 and all(ch in "0123456789abcdef" for ch in override):
+        return override
+    identity = str(client_id or getattr(api, "user_id", "") or "").strip()
+    cache = getattr(api, "_p2p_client_uuids", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(api, "_p2p_client_uuids", cache)
+    existing = str(cache.get(identity) or "")
+    if existing:
+        return existing
+    seed = "|".join(
+        (
+            "cloudplus-p2p",
+            str(getattr(api, "app_profile", "") or ""),
+            identity,
+        )
+    )
+    value = hashlib.md5(seed.encode()).hexdigest()[:16]
+    cache[identity] = value
+    return value
+
+
+def _next_session_index(api: Any) -> int:
+    with _CLIENT_SESSION_LOCK:
+        current = int(getattr(api, "_p2p_session_index", 0) or 0)
+        index = current + 1 if current < 99 else 1
+        setattr(api, "_p2p_session_index", index)
+        return index
+
+
+def _client_id_for(api: Any, device: dict[str, Any], override: Any = None) -> str:
+    for value in (
+        override,
+        device.get("_iot_client_id"),
+        device.get("iotClientId"),
+        device.get("clientId"),
+        getattr(api, "user_id", None),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "0"
+
+
 class P2PStreamer:
     """Runs a CloudPlus/Meari camera P2P stream using TURN + KCP + VVP."""
 
@@ -105,6 +152,7 @@ class P2PStreamer:
         remote: bool = False,
         vvp_quality: int | None = None,
         video_password: str | None = None,
+        client_id: Any = None,
     ) -> None:
         self._api = api
         self._device = device
@@ -114,6 +162,10 @@ class P2PStreamer:
         self._host_key = device.get("hostKey", "")
         self._video_password = (video_password or "").strip()
         self._remote = remote
+        self._prefer_relay = self._is_snap
+        self._client_id = _client_id_for(api, device, client_id)
+        self._client_uuid = _client_uuid_for(api, self._client_id)
+        self._webrtc_session_index = _next_session_index(api)
         self._vvp_stream_id = stream_id_for_quality(device, vvp_quality)
         app_profile = str(getattr(api, "app_profile", "") or "").lower()
         self._vvp_stream_flag = 0 if app_profile == "cloudedge" else 1
@@ -243,20 +295,35 @@ class P2PStreamer:
         return score
 
     def _parse_video_chunk(self, chunk: bytes):
-        if self._video_decrypt is True:
-            return parse_stream_frame(bytes(decrypt_stream_frame(bytearray(chunk))))
-        if self._video_decrypt is False:
+        def _raw():
             return parse_stream_frame(chunk)
 
-        raw = parse_stream_frame(chunk)
-        decrypted = bytes(decrypt_stream_frame(bytearray(chunk)))
-        dec = parse_stream_frame(decrypted)
+        def _decrypted():
+            return parse_stream_frame(bytes(decrypt_stream_frame(bytearray(chunk))))
+
+        raw = dec = None
+        if self._video_decrypt is True:
+            dec = _decrypted()
+            if self._video_parse_score(dec) >= 5:
+                return dec
+            raw = _raw()
+        elif self._video_decrypt is False:
+            raw = _raw()
+            if self._video_parse_score(raw) >= 5:
+                return raw
+            dec = _decrypted()
+        else:
+            raw = _raw()
+            dec = _decrypted()
+
         raw_score = self._video_parse_score(raw)
         dec_score = self._video_parse_score(dec)
         if raw_score > dec_score:
-            self._video_decrypt = False
+            if self._video_decrypt is None:
+                self._video_decrypt = False
             return raw
-        self._video_decrypt = True
+        if self._video_decrypt is None:
+            self._video_decrypt = True
         return dec
 
     def _parse_stream_chunk(self, chunk: bytes):
@@ -393,7 +460,7 @@ class P2PStreamer:
         platform_hint = getattr(self._api, "platform_domain", None)
         openapi_hint = getattr(self._api, "openapi_server", None)
         api_hint = getattr(self._api, "api_server", None)
-        client_id_hint = getattr(self._api, "user_id", None)
+        client_id_hint = self._client_uuid
         candidates = _resolve_signaling_server_candidates(
             platform_domain_hint=platform_hint,
             openapi_server_hint=openapi_hint,
@@ -412,7 +479,11 @@ class P2PStreamer:
                     getattr(self._api, "app_profile", "unknown"),
                     self._vvp_stream_id,
                 )
-                sig = MsgSvrClient(sig_ip, sig_port)
+                sig = MsgSvrClient(
+                    sig_ip,
+                    sig_port,
+                    session_index=self._webrtc_session_index,
+                )
                 self._active_sig = sig
                 sig.connect(timeout_s=SIGNALING_CONNECT_TIMEOUT_S)
                 return self._do_stream(
@@ -495,10 +566,11 @@ class P2PStreamer:
 
         app_ver = str(getattr(api, "_app_ver", "5.9.2") or "5.9.2")
         sig.register(
-            client_id=api.user_id,
+            client_id=self._client_id,
             brand=str(getattr(api, "_source_app", "77") or "77"),
             app_ver=f"{app_ver}a16" if "a" not in app_ver else app_ver,
             country=api.country_code,
+            client_uuid=self._client_uuid,
         )
         sig.webrtc_hello_full()
 
@@ -540,7 +612,7 @@ class P2PStreamer:
             platform_domain_hint=getattr(api, "platform_domain", None),
             openapi_server_hint=getattr(api, "openapi_server", None),
             api_server_hint=getattr(api, "api_server", None),
-            client_id_hint=getattr(api, "user_id", None),
+            client_id_hint=self._client_uuid,
         )
         coturn = sig.request_coturn(device_uuid)
         turn = TurnClient(
@@ -608,12 +680,6 @@ class P2PStreamer:
                 sdp_lines.append(
                     f"a=candidate:S{ip_hex} 1 UDP 1862270975 {turn.mapped_ip} {turn.mapped_port} typ srflx"
                 )
-        if turn.relay_ip:
-            relay_hex = socket.inet_aton(local_ips[0]).hex()
-            sdp_lines.append(
-                f"a=candidate:S{relay_hex} 1 UDP 1862270975 {turn.relay_ip} {turn.relay_port} typ srflx"
-            )
-
         offer_tag = str((sig.webrtcsvr or {}).get("tag") or "") + "01"
         answer = sig.send_offer(device_uuid, "\n".join(sdp_lines) + "\n")
         camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
@@ -793,8 +859,8 @@ class P2PStreamer:
                 return False
             kcp.send_iva_data(_next_vvp(VVP_CMD_START_LIVE))
             last_start_live = now_ts
-            live_started = True
             last_heartbeat = now_ts + VVP_HEARTBEAT_S
+            live_started = True
             keyframe_wait = gap_recovery_for(self._video_codec).keyframe_wait_s
             if wait_for_recovery_keyframe and keyframe_wait > 0.0:
                 wait_for_keyframe_until = max(
@@ -1032,17 +1098,24 @@ class P2PStreamer:
             if is_kcp:
                 if (
                     peer is not None
-                    and confirmed_peer[0] is None
                     and not is_turn_server_stun
                     and peer[0] != getattr(turn, "server_ip", None)
                 ):
                     direct = not packet.via_turn and not self._remote
-                    confirmed_peer[0] = (peer[0], peer[1], direct)
-                    _LOGGER.debug(
-                        "Confirmed media peer %s via %s",
-                        format_endpoint(peer),
-                        "direct" if direct else "turn",
-                    )
+                    current = confirmed_peer[0]
+                    prefer_direct = direct and not self._prefer_relay
+                    prefer_relay = not direct and self._prefer_relay
+                    if (
+                        current is None
+                        or (prefer_direct and not current[2])
+                        or (prefer_relay and current[2])
+                    ):
+                        confirmed_peer[0] = (peer[0], peer[1], direct)
+                        _LOGGER.debug(
+                            "Confirmed media peer %s via %s",
+                            format_endpoint(peer),
+                            "direct" if direct else "turn",
+                        )
                 if is_iva or (first_segment and first_segment["cmd"] == KCP_CMD_PUSH):
                     last_kcp_push_time = time.time()
                 elif any(seg["cmd"] == KCP_CMD_PUSH for seg in segments):
@@ -1064,7 +1137,6 @@ class P2PStreamer:
         kcp.send_handshake()
         now = time.time()
         last_iva_heartbeat = now + IVA_HEARTBEAT_S
-        last_heartbeat = float("inf")
 
         while self._running:
             now = time.time()
@@ -1087,12 +1159,6 @@ class P2PStreamer:
                     ).start()
                 next_signal_heartbeat = now + signal_heartbeat_s
 
-            if live_started and now >= last_heartbeat:
-                kcp.send_iva_data(
-                    _next_vvp(VVP_CMD_HEARTBEAT, stream_id=0, stream_flag=0)
-                )
-                last_heartbeat = now + VVP_HEARTBEAT_S
-
             if self._keyframe_request.is_set():
                 self._keyframe_request.clear()
                 if live_started and now >= (
@@ -1105,22 +1171,15 @@ class P2PStreamer:
                 kcp.send_handshake()
                 last_iva_heartbeat = now + IVA_HEARTBEAT_S
 
-            waiting_first_video = last_video_time <= 0.0
-            waiting_first_partial = bool(
-                getattr(kcp, "recv_buf", None) or getattr(kcp, "recv_frag_buf", None)
-            )
-            kcp_rx_idle = (
-                now - last_kcp_push_time if last_kcp_push_time > 0.0 else float("inf")
-            )
+            if live_started and now >= last_heartbeat:
+                kcp.send_iva_data(
+                    _next_vvp(VVP_CMD_HEARTBEAT, stream_id=0, stream_flag=0)
+                )
+                last_heartbeat = now + VVP_HEARTBEAT_S
+
             if not live_started:
                 if kcp.handshake_done:
                     _send_start_live("handshake", now)
-            elif (
-                waiting_first_video
-                and (not waiting_first_partial or kcp_rx_idle >= START_LIVE_RETRY_S)
-                and now >= last_start_live + START_LIVE_RETRY_S
-            ):
-                _send_start_live("retry", now)
             else:
                 keepalive_s = runtime_policy_for(
                     self._video_codec
