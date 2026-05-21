@@ -58,8 +58,8 @@ STATUS_POLL_INTERVAL = 300.0
 LIVE_VIDEO_STALL_RESTART_S = 12.0
 LIVE_STARTUP_STALL_RESTART_S = 25.0
 LIVE_VIDEO_MIN_INTERVAL = 1.0 / 30.0
-LIVE_ADAPTIVE_IPC_MUX_HOLD_S = 0.0
-LIVE_ADAPTIVE_IPC_MUX_QUIET_S = 0.0
+LIVE_ADAPTIVE_IPC_MUX_HOLD_S = 1.0
+LIVE_ADAPTIVE_IPC_MUX_QUIET_S = 1.2
 LIVE_P2P_VIDEO_GAP_S = 1.0
 SNAPSHOT_CARD_REFRESH_INTERVAL = 3.0
 SNAPSHOT_CARD_REQUEST_TTL = 30.0
@@ -786,6 +786,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 on_disconnect=lambda: None,
                 vvp_quality=self._stream_quality(),
                 video_password=self._video_password,
+                client_id=self.get_iot_value(1),
             )
             self._p2p_streamer = streamer
             try:

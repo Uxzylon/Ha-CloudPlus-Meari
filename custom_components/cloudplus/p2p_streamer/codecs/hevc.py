@@ -5,22 +5,22 @@ from __future__ import annotations
 from .base import CodecRuntimePolicy, GapRecoveryPolicy
 
 GAP_RECOVERY = GapRecoveryPolicy(
-    skip_wait_s=3.6,
-    skip_interval_s=1.4,
+    skip_wait_s=1.6,
+    skip_interval_s=1.0,
     keyframe_wait_s=8.0,
 )
 MPEGTS_STREAM_TYPE = 0x24
 PARAM_NAL_TYPES = frozenset({32, 33, 34})
 KEYFRAME_NAL_TYPES = frozenset({19, 20})
 STARTUP_BACKLOG_FRAMES = 60
-TIMESTAMP_TIMED_MUX = True
-ADAPTIVE_ARRIVAL_TIMED_MUX = True
+TIMESTAMP_TIMED_MUX = False
+ADAPTIVE_ARRIVAL_TIMED_MUX = False
 ADAPTIVE_TIMESTAMP_TIMED_MUX = False
 RUNTIME_POLICY = CodecRuntimePolicy(
     clean_startup_seed=True,
     runtime_stall_timeout_s=18.0,
     source_idle_reconnect_s=8.0,
-    startup_seed_min_generations=3,
+    startup_seed_min_generations=2,
 )
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import collections
 import socket
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable, Deque
 
@@ -13,7 +12,6 @@ from .stream_bootstrap import StreamBootstrap
 
 CLIENT_QUEUE_CHUNKS = 4096
 CLIENT_SEND_TIMEOUT_S = 10.0
-FRESH_BOOTSTRAP_WAIT_S = 3.0
 
 
 @dataclass
@@ -22,7 +20,6 @@ class _Client:
     queue: Deque[bytes]
     event: threading.Event
     wait_generation: int = 0
-    wait_deadline: float = 0.0
 
 
 class StreamServer:
@@ -99,19 +96,15 @@ class StreamServer:
         with self._lock:
             self._bootstrap.update(data)
             generation = int(self._bootstrap.state().get("generation", 0) or 0)
-            now = time.monotonic()
             for client in self._clients:
                 released = False
-                if client.wait_generation and (
-                    generation >= client.wait_generation or now >= client.wait_deadline
-                ):
+                if client.wait_generation and generation >= client.wait_generation:
                     bootstrap = self._bootstrap.snapshot()
                     if bootstrap:
                         client.queue.clear()
                         client.queue.append(bootstrap)
                         client.event.set()
                     client.wait_generation = 0
-                    client.wait_deadline = 0.0
                     released = True
                 if not client.wait_generation and not released:
                     client.queue.append(data)
@@ -130,15 +123,13 @@ class StreamServer:
             queue: Deque[bytes] = collections.deque(maxlen=CLIENT_QUEUE_CHUNKS)
             event = threading.Event()
             wait_generation = 0
-            wait_deadline = 0.0
             with self._lock:
                 bootstrap = self._bootstrap.snapshot()
                 target_generation = self._bootstrap_generation_unlocked() + 1
-            if not bootstrap and self._on_missing_bootstrap is not None:
+            if self._on_missing_bootstrap is not None:
                 try:
                     if self._on_missing_bootstrap():
                         wait_generation = target_generation
-                        wait_deadline = time.monotonic() + FRESH_BOOTSTRAP_WAIT_S
                 except Exception:
                     pass
             with self._lock:
@@ -146,7 +137,6 @@ class StreamServer:
                     if self._bootstrap_generation_unlocked() >= wait_generation:
                         bootstrap = self._bootstrap.snapshot()
                         wait_generation = 0
-                        wait_deadline = 0.0
                     else:
                         bootstrap = b""
                 elif not bootstrap:
@@ -154,9 +144,7 @@ class StreamServer:
                 if bootstrap:
                     queue.append(bootstrap)
                     event.set()
-                self._clients.append(
-                    _Client(client, queue, event, wait_generation, wait_deadline)
-                )
+                self._clients.append(_Client(client, queue, event, wait_generation))
             threading.Thread(
                 target=self._client_writer,
                 args=(client, queue, event),

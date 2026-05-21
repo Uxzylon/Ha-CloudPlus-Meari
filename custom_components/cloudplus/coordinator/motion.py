@@ -12,6 +12,22 @@ from ..motion_event import parse_motion_event
 _LOGGER = logging.getLogger(__name__)
 
 
+def _event_topics(api: MeariApiClient) -> list[str]:
+    user_id = str(api.user_id or "").strip()
+    if not user_id:
+        return []
+
+    prefixes = [user_id]
+    client_id = str(getattr(api, "client_id", "") or "").strip()
+    if client_id and client_id != user_id:
+        prefixes.insert(0, client_id)
+
+    topics = [
+        f"$bsssvr/iot/{prefix}/{user_id}/event/update/accepted" for prefix in prefixes
+    ]
+    return list(dict.fromkeys(topics))
+
+
 class MotionEventListener:
     """Subscribe to cloud motion events and dispatch events for one camera."""
 
@@ -37,15 +53,25 @@ class MotionEventListener:
             _LOGGER.warning("paho-mqtt is not installed; motion events disabled")
             return
 
-        user_id = str(self._api.user_id)
-        topic = f"$bsssvr/iot/{user_id}/{user_id}/event/update/accepted"
+        user_id = str(self._api.user_id or "").strip()
+        topics = _event_topics(self._api)
+        if not user_id or not topics:
+            return
 
         def on_connect(client, _userdata, _flags, rc, *_args):
             if rc == 0:
-                client.subscribe(topic, qos=2)
-                _LOGGER.debug("MQTT motion listener subscribed to %s", topic)
+                for topic in topics:
+                    client.subscribe(topic, qos=2)
+                _LOGGER.debug(
+                    "MQTT motion listener subscribed to %s",
+                    ", ".join(topics),
+                )
             else:
                 _LOGGER.warning("MQTT motion listener connect failed: rc=%s", rc)
+
+        def on_disconnect(_client, _userdata, _flags, rc, *_args):
+            if rc:
+                _LOGGER.debug("MQTT motion listener disconnected: rc=%s", rc)
 
         def on_message(_client, _userdata, msg):
             self._handle_payload(msg.payload)
@@ -70,6 +96,7 @@ class MotionEventListener:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         client.tls_set_context(ssl_ctx)
         client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
         client.on_message = on_message
         client.reconnect_delay_set(min_delay=3, max_delay=60)
 
