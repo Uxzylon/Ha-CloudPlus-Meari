@@ -229,6 +229,7 @@ class MeariApiClient:
 
         self.api_server: str = ""
         self.user_id: Optional[int] = None
+        self.client_id: str = ""
         self.user_token: Optional[str] = None
 
         # OpenAPI / MQTT
@@ -501,6 +502,7 @@ class MeariApiClient:
                     )
                 result = data["result"]
                 self.user_id = result["userID"]
+                self.client_id = str(result.get("clientId") or "").strip()
                 self.user_token = result["userToken"]
                 self._apply_login_iot_config(result)
                 return
