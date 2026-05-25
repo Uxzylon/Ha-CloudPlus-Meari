@@ -698,6 +698,19 @@ class MeariApiClient:
             if str(d.get("_category", "")).lower() in CAMERA_CATEGORIES
         ]
 
+    def get_latest_alarm_events(self) -> list[dict[str, Any]]:
+        """Return newest alarm-message summaries for all devices."""
+        data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Latest alarm events failed: {data}")
+
+        result = data.get("result")
+        if isinstance(result, dict):
+            devices = result.get("device") or result.get("devices")
+        else:
+            devices = data.get("device")
+        return devices if isinstance(devices, list) else []
+
     def get_device_status(self, sn_num: str) -> str:
         """Query device status via OpenAPI. Returns online/offline/dormancy."""
         device_id = format_sn(sn_num)
