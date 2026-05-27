@@ -25,7 +25,7 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
     dev = _select_device(devices, args.device_id, args.sn)
 
     loop = asyncio.get_running_loop()
-    hass = types.SimpleNamespace(loop=loop)
+    hass = types.SimpleNamespace(loop=loop, data={})
     coord = CloudEdgeMeariCoordinator(
         hass=hass,
         email=args.email,
