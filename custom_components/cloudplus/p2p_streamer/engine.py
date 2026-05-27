@@ -32,6 +32,7 @@ from .network import (
 )
 from .sdp import (
     add_candidate_once,
+    candidates_from_response,
     collect_trickle_candidates,
     format_endpoint,
     parse_sdp_answer,
@@ -680,6 +681,11 @@ class P2PStreamer:
                 sdp_lines.append(
                     f"a=candidate:S{ip_hex} 1 UDP 1862270975 {turn.mapped_ip} {turn.mapped_port} typ srflx"
                 )
+        if turn.relay_ip and turn.relay_port:
+            relay_hex = socket.inet_aton(turn.relay_ip).hex()
+            sdp_lines.append(
+                f"a=candidate:R{relay_hex} 1 UDP 16777215 {turn.relay_ip} {turn.relay_port} typ srflx"
+            )
         offer_tag = str((sig.webrtcsvr or {}).get("tag") or "") + "01"
         answer = sig.send_offer(device_uuid, "\n".join(sdp_lines) + "\n")
         camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
@@ -690,6 +696,15 @@ class P2PStreamer:
         for cand in camera_candidates:
             add_candidate_once(deduped_candidates, cand)
         camera_candidates = deduped_candidates
+
+        complete = sig.send_candidate_complete(device_uuid)
+        if isinstance(complete, dict):
+            if complete.get("sdp"):
+                complete_ufrag, complete_pwd, _ = parse_sdp_answer(complete["sdp"])
+                camera_ufrag = camera_ufrag or complete_ufrag
+                camera_pwd = camera_pwd or complete_pwd
+            for cand in candidates_from_response(complete):
+                add_candidate_once(camera_candidates, cand)
 
         if not camera_candidates:
             _LOGGER.error("No camera candidate found")
@@ -709,25 +724,6 @@ class P2PStreamer:
             if cand.get("ip") and cand.get("port"):
                 turn.channel_bind(cand["ip"], cand["port"])
 
-        complete = sig.send_candidate_complete(device_uuid)
-        if isinstance(complete, dict):
-            _, _, complete_candidates = parse_sdp_answer(complete.get("sdp", ""))
-            candidate = complete.get("candidate")
-            if isinstance(candidate, dict):
-                cip = candidate.get("ip")
-                cport = candidate.get("port")
-                if cip and cport:
-                    complete_candidates.append(
-                        {
-                            "ip": cip,
-                            "port": int(cport),
-                            "type": candidate.get("type", "relay"),
-                        }
-                    )
-            for cand in complete_candidates:
-                if add_candidate_once(camera_candidates, cand):
-                    turn.create_permission(cand["ip"])
-                    turn.channel_bind(cand["ip"], cand["port"])
         probe_hosts = []
         for host in (coturn_ip, coturn_host):
             host = str(host or "").strip()
