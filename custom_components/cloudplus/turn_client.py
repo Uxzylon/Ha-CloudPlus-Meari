@@ -291,20 +291,7 @@ class TurnClient:
             struct.pack(">I", UDP_TRANSPORT_VALUE << 24),
         )
 
-        # Step 1: unauthenticated request to get nonce
-        resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=False)
-        if resp and resp["type"] == ALLOCATE_ERROR:
-            if ATTR_NONCE in resp["attrs"]:
-                self.nonce = resp["attrs"][ATTR_NONCE]
-            if ATTR_REALM in resp["attrs"]:
-                self.realm = resp["attrs"][ATTR_REALM].rstrip(b"\x00").decode()
-
-        if not self.nonce:
-            raise RuntimeError("TURN server did not provide nonce")
-
-        # Step 2: authenticated request
-        resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=True)
-        if resp and resp["type"] == ALLOCATE_RESPONSE:
+        def apply_success(resp):
             if ATTR_XOR_RELAYED_ADDRESS in resp["attrs"]:
                 self.relay_ip, self.relay_port = _decode_xor_address(
                     resp["attrs"][ATTR_XOR_RELAYED_ADDRESS]
@@ -313,7 +300,48 @@ class TurnClient:
                 self.mapped_ip, self.mapped_port = _decode_xor_address(
                     resp["attrs"][ATTR_XOR_MAPPED_ADDRESS]
                 )
-            return True
+            return bool(self.relay_ip and self.relay_port)
+
+        def error_text(resp):
+            err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
+            if len(err) < 4:
+                return ""
+            code = err[2] * 100 + err[3]
+            reason = err[4:].decode("utf-8", errors="replace")
+            return f"TURN Allocate error {code}: {reason}".rstrip()
+
+        last_error = ""
+
+        # Step 1: unauthenticated request to get nonce.
+        # A few relay deployments accept the first request directly, so treat a
+        # success here as a valid allocation instead of requiring a nonce.
+        for _attempt in range(3):
+            resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=False)
+            if resp and resp["type"] == ALLOCATE_RESPONSE:
+                return apply_success(resp)
+            if resp and resp["type"] == ALLOCATE_ERROR:
+                last_error = error_text(resp)
+                if ATTR_NONCE in resp["attrs"]:
+                    self.nonce = resp["attrs"][ATTR_NONCE]
+                if ATTR_REALM in resp["attrs"]:
+                    self.realm = (
+                        resp["attrs"][ATTR_REALM]
+                        .rstrip(b"\x00")
+                        .decode("utf-8", errors="replace")
+                    )
+                if self.nonce:
+                    break
+            else:
+                last_error = "timed out"
+
+        if not self.nonce:
+            suffix = f" ({last_error})" if last_error else ""
+            raise RuntimeError(f"TURN server did not provide nonce{suffix}")
+
+        # Step 2: authenticated request
+        resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=True)
+        if resp and resp["type"] == ALLOCATE_RESPONSE:
+            return apply_success(resp)
         elif resp:
             err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
             if len(err) >= 4:
