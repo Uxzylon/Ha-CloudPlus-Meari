@@ -19,6 +19,7 @@ from ..const import (
     DEFAULT_COUNTRY_CODE,
     DEFAULT_MOTION_TIMEOUT,
     DEFAULT_PHONE_CODE,
+    DOMAIN,
 )
 from ..p2p_streamer import (
     ADAPTIVE_STREAM_ID,
@@ -136,6 +137,8 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._p2p_streamer: P2PStreamer | None = None
         self._last_p2p_diagnostics: dict[str, Any] = {}
         self._motion_listener: MotionEventListener | None = None
+        self._motion_listener_key: tuple[str, ...] | None = None
+        self._motion_listener_unsub: Callable[[], None] | None = None
         self._wake_event = threading.Event()
         self._idle_stop = threading.Event()
         self._idle_frame_ready = threading.Event()
@@ -434,16 +437,40 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
 
     def _start_motion_listener(self, api: MeariApiClient) -> None:
         self._stop_motion_listener()
-        self._motion_listener = MotionEventListener(
-            api, self._device_id, self._sn_num, self._note_motion
+        key = (
+            self._email,
+            self._country_code,
+            self._phone_code,
+            self._app_profile,
         )
+        listeners = self.hass.data.setdefault(DOMAIN, {}).setdefault(
+            "_motion_listeners", {}
+        )
+        listener = listeners.get(key)
+        if listener is None:
+            listener = MotionEventListener(api)
+            listeners[key] = listener
+        self._motion_listener_unsub = listener.register(
+            self._device_id, self._sn_num, self._note_motion
+        )
+        self._motion_listener = listener
+        self._motion_listener_key = key
         self._motion_listener.start()
 
     def _stop_motion_listener(self) -> None:
+        unsub = self._motion_listener_unsub
         listener = self._motion_listener
+        key = self._motion_listener_key
+        self._motion_listener_unsub = None
         self._motion_listener = None
-        if listener is not None:
+        self._motion_listener_key = None
+        if unsub is not None:
+            unsub()
+        if listener is not None and not listener.has_callbacks:
             listener.stop()
+            listeners = self.hass.data.get(DOMAIN, {}).get("_motion_listeners", {})
+            if key is not None and listeners.get(key) is listener:
+                listeners.pop(key, None)
 
     def _start_idle_loop(self) -> None:
         if not self._is_snap:
