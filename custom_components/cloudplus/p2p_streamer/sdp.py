@@ -37,16 +37,24 @@ def parse_sdp_answer(sdp: str) -> tuple[str, str, list[dict[str, Any]]]:
             camera_pwd = line.split(":", 1)[1].strip()
         elif line.startswith("c=IN IP4 "):
             camera_sdp_ip = line.split("c=IN IP4 ", 1)[1].strip()
-        elif line.startswith("m=audio "):
+        elif line.startswith("m="):
             parts = line.split()
-            if len(parts) > 1 and parts[1].isdigit():
-                camera_sdp_port = int(parts[1])
+            try:
+                if len(parts) > 1:
+                    camera_sdp_port = int(parts[1])
+            except (TypeError, ValueError):
+                pass
         elif line.startswith("a=candidate:"):
             parts = line.split()
             if len(parts) >= 6:
-                add_candidate(
-                    parts[4], int(parts[5]), parts[7] if len(parts) > 7 else "relay"
-                )
+                try:
+                    add_candidate(
+                        parts[4],
+                        int(parts[5]),
+                        parts[7] if len(parts) > 7 else "relay",
+                    )
+                except (TypeError, ValueError):
+                    pass
 
     if camera_sdp_ip and camera_sdp_port:
         media_candidate = {
@@ -66,6 +74,31 @@ def parse_sdp_answer(sdp: str) -> tuple[str, str, list[dict[str, Any]]]:
     return camera_ufrag, camera_pwd, camera_candidates
 
 
+def candidates_from_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract ICE candidates from a WebRTC signaling response."""
+    candidates: list[dict[str, Any]] = []
+    sdp = response.get("sdp", "")
+    if sdp:
+        _, _, candidates = parse_sdp_answer(str(sdp))
+
+    candidate = response.get("candidate")
+    if isinstance(candidate, dict):
+        ip = candidate.get("ip")
+        port = candidate.get("port")
+        if ip and port:
+            try:
+                candidates.append(
+                    {
+                        "ip": str(ip),
+                        "port": int(port),
+                        "type": str(candidate.get("type") or "relay"),
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
+    return candidates
+
+
 def collect_trickle_candidates(
     sig: MsgSvrClient, camera_candidates: list[dict[str, Any]]
 ) -> None:
@@ -81,22 +114,7 @@ def collect_trickle_candidates(
                 break
             if not isinstance(extra, dict):
                 continue
-            sdp = extra.get("sdp", "")
-            if sdp:
-                _, _, extra_candidates = parse_sdp_answer(sdp)
-                camera_candidates.extend(extra_candidates)
-            candidate = extra.get("candidate")
-            if isinstance(candidate, dict):
-                ip = candidate.get("ip")
-                port = candidate.get("port")
-                if ip and port:
-                    camera_candidates.append(
-                        {
-                            "ip": ip,
-                            "port": int(port),
-                            "type": candidate.get("type", "relay"),
-                        }
-                    )
+            camera_candidates.extend(candidates_from_response(extra))
     finally:
         sig.sock.settimeout(old_timeout)
 
