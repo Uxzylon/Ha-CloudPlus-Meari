@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import ssl
+import threading
 from typing import Callable
 
 from ..api import MeariApiClient
 from ..motion_event import parse_motion_event
 
 _LOGGER = logging.getLogger(__name__)
+ALARM_POLL_INTERVAL = 15.0
+ALARM_POLL_ERROR_INTERVAL = 60.0
 
 
 def _event_topics(api: MeariApiClient) -> list[str]:
@@ -29,28 +33,51 @@ def _event_topics(api: MeariApiClient) -> list[str]:
 
 
 class MotionEventListener:
-    """Subscribe to cloud motion events and dispatch events for one camera."""
+    """Account-scoped Meari MQTT listener that dispatches camera motion events."""
 
-    def __init__(
+    def __init__(self, api: MeariApiClient) -> None:
+        self._api = api
+        self._client = None
+        self._callbacks: list[tuple[str, str, Callable[[str], None]]] = []
+        self._lock = threading.Lock()
+        self._stop_poll = threading.Event()
+        self._poll_thread: threading.Thread | None = None
+        self._seen_alarm_keys: set[tuple[str, str, str]] = set()
+
+    @property
+    def has_callbacks(self) -> bool:
+        with self._lock:
+            return bool(self._callbacks)
+
+    def register(
         self,
-        api: MeariApiClient,
         device_id: int,
         sn_num: str,
         on_motion: Callable[[str], None],
-    ) -> None:
-        self._api = api
-        self._device_id = str(device_id)
-        self._sn_num = sn_num
-        self._on_motion = on_motion
-        self._client = None
+    ) -> Callable[[], None]:
+        item = (str(device_id), str(sn_num), on_motion)
+        with self._lock:
+            self._callbacks.append(item)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                try:
+                    self._callbacks.remove(item)
+                except ValueError:
+                    pass
+
+        return unsubscribe
 
     def start(self) -> None:
+        self._start_alarm_poll()
+        if self._client is not None:
+            return
         if not self._api.mqtt_host:
             return
         try:
             import paho.mqtt.client as mqtt
         except ImportError:
-            _LOGGER.warning("paho-mqtt is not installed; motion events disabled")
+            _LOGGER.warning("paho-mqtt is not installed; using alarm polling only")
             return
 
         user_id = str(self._api.user_id or "").strip()
@@ -108,9 +135,14 @@ class MotionEventListener:
             client.loop_start()
         except Exception as exc:
             _LOGGER.warning("MQTT motion listener failed to start: %s", exc)
-            self.stop()
+            self._client = None
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
     def stop(self) -> None:
+        self._stop_alarm_poll()
         client = self._client
         self._client = None
         if client is None:
@@ -120,6 +152,68 @@ class MotionEventListener:
             client.disconnect()
         except Exception:
             pass
+
+    def _start_alarm_poll(self) -> None:
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._stop_poll.clear()
+        self._poll_thread = threading.Thread(target=self._alarm_poll_loop, daemon=True)
+        self._poll_thread.start()
+
+    def _stop_alarm_poll(self) -> None:
+        self._stop_poll.set()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=2)
+            self._poll_thread = None
+
+    def _alarm_poll_loop(self) -> None:
+        seeded = False
+        while not self._stop_poll.is_set():
+            try:
+                events = self._api.get_latest_alarm_events()
+                self._handle_alarm_events(events, dispatch=seeded)
+                seeded = True
+                wait_s = ALARM_POLL_INTERVAL
+            except Exception as exc:
+                _LOGGER.debug("Latest alarm poll failed: %s", exc)
+                wait_s = ALARM_POLL_ERROR_INTERVAL
+            self._stop_poll.wait(wait_s)
+
+    @staticmethod
+    def _alarm_key(event: dict) -> tuple[str, str, str]:
+        device_id = str(event.get("deviceID") or event.get("deviceId") or "").strip()
+        event_time = str(event.get("devLocalTime") or event.get("eventTime") or "")
+        event_type = str(
+            event.get("evt")
+            or event.get("eventType")
+            or event.get("imageAlertType")
+            or ""
+        )
+        return device_id, event_time, event_type
+
+    def _handle_alarm_events(self, events: list[dict], dispatch: bool) -> None:
+        for raw_event in events:
+            if not isinstance(raw_event, dict):
+                continue
+            key = self._alarm_key(raw_event)
+            if not any(key) or key in self._seen_alarm_keys:
+                continue
+            self._seen_alarm_keys.add(key)
+            if dispatch:
+                self._handle_payload(json.dumps(raw_event).encode())
+
+    def _matching_callbacks(
+        self, device_id: str, license_id: str
+    ) -> list[Callable[[str], None]]:
+        with self._lock:
+            callbacks = list(self._callbacks)
+        out: list[Callable[[str], None]] = []
+        for registered_device_id, registered_sn, callback in callbacks:
+            if device_id and device_id == registered_device_id:
+                out.append(callback)
+            elif not device_id and license_id and license_id == registered_sn:
+                out.append(callback)
+        return out
 
     def _handle_payload(self, payload: bytes) -> None:
         try:
@@ -132,11 +226,9 @@ class MotionEventListener:
 
         device_id = event["device_id"]
         license_id = event["license_id"]
-        if device_id and device_id != self._device_id:
-            return
-        if not device_id and license_id and license_id != self._sn_num:
-            return
         if not device_id and not license_id:
             return
 
-        self._on_motion(str(event["evt_name"]))
+        motion_type = str(event["evt_name"])
+        for callback in self._matching_callbacks(device_id, license_id):
+            callback(motion_type)
