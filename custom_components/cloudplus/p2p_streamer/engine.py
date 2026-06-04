@@ -30,6 +30,7 @@ from .network import (
     _send_direct_ice_binding,
     recv_peer_packets,
 )
+from .lan import build_lan_connect_frame, host_candidate_endpoints
 from .sdp import (
     add_candidate_once,
     candidates_from_response,
@@ -71,6 +72,8 @@ _LOGGER = logging.getLogger(__name__)
 IVA_HEARTBEAT_S = 3.0
 VVP_HEARTBEAT_S = 10.0
 AUTH_FALLBACK_NO_VIDEO_S = 10.0
+DORMANCY_WAKE_TIMEOUT_S = 45.0
+WAKE_RETRY_S = 4.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 SIGNALING_CONNECT_TIMEOUT_S = 5.0
 CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S = 4.0
@@ -581,17 +584,37 @@ class P2PStreamer:
             _LOGGER.info("Camera dormant, waking...")
             contact = status.get("contact", {})
             local_ips = _get_local_ips()
-            sig.send_wake_connect(
-                device_uuid,
-                contact.get("keepalive", contact),
-                local_ips,
-                16685,
-            )
-            try:
-                self._api.wake_device(self._sn_num, self._device.get("deviceID", 0))
-            except Exception:
-                pass
-            awake = sig.wait_for_status(device_uuid, "online", timeout=30)
+
+            def _fire_wake() -> None:
+                try:
+                    sig.send_wake_connect(
+                        device_uuid,
+                        contact.get("keepalive", contact),
+                        local_ips,
+                        16685,
+                    )
+                except Exception:
+                    _LOGGER.debug("signaling wake_connect failed", exc_info=True)
+                try:
+                    self._api.wake_device(
+                        self._sn_num, self._device.get("deviceID", 0)
+                    )
+                except Exception:
+                    pass
+
+            # Snap cameras can miss a single wake-connect when deeply dormant.
+            # Re-send the signaling+HTTP wake every WAKE_RETRY_S until the camera
+            # pushes `status=online` or the dormancy budget expires.
+            deadline = time.time() + DORMANCY_WAKE_TIMEOUT_S
+            awake = None
+            while time.time() < deadline and self._running:
+                _fire_wake()
+                remaining = deadline - time.time()
+                awake = sig.wait_for_status(
+                    device_uuid, "online", timeout=min(WAKE_RETRY_S, remaining)
+                )
+                if awake:
+                    break
             if not awake:
                 _LOGGER.warning("Camera did not come online")
                 return (0, 0)
@@ -603,7 +626,7 @@ class P2PStreamer:
                 f"Camera not online on {format_endpoint(self._last_signaling_endpoint)} "
                 f"(status={device_status})"
             )
-            if str(device_status).lower() == "offline":
+            if str(device_status).lower() in {"offline", "unknown"}:
                 raise SignalingClusterMiss(message)
             _LOGGER.warning("%s", message)
             return (0, 0)
@@ -681,11 +704,6 @@ class P2PStreamer:
                 sdp_lines.append(
                     f"a=candidate:S{ip_hex} 1 UDP 1862270975 {turn.mapped_ip} {turn.mapped_port} typ srflx"
                 )
-        if turn.relay_ip and turn.relay_port:
-            relay_hex = socket.inet_aton(turn.relay_ip).hex()
-            sdp_lines.append(
-                f"a=candidate:R{relay_hex} 1 UDP 16777215 {turn.relay_ip} {turn.relay_port} typ srflx"
-            )
         offer_tag = str((sig.webrtcsvr or {}).get("tag") or "") + "01"
         answer = sig.send_offer(device_uuid, "\n".join(sdp_lines) + "\n")
         camera_ufrag, camera_pwd, camera_candidates = parse_sdp_answer(
@@ -741,6 +759,25 @@ class P2PStreamer:
             offer_tag,
         )
         self._last_candidate_count = len(camera_candidates)
+        lan_connect_frame = build_lan_connect_frame()
+        lan_connect_endpoints = (
+            [] if self._remote else host_candidate_endpoints(camera_candidates)
+        )
+        last_lan_connect = 0.0
+
+        def _send_lan_connect(now_ts: float, *, force: bool = False) -> None:
+            nonlocal last_lan_connect
+            if not lan_connect_endpoints:
+                return
+            if not force and now_ts < last_lan_connect + 1.0:
+                return
+            for endpoint in lan_connect_endpoints:
+                try:
+                    turn.sock.sendto(lan_connect_frame, endpoint)
+                except Exception:
+                    pass
+            last_lan_connect = now_ts
+
         _LOGGER.debug(
             "Camera ICE candidates: %s",
             ", ".join(
@@ -806,6 +843,8 @@ class P2PStreamer:
         last_ack_probe = 0.0
         last_gap_nudge = 0.0
         last_gap_skip = 0.0
+        last_idle_start_live = 0.0
+        live_started_at = 0.0
         last_client_keyframe_request = 0.0
         last_stall_debug = 0.0
         wait_for_keyframe_until = 0.0
@@ -848,7 +887,7 @@ class P2PStreamer:
             min_interval: float = 0.0,
             wait_for_recovery_keyframe: bool = False,
         ) -> bool:
-            nonlocal last_start_live, live_started, last_heartbeat
+            nonlocal last_start_live, live_started, live_started_at, last_heartbeat
             nonlocal wait_for_keyframe_until
             now_ts = time.time() if now_ts is None else now_ts
             if now_ts < last_start_live + min_interval:
@@ -856,6 +895,8 @@ class P2PStreamer:
             kcp.send_iva_data(_next_vvp(VVP_CMD_START_LIVE))
             last_start_live = now_ts
             last_heartbeat = now_ts + VVP_HEARTBEAT_S
+            if not live_started:
+                live_started_at = now_ts
             live_started = True
             keyframe_wait = gap_recovery_for(self._video_codec).keyframe_wait_s
             if wait_for_recovery_keyframe and keyframe_wait > 0.0:
@@ -973,16 +1014,15 @@ class P2PStreamer:
                 return now_ts - last_kcp_push_time
             if last_kcp_payload_time > 0.0:
                 return now_ts - last_kcp_payload_time
-            if last_start_live > 0.0 and (
-                getattr(kcp, "recv_buf", None) or getattr(kcp, "recv_frag_buf", None)
-            ):
-                return now_ts - last_start_live
+            if live_started_at > 0.0:
+                return now_ts - live_started_at
             return 0.0
 
         def _attempt_gap_recovery(now_ts: float) -> None:
             nonlocal reconnect_idle_source
             nonlocal candidate_fanout_until
             nonlocal last_ack_probe, last_gap_nudge, last_gap_skip
+            nonlocal last_idle_start_live
             nonlocal last_stall_debug, wait_for_keyframe_until, last_video_time
             stall_time = _video_wait_s(now_ts)
             if stall_time <= 0.8:
@@ -1005,9 +1045,22 @@ class P2PStreamer:
                     or getattr(kcp, "recv_queue", None)
                     or getattr(kcp, "recv_frag_buf", None)
                 )
-                idle_reconnect_s = runtime_policy_for(
-                    self._video_codec
-                ).source_idle_reconnect_s
+                runtime_policy = runtime_policy_for(self._video_codec)
+                idle_retry_s = runtime_policy.idle_start_live_retry_s
+                if (
+                    live_started
+                    and idle_retry_s > 0.0
+                    and stall_time >= idle_retry_s
+                    and now_ts >= last_idle_start_live + idle_retry_s
+                ):
+                    if _send_start_live(
+                        "idle",
+                        now_ts,
+                        min_interval=idle_retry_s,
+                        wait_for_recovery_keyframe=True,
+                    ):
+                        last_idle_start_live = now_ts
+                idle_reconnect_s = runtime_policy.source_idle_reconnect_s
                 if stall_time >= idle_reconnect_s and not kcp_pending:
                     _LOGGER.warning(
                         "P2P source idle %.1fs; reconnecting session",
@@ -1092,17 +1145,31 @@ class P2PStreamer:
             is_iva = packet.data[0:2] == b"\xff\x01"
             is_kcp = bool(segments or first_segment or is_iva)
             if is_kcp:
-                if (
-                    peer is not None
-                    and not is_turn_server_stun
-                    and peer[0] != getattr(turn, "server_ip", None)
-                ):
+                # via_turn=True packets are camera media unwrapped from a bound
+                # channel; the camera's relay can share an IP with our TURN
+                # server, so peer[0]==server_ip is not a rejection signal there.
+                # Direct (non-TURN) packets from the TURN server itself are
+                # already filtered via is_turn_server_stun.
+                valid_peer = peer is not None and (
+                    packet.via_turn
+                    or (
+                        not is_turn_server_stun
+                        and peer[0] != getattr(turn, "server_ip", None)
+                    )
+                )
+                if valid_peer:
                     direct = not packet.via_turn and not self._remote
                     current = confirmed_peer[0]
                     prefer_direct = direct and not self._prefer_relay
                     prefer_relay = not direct and self._prefer_relay
-                    if (
+                    defer_direct = (
                         current is None
+                        and direct
+                        and self._prefer_relay
+                        and time.time() < candidate_fanout_until
+                    )
+                    if (
+                        (current is None and not defer_direct)
                         or (prefer_direct and not current[2])
                         or (prefer_relay and current[2])
                     ):
@@ -1126,16 +1193,21 @@ class P2PStreamer:
                     elif typ == "handshake":
                         kcp.flush_acks()
                         kcp.retransmit_unacked()
-                        if not live_started:
-                            _send_start_live("handshake", time.time())
                 _drain_kcp_queue()
 
-        kcp.send_handshake()
         now = time.time()
+        _send_lan_connect(now, force=True)
+        kcp.send_handshake()
+        # Official app sends START_LIVE in the very next KCP push (sn=1) without
+        # waiting for the camera's handshake echo or any ACK. Mirroring that
+        # avoids a class of post-dormancy stalls where the camera ACKs but never
+        # echoes the IVA handshake, then ignores a delayed START_LIVE.
+        _send_start_live("startup", now)
         last_iva_heartbeat = now + IVA_HEARTBEAT_S
 
         while self._running:
             now = time.time()
+            _send_lan_connect(now)
 
             if auth_fallback_at and self._video_count <= 0 and now >= auth_fallback_at:
                 return AUTH_FALLBACK_RESULT
@@ -1173,23 +1245,19 @@ class P2PStreamer:
                 )
                 last_heartbeat = now + VVP_HEARTBEAT_S
 
-            if not live_started:
-                if kcp.handshake_done:
-                    _send_start_live("handshake", now)
-            else:
-                keepalive_s = runtime_policy_for(
-                    self._video_codec
-                ).start_live_keepalive_s
-                if (
-                    keepalive_s > 0.0
-                    and last_video_time > 0.0
-                    and now >= last_start_live + keepalive_s
-                ):
-                    _send_start_live(
-                        "keepalive",
-                        now,
-                        wait_for_recovery_keyframe=True,
-                    )
+            keepalive_s = runtime_policy_for(
+                self._video_codec
+            ).start_live_keepalive_s
+            if (
+                keepalive_s > 0.0
+                and last_video_time > 0.0
+                and now >= last_start_live + keepalive_s
+            ):
+                _send_start_live(
+                    "keepalive",
+                    now,
+                    wait_for_recovery_keyframe=True,
+                )
 
             if now >= turn_refresh:
                 try:

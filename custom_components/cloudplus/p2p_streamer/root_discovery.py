@@ -84,7 +84,7 @@ def _domains(
             _platform_from_openapi(openapi_host),
         )
     )
-    return hinted or list(DEFAULT_PLATFORM_DOMAINS)
+    return _dedupe((*hinted, *DEFAULT_PLATFORM_DOMAINS))
 
 
 def _timestamp() -> str:
@@ -225,40 +225,37 @@ def discover_msgsvr_endpoints(
         hinted = bool(_host(platform_domain_hint) or _host(openapi_server_hint))
         domains = _dedupe((f"{code}ce.mearicloud.com", *(domains if hinted else ())))
 
-    root_ips = []
-    for domain in domains:
-        root_ips.extend(_resolve_ips(domain))
-    root_ips = _dedupe(root_ips)
-
     endpoints: list[tuple[str, int]] = []
-    for root_ip in root_ips:
-        root = None
-        for body in _root_queries(code=code, client_id_hint=client_id_hint):
-            root = _query_conf((root_ip, ROOT_DISCOVERY_PORT), body, timeout_s)
-            if root is None:
-                break
-            if isinstance(root, dict) and (
-                isinstance(root.get("contact"), dict)
-                or isinstance(root.get("dnssvr"), dict)
-            ):
-                break
-        if isinstance(root, dict):
-            endpoints.extend(_contact_endpoints(root))
-        if endpoints:
-            break
+    for domain in domains:
+        domain_ips = _resolve_ips(domain)
+        domain_endpoints: list[tuple[str, int]] = []
+        for root_ip in domain_ips:
+            root = None
+            for body in _root_queries(code=code, client_id_hint=client_id_hint):
+                root = _query_conf((root_ip, ROOT_DISCOVERY_PORT), body, timeout_s)
+                if root is None:
+                    break
+                if isinstance(root, dict) and (
+                    isinstance(root.get("contact"), dict)
+                    or isinstance(root.get("dnssvr"), dict)
+                ):
+                    break
+            if isinstance(root, dict):
+                domain_endpoints.extend(_contact_endpoints(root))
 
-        dns_endpoint = _dnssvr_endpoint(root) if isinstance(root, dict) else None
-        if dns_endpoint is None:
-            continue
-
-        for parent_body in _parent_queries(code=code, client_id_hint=client_id_hint):
-            parent = _query_conf(dns_endpoint, parent_body, timeout_s)
-            if isinstance(parent, dict):
-                endpoints.extend(_contact_endpoints(parent))
-            if endpoints:
+            dns_endpoint = _dnssvr_endpoint(root) if isinstance(root, dict) else None
+            if dns_endpoint is not None:
+                for parent_body in _parent_queries(
+                    code=code, client_id_hint=client_id_hint
+                ):
+                    parent = _query_conf(dns_endpoint, parent_body, timeout_s)
+                    if isinstance(parent, dict):
+                        domain_endpoints.extend(_contact_endpoints(parent))
+                    if domain_endpoints:
+                        break
+            if domain_endpoints:
                 break
-        if endpoints:
-            break
+        endpoints.extend(_dedupe(domain_endpoints))
 
     endpoints = _dedupe(endpoints)
     if endpoints:
