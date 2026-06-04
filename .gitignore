@@ -6,6 +6,9 @@ reverse_engineering/
 /.*
 *.md
 !README.md
+!AGENTS.md
+!docs/
+!docs/**/*.md
 !debug.py
 *_example/
 .idea/

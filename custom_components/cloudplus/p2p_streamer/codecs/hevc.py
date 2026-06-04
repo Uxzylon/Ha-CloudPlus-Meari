@@ -19,7 +19,7 @@ ADAPTIVE_TIMESTAMP_TIMED_MUX = False
 RUNTIME_POLICY = CodecRuntimePolicy(
     clean_startup_seed=True,
     runtime_stall_timeout_s=18.0,
-    source_idle_reconnect_s=8.0,
+    source_idle_reconnect_s=10.0,
     startup_seed_min_generations=2,
 )
 
