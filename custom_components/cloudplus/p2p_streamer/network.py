@@ -207,15 +207,13 @@ def _resolve_signaling_server_candidates(
         _SIG_CACHE[cache_key] = (pinned, now + _SIG_CACHE_TTL_S)
         return [pinned]
 
-    root_endpoints: list[tuple[str, int]] = []
-    if cached is None:
-        root_endpoints = discover_msgsvr_endpoints(
-            platform_domain_hint=platform_domain_hint,
-            openapi_server_hint=openapi_server_hint,
-            api_server_hint=api_server_hint,
-            client_id_hint=client_id_hint,
-            timeout_s=timeout_s,
-        )
+    root_endpoints = discover_msgsvr_endpoints(
+        platform_domain_hint=platform_domain_hint,
+        openapi_server_hint=openapi_server_hint,
+        api_server_hint=api_server_hint,
+        client_id_hint=client_id_hint,
+        timeout_s=timeout_s,
+    )
 
     ordered_candidates: list[tuple[str, int]] = []
     if cached is not None:

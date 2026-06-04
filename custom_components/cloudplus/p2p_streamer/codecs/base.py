@@ -61,7 +61,8 @@ class CodecRuntimePolicy:
     fast_quiet_cap_s: float = 1.5
     runtime_stall_timeout_s: float = 10.0
     source_idle_reconnect_s: float = 14.0
-    start_live_keepalive_s: float = 0.0
+    start_live_keepalive_s: float = 30.0
+    idle_start_live_retry_s: float = 5.0
     startup_seed_min_generations: int = 1
     preferred_backlog_reasons: frozenset[str] = frozenset(
         {"ready", "seed-not-fresh", "seed-awaiting-follow-frames"}
