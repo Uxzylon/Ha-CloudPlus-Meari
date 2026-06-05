@@ -16,6 +16,7 @@ from .audio import (
     _print_audio_crackle_diagnostics,
     start_player_audio_diag,
 )
+from .capture import PacketCapture
 from .codec_helpers import _coord_codec, _codec_policy, _codec_text
 from .coordinator import (
     _await_live_stream,
@@ -67,6 +68,7 @@ async def cmd_stream(args) -> int:
     log = logging.getLogger(__name__)
     run_started_mono = time.monotonic()
     coord = None
+    capture: PacketCapture | None = None
     player_proc = None
     player_log_fh = None
     recorder_proc: subprocess.Popen | None = None
@@ -134,6 +136,18 @@ async def cmd_stream(args) -> int:
     player_log_path = f"{artifact_base}_player.log"
     recorder_log_path = f"{artifact_base}_recorder.log"
     try:
+        capture_arg = getattr(args, "capture", None)
+        if capture_arg is not None:
+            capture_path = (
+                os.path.abspath(os.path.expanduser(capture_arg))
+                if capture_arg
+                else f"{artifact_base}.pcap"
+            )
+            capture = PacketCapture(
+                capture_path, filter_expr=getattr(args, "capture_filter", "udp")
+            )
+            capture.start()
+
         setattr(args, "skip_initial_grab", bool(args.wake and args.play))
         if args.wake and args.play:
             logging.getLogger(__name__).info(
@@ -797,6 +811,8 @@ async def cmd_stream(args) -> int:
 
         return 0
     finally:
+        if capture is not None:
+            capture.stop()
         _stop_player_process(player_proc)
         _stop_player_process(recorder_proc)
         _stop_player_process(pcm_recorder_proc)
