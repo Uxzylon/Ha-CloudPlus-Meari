@@ -63,6 +63,12 @@ class FfmpegMuxer:
         self._last_video_pts: int | None = None
         self._video_pts_step_ticks = 6000
         self._current_video_pts = 0
+        # Continuation base for video PTS. start() nulls _last_video_pts on every
+        # reconnect, but the muxer feeds one unbroken TS stream to consumers; resuming
+        # at 0 looks like a backward jump and trips HA's stream_worker (PyAV wrap-
+        # corrects by +2**33 -> "Timestamp discontinuity"). Persisting this across
+        # start() keeps emitted PTS monotonic. Deliberately not reset in start().
+        self._pts_carry = 0
         self._audio_gate_open = False
         self._audio_clock_started_at = 0.0
         self._audio_clock_base_pts = 0
@@ -333,16 +339,11 @@ class FfmpegMuxer:
             pts_interval_s = None
         if pts_interval_s is not None:
             step = max(1, int(max(0.001, pts_interval_s) * 90000))
-            pts = 0 if self._last_video_pts is None else self._last_video_pts + step
-            self._current_video_pts = pts
-            return pts
-
-        pts = (
-            0
-            if self._last_video_pts is None
-            else (self._last_video_pts + self._video_pts_step_ticks)
-        )
+        else:
+            step = self._video_pts_step_ticks
+        pts = self._pts_carry if self._last_video_pts is None else self._last_video_pts + step
         self._current_video_pts = pts
+        self._pts_carry = pts + step
         return pts
 
     def _due_audio_ts(self) -> bytes:

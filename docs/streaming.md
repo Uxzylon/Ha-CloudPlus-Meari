@@ -90,6 +90,12 @@ resume.
 - Camera timestamps can be unstable across stalls, especially with HEVC and
   AUTO. The muxer **generates stable video PTS** at the advertised FPS and
   caps audio lead so audio cannot run seconds ahead while video is stalled.
+- **Video PTS stays monotonic across reconnects.** A single muxer feeds one
+  unbroken TS stream for the whole live session, but a reconnect restarts the
+  ffmpeg child. The muxer carries the PTS base forward instead of resuming at
+  0, otherwise consumers see a backward jump — HA's `stream_worker` wrap-
+  corrects it by +2³³ and aborts with a "Timestamp discontinuity" (ffplay
+  tolerates it, so the debug harness never reproduces this).
 - **Do not inject old video frames** to hide loss. It creates visible time
   travel.
 - When the source stops sending frames, the integration can only recover
