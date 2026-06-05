@@ -166,7 +166,6 @@ class P2PStreamer:
         self._host_key = device.get("hostKey", "")
         self._video_password = (video_password or "").strip()
         self._remote = remote
-        self._prefer_relay = self._is_snap
         self._client_id = _client_id_for(api, device, client_id)
         self._client_uuid = _client_uuid_for(api, self._client_id)
         self._webrtc_session_index = _next_session_index(api)
@@ -1160,18 +1159,9 @@ class P2PStreamer:
                 if valid_peer:
                     direct = not packet.via_turn and not self._remote
                     current = confirmed_peer[0]
-                    prefer_direct = direct and not self._prefer_relay
-                    prefer_relay = not direct and self._prefer_relay
-                    defer_direct = (
-                        current is None
-                        and direct
-                        and self._prefer_relay
-                        and time.time() < candidate_fanout_until
-                    )
                     if (
-                        (current is None and not defer_direct)
-                        or (prefer_direct and not current[2])
-                        or (prefer_relay and current[2])
+                        current is None
+                        or (direct and not current[2])
                     ):
                         confirmed_peer[0] = (peer[0], peer[1], direct)
                         _LOGGER.debug(
