@@ -57,6 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
         default="ffplay",
         help="Use ffplay-only verdicts, or include recorder/TS/PCM diagnostics",
     )
+    stream.add_argument(
+        "--capture",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Capture host traffic with tcpdump for the stream's lifetime "
+        "(needs root/sudo). Bare flag auto-names a .pcap next to the artifacts; "
+        "pass a PATH to override. Diff against the official-app captures.",
+    )
+    stream.add_argument(
+        "--capture-filter",
+        default="udp",
+        help="tcpdump BPF filter for --capture (default: udp — root discovery, "
+        "STUN/TURN and P2P; skips HTTPS API noise)",
+    )
     return parser
 
 
