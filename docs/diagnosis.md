@@ -89,5 +89,6 @@ If a behaviour seems to disagree with the official app, capture both sides:
    addresses in the SDP `m=audio` / `c=IN IP4 …` lines, and the VVP
    `START_LIVE` parameters.
 
-Captures live under `reverse_engineering/network_recordings/` (gitignored)
-and are the ground truth when the code disagrees with a vendor change.
+Reproduce and store these captures with your local tooling (see
+[`AGENTS.local.md`](../AGENTS.local.md) at the repo root); they're the ground
+truth when the code disagrees with a vendor change.

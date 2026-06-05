@@ -351,8 +351,8 @@ Before opening a PR, please:
 
 - run `python debug.py list` and `python debug.py stream …` against your own
   camera to confirm the change doesn't break the streaming path,
-- keep behaviour gated on actual evidence from the reverse-engineering
-  captures under `reverse_engineering/` (not in git) where possible,
+- keep behaviour gated on actual evidence from local captures of the official
+  app where possible,
 - avoid hardcoded IPs, regions, or signaling endpoints — discovery is the
   source of truth.
 

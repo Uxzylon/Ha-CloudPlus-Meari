@@ -16,10 +16,9 @@ sits in KCP push `sn=0` and `START_LIVE` in KCP push `sn=1` **back-to-back**,
 with no delay between them and no wait for any camera-side echo or peer
 confirmation.
 
-- Reference capture: `reverse_engineering/network_recordings/
-  record-cloudedge-111464148-AUTO-60s/13` —
-  - `14.bin` (sn=0): IVA handshake `0x7012`
-  - `16.bin` (sn=1): VVP `START_LIVE` (cmd `0x11FF`)
+- In the captured KCP stream: `sn=0` carries the IVA handshake `0x7012` and
+  `sn=1` carries VVP `START_LIVE` (cmd `0x11FF`), back-to-back. Reproduce with
+  your local capture tooling (see [`AGENTS.local.md`](../AGENTS.local.md)).
 
 Earlier we gated `START_LIVE` on the camera echoing its IVA handshake (or a
 short grace after media-peer confirmation). Both turn out to be wrong: on

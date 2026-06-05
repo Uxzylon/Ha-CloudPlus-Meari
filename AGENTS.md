@@ -25,9 +25,18 @@ test suite, runtime is HA. Validate with [debug.py](debug.py).
 | [custom_components/cloudplus/p2p_streamer/](custom_components/cloudplus/p2p_streamer/) | Protocol stack: discovery → signaling → ICE/TURN → KCP → VVP. |
 | [debug_tools/](debug_tools/) + [debug.py](debug.py) | CLI harness — same code path as HA, drives ffplay. |
 | [docs/](docs/) | Architecture, protocol, streaming, motion, diagnosis. |
-| `reverse_engineering/` | APK decompiles + pcaps. **Gitignored. Read-only evidence.** |
 
 Module-by-module map: [docs/architecture.md](docs/architecture.md).
+
+## Local environment notes
+
+This repo is the public integration only. Some contributors keep
+machine-local tooling and vendor-app evidence (decompiles, packet captures,
+a sandbox to run the official app) *outside* version control — it's
+gitignored and differs per person. If an
+[`AGENTS.local.md`](AGENTS.local.md) exists at the repo root, **read it
+first**: it's the entry point to any local-only agent instructions. It's
+absent by default; create your own to document your setup.
 
 ## Setup
 
@@ -49,8 +58,8 @@ python debug.py stream --device-id <id> --duration 60 --quality SD
 python debug.py --debug stream --device-id <id> --duration 30    # verbose
 ```
 
-For protocol changes, cross-check against captures under
-`reverse_engineering/network_recordings/` when one exists. Lint with
+For protocol changes, cross-check against any local packet captures your
+environment provides (see [`AGENTS.local.md`](AGENTS.local.md)). Lint with
 `flake8` ([.flake8](.flake8), `max-line-length = 250`).
 
 ## Code style
@@ -92,8 +101,8 @@ Ask first: adding a runtime dependency (`manifest.json` `requirements`),
 bumping `manifest.json` `version` (triggers
 [.github/workflows/release-tags.yml](.github/workflows/release-tags.yml)),
 any `git commit` / `push` / branch / tag op (especially anything touching
-`main` or `dev`), modifying `reverse_engineering/`, or network captures /
-APK downloads / extra Meari-cloud traffic beyond a normal stream.
+`main` or `dev`), or network captures / APK downloads / extra Meari-cloud
+traffic beyond a normal stream.
 
 ## Security
 

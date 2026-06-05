@@ -14,17 +14,17 @@ How the code is laid out and which file owns what.
 ├── custom_components/cloudplus/   # The HA integration (HACS-shipped code)
 ├── debug_tools/                   # Reusable bits of the CLI harness
 ├── debug.py                       # CLI entry point — `python debug.py …`
-├── reverse_engineering/           # APK decompiles + pcap captures (gitignored)
-├── tools/                         # Helper scripts (APK download / decompile)
 ├── docs/                          # Protocol + dev docs (this folder)
 ├── README.md                      # User-facing
 ├── AGENTS.md                      # AI-assistant onboarding
 └── hacs.json / manifest.json      # HACS + HA metadata
 ```
 
-`reverse_engineering/` is gitignored — it holds large APK extractions and
-network captures used as ground truth when the code disagrees with the
-official app. Treat it as read-only evidence, not as runtime data.
+Some contributors keep local-only evidence and tooling (APK extractions,
+packet captures, a sandbox for the official app) outside the repo as ground
+truth when the code disagrees with the official app. It's gitignored and
+per-contributor — see [`AGENTS.local.md`](../AGENTS.local.md) at the repo
+root if present.
 
 ## Integration entry points
 
