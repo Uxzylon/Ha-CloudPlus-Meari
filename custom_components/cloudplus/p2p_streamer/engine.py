@@ -1204,7 +1204,11 @@ class P2PStreamer:
 
             if now >= last_ice:
                 _send_ice_checks()
-                last_ice = now + 2.0
+                # Match the official app's rapid ICE cadence until a media peer
+                # is confirmed. On LAN the camera (ICE-controlled) gates video on
+                # ICE completion and answers only a fraction of our checks, so 2s
+                # spacing rarely nominates a pair before a reconnect resets it.
+                last_ice = now + (2.0 if confirmed_peer[0] is not None else 0.05)
             snap_keepalive.tick()
 
             if now >= next_signal_heartbeat:
@@ -1256,7 +1260,13 @@ class P2PStreamer:
                     pass
                 turn_refresh = now + 60.0
 
-            packets = recv_peer_packets(turn, timeout=0.08, max_packets=2048)
+            # Spin tighter while ICE is unconfirmed so we answer the camera's
+            # connectivity-check flood promptly and re-issue our own checks fast.
+            packets = recv_peer_packets(
+                turn,
+                timeout=0.08 if confirmed_peer[0] is not None else 0.02,
+                max_packets=2048,
+            )
             if not packets:
                 _process_pending_payloads()
                 _attempt_gap_recovery(now)
