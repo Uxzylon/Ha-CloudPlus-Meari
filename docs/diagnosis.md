@@ -37,7 +37,7 @@ Useful flags on `stream`:
 | Flag | Purpose |
 |------|---------|
 | `--quality` | `AUTO`, `SD`, `HD`, `QHD`, or a raw profile id. |
-| `--wake-timeout` | Seconds to wait for live frames before giving up (default 45, bumped to 90 for deep-dormancy). |
+| `--wake-timeout` | Seconds to wait for live frames before giving up (default 90, sized for worst-case deep-dormancy wakes). |
 | `--video-password` | E2EE password if the camera has it enabled. |
 | `--output-file <base>` | Dump `.ts` / `.wav` and recorder/player logs under that basename. |
 | `--analysis-mode full` | Also produce TS + PCM diagnostics on top of the ffplay verdict. |

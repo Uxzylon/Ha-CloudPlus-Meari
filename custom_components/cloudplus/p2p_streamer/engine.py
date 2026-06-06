@@ -197,6 +197,9 @@ class P2PStreamer:
         self._last_turn_endpoint: tuple[str, int] | None = None
         self._last_candidate_count = 0
         self._keyframe_request = threading.Event()
+        # True while a dormant camera is actively being woken — watchdogs must
+        # not restart the session underneath the dormancy-wake budget.
+        self.awaiting_wake = False
 
     def request_stop(self) -> None:
         self._running = False
@@ -595,25 +598,29 @@ class P2PStreamer:
                 except Exception:
                     _LOGGER.debug("signaling wake_connect failed", exc_info=True)
                 try:
-                    self._api.wake_device(
-                        self._sn_num, self._device.get("deviceID", 0)
-                    )
+                    self._api.wake_device(self._sn_num, self._device.get("deviceID", 0))
                 except Exception:
                     pass
 
             # Snap cameras can miss a single wake-connect when deeply dormant.
             # Re-send the signaling+HTTP wake every WAKE_RETRY_S until the camera
-            # pushes `status=online` or the dormancy budget expires.
+            # pushes `status=online` or the dormancy budget expires. Flag the wake
+            # so coordinator/debug watchdogs hold off restarting underneath it —
+            # deep-dormancy wakes can take most of DORMANCY_WAKE_TIMEOUT_S.
             deadline = time.time() + DORMANCY_WAKE_TIMEOUT_S
             awake = None
-            while time.time() < deadline and self._running:
-                _fire_wake()
-                remaining = deadline - time.time()
-                awake = sig.wait_for_status(
-                    device_uuid, "online", timeout=min(WAKE_RETRY_S, remaining)
-                )
-                if awake:
-                    break
+            self.awaiting_wake = True
+            try:
+                while time.time() < deadline and self._running:
+                    _fire_wake()
+                    remaining = deadline - time.time()
+                    awake = sig.wait_for_status(
+                        device_uuid, "online", timeout=min(WAKE_RETRY_S, remaining)
+                    )
+                    if awake:
+                        break
+            finally:
+                self.awaiting_wake = False
             if not awake:
                 _LOGGER.warning("Camera did not come online")
                 return (0, 0)
@@ -1159,10 +1166,7 @@ class P2PStreamer:
                 if valid_peer:
                     direct = not packet.via_turn and not self._remote
                     current = confirmed_peer[0]
-                    if (
-                        current is None
-                        or (direct and not current[2])
-                    ):
+                    if current is None or (direct and not current[2]):
                         confirmed_peer[0] = (peer[0], peer[1], direct)
                         _LOGGER.debug(
                             "Confirmed media peer %s via %s",
@@ -1239,9 +1243,7 @@ class P2PStreamer:
                 )
                 last_heartbeat = now + VVP_HEARTBEAT_S
 
-            keepalive_s = runtime_policy_for(
-                self._video_codec
-            ).start_live_keepalive_s
+            keepalive_s = runtime_policy_for(self._video_codec).start_live_keepalive_s
             if (
                 keepalive_s > 0.0
                 and last_video_time > 0.0
