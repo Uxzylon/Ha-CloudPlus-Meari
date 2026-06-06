@@ -48,9 +48,23 @@ camera pushes `status=online` or `DORMANCY_WAKE_TIMEOUT_S` (≈45 s) elapses.
 The retries are cheap and they shorten the typical post-deep-dormancy wake
 to a single session — no need for a coordinator-level restart cycle.
 
-The debug harness `--wake-timeout` default is bumped to 90 s to account for
-worst-case deep-dormancy wakes; the HA coordinator already self-restarts so
-it doesn't need a wider window.
+**The watchdogs must not restart underneath an active wake.** A deep-dormancy
+wake routinely takes 30–45 s, but the no-first-video restart fires at
+`LIVE_STARTUP_STALL_RESTART_S` (25 s) and the debug harness stall restart at
+~30 s. Left unguarded they tear the session down *mid-wake*, lose all wake
+progress, and — because the camera often only comes online around 40 s — the
+stream never starts (observed as a session that sends `START_LIVE` then dies
+immediately, 0 frames). The engine therefore exposes `awaiting_wake` while the
+dormancy-wake loop runs; the HA coordinator (`_stream_video_stale`) and the
+debug stall watchdog both **skip the restart while it is set**, and the
+coordinator starts its first-video clock from when the wake *completes*, not
+from session start. A truly stuck wake still ends on its own when the engine's
+`DORMANCY_WAKE_TIMEOUT_S` budget expires, after which the session restarts
+normally.
+
+The debug harness `--wake-timeout` default is 90 s to account for worst-case
+deep-dormancy wakes (a 25–45 s wake plus first-keyframe time can exceed the
+old 45 s window).
 
 ## Source-idle recovery (sustaining the stream)
 

@@ -93,6 +93,12 @@ def _maybe_restart_stalled_stream(
     if not stream_active:
         return None
 
+    # A dormant camera mid-wake legitimately has no video yet; don't count that
+    # against the stall timeout (deep-dormancy wakes run for tens of seconds).
+    p2p = getattr(coord, "_p2p_streamer", None)
+    if p2p is not None and getattr(p2p, "awaiting_wake", False):
+        return None
+
     now = time.monotonic()
     if stall_started_at is None:
         return now

@@ -153,6 +153,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._video_mux_target_fps = 15.0
         self._p2p_session_generation = 0
         self._stream_started_at = 0.0
+        self._wake_active_at = 0.0
         self._last_p2p_video_time = 0.0
         self._last_p2p_audio_time = 0.0
         self._last_video_time = 0.0
@@ -588,13 +589,21 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         worker = self._stream_thread
         if worker is None or not worker.is_alive() or self._stream_started_at <= 0.0:
             return False
+        streamer = self._p2p_streamer
+        if streamer is not None and getattr(streamer, "awaiting_wake", False):
+            # Dormant camera still being woken: the engine owns this window
+            # (DORMANCY_WAKE_TIMEOUT_S). Don't restart underneath it, and only
+            # start the first-video clock once the wake completes.
+            self._wake_active_at = now
+            return False
         if self._last_p2p_video_time >= self._stream_started_at:
             timeout = max(
                 LIVE_VIDEO_STALL_RESTART_S,
                 runtime_policy_for(self._video_codec).source_idle_reconnect_s,
             )
             return now - self._last_p2p_video_time >= timeout
-        return now - self._stream_started_at >= LIVE_STARTUP_STALL_RESTART_S
+        baseline = max(self._stream_started_at, self._wake_active_at)
+        return now - baseline >= LIVE_STARTUP_STALL_RESTART_S
 
     def _restart_stale_stream(self, now: float, *, context: str) -> None:
         if self._last_p2p_video_time >= self._stream_started_at:

@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument(
         "--wake-timeout",
         type=int,
-        default=45,
+        default=90,
         help="Seconds to wait for live frames before launching playback",
     )
     stream.add_argument(
