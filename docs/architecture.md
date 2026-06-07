@@ -80,7 +80,9 @@ Pure-asyncio; can be driven from HA or from `debug.py` without changes.
 
 | File | Layer |
 |------|-------|
-| `engine.py` | The orchestrator — discovery → signaling → ICE → KCP → VVP → media. |
+| `engine.py` | `P2PStreamer` — lifecycle + session orchestration (discovery → signaling → wake → coturn). |
+| `live_session.py` | `LiveSessionMixin._stream_with_turn` — the per-session ICE → KCP → VVP → media loop (split out to keep files <1000 lines). |
+| `session_support.py` | Shared session constants, identity helpers, `SignalingClusterMiss`. |
 | `root_discovery.py` | Native UDP root protocol on port 9253. |
 | `network.py` | Socket plumbing, packet routing, NAT timers. |
 | `ice.py` + `sdp.py` | Candidate gathering + SDP parsing (relay implicit in `m=audio`). |
