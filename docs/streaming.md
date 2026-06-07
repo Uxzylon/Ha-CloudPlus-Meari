@@ -33,20 +33,33 @@ The engine therefore sends `kcp.send_handshake()` and a `START_LIVE` (reason
 `live_started = True` is set immediately so the keepalive and idle-retry
 paths take over from there.
 
-## Dormancy wake must be retried
+## Dormancy wake is offer-driven, not status-driven
 
-Snap (battery / solar) cameras occasionally miss a single
-`send_wake_connect` when deeply dormant. Sending it once and then passively
-waiting up to 30 s for the camera to push `status=online` leaves the engine
-idle while HA-coordinator-level watchdogs fire `Restarting stale` after
-25 s and tear the session down before the camera has a chance to come
-back.
+A dormant snap (battery / solar) camera's `status=online` push is **slow** —
+measured 40–57 s, sometimes more. **Do not gate the stream on it.** Direct
+capture of the official app on a cold (30–60 min dormant) camera shows it
+streaming in ~5 s of tap / ~14 s of signaling: the app requests coturn and
+then sends the **SDP offer / live request while the camera is still dormant**.
+The camera wakes *in response to the offer* and answers in ~10–15 s — long
+before its `online` status would arrive. The app never polls `online`.
 
-**Fix**: re-fire both `sig.send_wake_connect` and the HTTP `wake_device`
-every `WAKE_RETRY_S` (≈4 s) inside the dormancy wait, until either the
-camera pushes `status=online` or `DORMANCY_WAKE_TIMEOUT_S` (≈45 s) elapses.
-The retries are cheap and they shorten the typical post-deep-dormancy wake
-to a single session — no need for a coordinator-level restart cycle.
+**Fix**: mirror that exactly.
+
+- On `status=dormancy` the engine does **not** wait for `online`. It requests
+  coturn first (works while dormant — same order as the app; firing the wake
+  first leaves stray signaling frames that desync the coturn read), allocates
+  the relay, then enters `_negotiate_dormant_offer`: re-issue the SDP offer and
+  re-fire `send_wake_connect` + HTTP `wake_device` every few seconds while
+  continuously polling the signaling socket for the camera's delayed, pushed
+  SDP answer + trickle candidates. The camera's **answer is the wake
+  confirmation**; once candidates arrive the normal ICE/START_LIVE path runs.
+- `DORMANCY_WAKE_TIMEOUT_S` (≈75 s) bounds how long we keep offering before
+  giving up to the next signaling candidate / a fresh session.
+- If a signaling cluster returns no coturn creds, fail fast to the next
+  candidate instead of spending the allocate retries on an empty address.
+
+This brought cold-start latency from ~70 s (status-polling) down to ~14 s,
+matching the app.
 
 **The watchdogs must not restart underneath an active wake.** A deep-dormancy
 wake routinely takes 30–45 s, but the no-first-video restart fires at
@@ -55,8 +68,9 @@ wake routinely takes 30–45 s, but the no-first-video restart fires at
 progress, and — because the camera often only comes online around 40 s — the
 stream never starts (observed as a session that sends `START_LIVE` then dies
 immediately, 0 frames). The engine therefore exposes `awaiting_wake` while the
-dormancy-wake loop runs; the HA coordinator (`_stream_video_stale`) and the
-debug stall watchdog both **skip the restart while it is set**, and the
+offer-driven wake is in progress (set on `dormancy`, cleared once the camera's
+SDP answer yields candidates); the HA coordinator (`_stream_video_stale`) and
+the debug stall watchdog both **skip the restart while it is set**, and the
 coordinator starts its first-video clock from when the wake *completes*, not
 from session start. A truly stuck wake still ends on its own when the engine's
 `DORMANCY_WAKE_TIMEOUT_S` budget expires, after which the session restarts
