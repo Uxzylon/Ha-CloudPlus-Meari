@@ -54,7 +54,11 @@ class PacketCapture:
         )
         try:
             self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
-                argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError as err:
             _LOGGER.warning("Could not start tcpdump: %s", err)
