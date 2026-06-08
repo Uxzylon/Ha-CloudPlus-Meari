@@ -6,7 +6,6 @@ import json
 import logging
 import socket
 import time
-from urllib.parse import urlparse
 
 from ..msgsvr_codec import (
     CMD_STATUS,
@@ -15,6 +14,7 @@ from ..msgsvr_codec import (
     build_frame,
     parse_frame,
 )
+from ..url_util import parse_host as _host
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,18 +28,6 @@ ROOT_DISCOVERY_PORT = 9253
 ROOT_DISCOVERY_VERSION = 15259
 _ROOT_CACHE_TTL_S = 600.0
 _ROOT_CACHE: dict[str, tuple[list[tuple[str, int]], float]] = {}
-
-
-def _host(value: str | None) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if "://" in raw:
-        try:
-            return (urlparse(raw).hostname or "").strip().lower()
-        except Exception:
-            return ""
-    return raw
 
 
 def _platform_from_openapi(host: str) -> str:

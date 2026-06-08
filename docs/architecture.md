@@ -89,7 +89,7 @@ Pure-asyncio; can be driven from HA or from `debug.py` without changes.
 | `relay_probe.py` | TURN allocation, permissions, channel binding. |
 | `lan.py` | Direct-LAN punch (plaintext msgsvr "connect" to host candidates). |
 | `kcp_tunnel.py` (sibling under `cloudplus/`) | KCP reliable transport over UDP. |
-| `protocol.py` + `frames.py` | IVA framing (`0x7010` / `0x7012`). |
+| `protocol.py` | IVA framing (`0x7010` / `0x7012`). |
 | `codec.py` | VVP packet codec (magic `0x56565099`). |
 | `quality.py` | Quality-profile → stream-id mapping (AUTO=105, profile=100+id). |
 | `keepalive.py` | `0x888E` heartbeat + proactive `START_LIVE` re-issue. |

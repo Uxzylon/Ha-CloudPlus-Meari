@@ -16,3 +16,4 @@ reverse_engineering/
 .venv/
 logs/
 *.pcap
+!.pylintrc

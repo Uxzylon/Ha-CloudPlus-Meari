@@ -107,10 +107,10 @@ def collect_trickle_candidates(
         sig.sock.settimeout(0.5)
         for _ in range(10):
             try:
-                extra = sig._recv_webrtc_content()
+                extra = sig.recv_webrtc_content()
             except socket.timeout:
                 break
-            except Exception:
+            except (OSError, ValueError, KeyError):
                 break
             if not isinstance(extra, dict):
                 continue

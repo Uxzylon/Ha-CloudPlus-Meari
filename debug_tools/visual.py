@@ -1,3 +1,5 @@
+"""ffplay visual-progress and showinfo PTS parsing for stream diagnostics."""
+
 from __future__ import annotations
 
 import logging
@@ -68,7 +70,7 @@ def _monitor_player_decode_correlation(
                 fh.seek(offset)
                 chunk = fh.read()
                 offset = fh.tell()
-        except Exception:
+        except OSError:
             return
 
         if not chunk:
@@ -137,6 +139,134 @@ def _monitor_player_decode_correlation(
     _drain_decode_log_once()
 
 
+def _note_showinfo_render_gap(
+    state: dict[str, Any], when_mono: float, log: logging.Logger
+) -> None:
+    """Record the wall-clock gap between consecutive ffplay showinfo lines."""
+    prev_showinfo_mono = float(state.get("last_showinfo_mono", 0.0) or 0.0)
+    if prev_showinfo_mono <= 0.0:
+        return
+    render_gap_s = max(0.0, when_mono - prev_showinfo_mono)
+    render_gaps = state.setdefault("showinfo_render_gaps_s", [])
+    if len(render_gaps) < 10000:
+        render_gaps.append(render_gap_s)
+    player_started_at = float(state.get("player_started_mono", when_mono) or when_mono)
+    startup_cutoff_s = 5.0
+    target_bucket = (
+        "showinfo_startup_render_gaps_s"
+        if (when_mono - player_started_at) <= startup_cutoff_s
+        else "showinfo_steady_render_gaps_s"
+    )
+    phase_render_gaps = state.setdefault(target_bucket, [])
+    if len(phase_render_gaps) < 5000:
+        phase_render_gaps.append(render_gap_s)
+    state["max_showinfo_render_gap_s"] = max(
+        float(state.get("max_showinfo_render_gap_s", 0.0) or 0.0),
+        render_gap_s,
+    )
+    if render_gap_s > 1.0:
+        state["showinfo_render_freezes_over_1s"] = (
+            int(state.get("showinfo_render_freezes_over_1s", 0) or 0) + 1
+        )
+    last_warned_gap_s = float(state.get("last_warned_showinfo_gap_s", 0.0) or 0.0)
+    if render_gap_s >= 2.0 and abs(render_gap_s - last_warned_gap_s) > 0.20:
+        player_started_mono = float(
+            state.get("player_started_mono", when_mono) or when_mono
+        )
+        log.warning(
+            "ffplay visible freeze: showinfo gap %.2fs at +%.2fs from player start",
+            render_gap_s,
+            when_mono - player_started_mono,
+        )
+        state["last_warned_showinfo_gap_s"] = render_gap_s
+
+
+def _note_showinfo_frame_jump(state: dict[str, Any], line: str) -> None:
+    """Count skipped frame indices reported by ffplay showinfo."""
+    n_match = _SHOWINFO_FRAME_N_RE.search(line)
+    if not n_match:
+        return
+    try:
+        frame_n = int(n_match.group(1))
+    except ValueError:
+        frame_n = -1
+    if frame_n < 0:
+        return
+    prev_frame_n = int(state.get("last_showinfo_frame_n", -1) or -1)
+    if prev_frame_n >= 0 and frame_n > prev_frame_n + 1:
+        state["showinfo_frame_jump_count"] = int(
+            state.get("showinfo_frame_jump_count", 0) or 0
+        ) + (frame_n - prev_frame_n - 1)
+    state["last_showinfo_frame_n"] = frame_n
+
+
+def _note_showinfo_pts(state: dict[str, Any], line: str, when_mono: float) -> None:
+    """Record PTS-time gaps and the PTS timeline from ffplay showinfo."""
+    pts_match = _SHOWINFO_PTS_TIME_RE.search(line)
+    if not pts_match:
+        return
+    try:
+        pts_time = float(pts_match.group(1))
+    except ValueError:
+        pts_time = -1.0
+    if pts_time < 0.0:
+        return
+    prev_pts_time = float(state.get("last_showinfo_pts_time", -1.0) or -1.0)
+    if 0.0 <= prev_pts_time < pts_time:
+        pts_gap_s = pts_time - prev_pts_time
+        pts_gaps = state.setdefault("showinfo_pts_gaps_s", [])
+        if len(pts_gaps) < 10000:
+            pts_gaps.append(pts_gap_s)
+        player_started_at = float(
+            state.get("player_started_mono", when_mono) or when_mono
+        )
+        startup_cutoff_s = 5.0
+        target_bucket = (
+            "showinfo_startup_pts_gaps_s"
+            if (when_mono - player_started_at) <= startup_cutoff_s
+            else "showinfo_steady_pts_gaps_s"
+        )
+        phase_pts_gaps = state.setdefault(target_bucket, [])
+        if len(phase_pts_gaps) < 5000:
+            phase_pts_gaps.append(pts_gap_s)
+        state["max_showinfo_pts_gap_s"] = max(
+            float(state.get("max_showinfo_pts_gap_s", 0.0) or 0.0),
+            pts_gap_s,
+        )
+        if pts_gap_s > 0.30:
+            state["showinfo_pts_gaps_over_300ms"] = (
+                int(state.get("showinfo_pts_gaps_over_300ms", 0) or 0) + 1
+            )
+    state["last_showinfo_pts_time"] = pts_time
+    timeline = state.setdefault("showinfo_timeline", [])
+    if len(timeline) < 20000:
+        timeline.append((when_mono, pts_time))
+
+
+def _note_player_texture_ready(
+    state: dict[str, Any], when_mono: float, log: logging.Logger
+) -> None:
+    """Record the first ffplay video-texture creation and log readiness."""
+    if float(state.get("texture_created_mono", 0.0) or 0.0) > 0.0:
+        return
+    state["texture_created_mono"] = when_mono
+    player_started_mono = float(
+        state.get("player_started_mono", when_mono) or when_mono
+    )
+    run_started_mono = float(state.get("run_started_mono", 0.0) or 0.0)
+    if run_started_mono > 0.0:
+        log.info(
+            "Player visual ready: ffplay created its video texture after %.2fs from player launch / %.2fs from debug.py start",
+            when_mono - player_started_mono,
+            when_mono - run_started_mono,
+        )
+    else:
+        log.info(
+            "Player visual ready: ffplay created its video texture after %.2fs",
+            when_mono - player_started_mono,
+        )
+
+
 def _monitor_player_visual_state(
     log_path: str,
     stop_event: threading.Event,
@@ -155,7 +285,7 @@ def _monitor_player_visual_state(
                 fh.seek(offset)
                 chunk = fh.read()
                 offset = fh.tell()
-        except Exception:
+        except OSError:
             return
 
         if not chunk:
@@ -177,131 +307,17 @@ def _monitor_player_visual_state(
 
             if _FFPLAY_TEXTURE_LINE_RE.search(line):
                 state["texture_lines"] = int(state.get("texture_lines", 0) or 0) + 1
-                if float(state.get("texture_created_mono", 0.0) or 0.0) <= 0.0:
-                    state["texture_created_mono"] = when_mono
-                    player_started_mono = float(
-                        state.get("player_started_mono", when_mono) or when_mono
-                    )
-                    run_started_mono = float(state.get("run_started_mono", 0.0) or 0.0)
-                    if run_started_mono > 0.0:
-                        log.info(
-                            "Player visual ready: ffplay created its video texture after %.2fs from player launch / %.2fs from debug.py start",
-                            when_mono - player_started_mono,
-                            when_mono - run_started_mono,
-                        )
-                    else:
-                        log.info(
-                            "Player visual ready: ffplay created its video texture after %.2fs",
-                            when_mono - player_started_mono,
-                        )
+                _note_player_texture_ready(state, when_mono, log)
 
             if "Parsed_showinfo" in line and "pts_time:" in line:
                 state["showinfo_lines"] = int(state.get("showinfo_lines", 0) or 0) + 1
                 if float(state.get("first_showinfo_mono", 0.0) or 0.0) <= 0.0:
                     state["first_showinfo_mono"] = when_mono
 
-                prev_showinfo_mono = float(state.get("last_showinfo_mono", 0.0) or 0.0)
-                if prev_showinfo_mono > 0.0:
-                    render_gap_s = max(0.0, when_mono - prev_showinfo_mono)
-                    render_gaps = state.setdefault("showinfo_render_gaps_s", [])
-                    if len(render_gaps) < 10000:
-                        render_gaps.append(render_gap_s)
-                    player_started_at = float(
-                        state.get("player_started_mono", when_mono) or when_mono
-                    )
-                    startup_cutoff_s = 5.0
-                    target_bucket = (
-                        "showinfo_startup_render_gaps_s"
-                        if (when_mono - player_started_at) <= startup_cutoff_s
-                        else "showinfo_steady_render_gaps_s"
-                    )
-                    phase_render_gaps = state.setdefault(target_bucket, [])
-                    if len(phase_render_gaps) < 5000:
-                        phase_render_gaps.append(render_gap_s)
-                    state["max_showinfo_render_gap_s"] = max(
-                        float(state.get("max_showinfo_render_gap_s", 0.0) or 0.0),
-                        render_gap_s,
-                    )
-                    if render_gap_s > 1.0:
-                        state["showinfo_render_freezes_over_1s"] = (
-                            int(state.get("showinfo_render_freezes_over_1s", 0) or 0)
-                            + 1
-                        )
-                    last_warned_gap_s = float(
-                        state.get("last_warned_showinfo_gap_s", 0.0) or 0.0
-                    )
-                    if (
-                        render_gap_s >= 2.0
-                        and abs(render_gap_s - last_warned_gap_s) > 0.20
-                    ):
-                        player_started_mono = float(
-                            state.get("player_started_mono", when_mono) or when_mono
-                        )
-                        log.warning(
-                            "ffplay visible freeze: showinfo gap %.2fs at +%.2fs from player start",
-                            render_gap_s,
-                            when_mono - player_started_mono,
-                        )
-                        state["last_warned_showinfo_gap_s"] = render_gap_s
+                _note_showinfo_render_gap(state, when_mono, log)
                 state["last_showinfo_mono"] = when_mono
-
-                n_match = _SHOWINFO_FRAME_N_RE.search(line)
-                if n_match:
-                    try:
-                        frame_n = int(n_match.group(1))
-                    except ValueError:
-                        frame_n = -1
-                    if frame_n >= 0:
-                        prev_frame_n = int(state.get("last_showinfo_frame_n", -1) or -1)
-                        if prev_frame_n >= 0 and frame_n > prev_frame_n + 1:
-                            state["showinfo_frame_jump_count"] = int(
-                                state.get("showinfo_frame_jump_count", 0) or 0
-                            ) + (frame_n - prev_frame_n - 1)
-                        state["last_showinfo_frame_n"] = frame_n
-
-                pts_match = _SHOWINFO_PTS_TIME_RE.search(line)
-                if pts_match:
-                    try:
-                        pts_time = float(pts_match.group(1))
-                    except ValueError:
-                        pts_time = -1.0
-                    if pts_time >= 0.0:
-                        prev_pts_time = float(
-                            state.get("last_showinfo_pts_time", -1.0) or -1.0
-                        )
-                        if prev_pts_time >= 0.0 and pts_time > prev_pts_time:
-                            pts_gap_s = pts_time - prev_pts_time
-                            pts_gaps = state.setdefault("showinfo_pts_gaps_s", [])
-                            if len(pts_gaps) < 10000:
-                                pts_gaps.append(pts_gap_s)
-                            player_started_at = float(
-                                state.get("player_started_mono", when_mono) or when_mono
-                            )
-                            startup_cutoff_s = 5.0
-                            target_bucket = (
-                                "showinfo_startup_pts_gaps_s"
-                                if (when_mono - player_started_at) <= startup_cutoff_s
-                                else "showinfo_steady_pts_gaps_s"
-                            )
-                            phase_pts_gaps = state.setdefault(target_bucket, [])
-                            if len(phase_pts_gaps) < 5000:
-                                phase_pts_gaps.append(pts_gap_s)
-                            state["max_showinfo_pts_gap_s"] = max(
-                                float(state.get("max_showinfo_pts_gap_s", 0.0) or 0.0),
-                                pts_gap_s,
-                            )
-                            if pts_gap_s > 0.30:
-                                state["showinfo_pts_gaps_over_300ms"] = (
-                                    int(
-                                        state.get("showinfo_pts_gaps_over_300ms", 0)
-                                        or 0
-                                    )
-                                    + 1
-                                )
-                        state["last_showinfo_pts_time"] = pts_time
-                        timeline = state.setdefault("showinfo_timeline", [])
-                        if len(timeline) < 20000:
-                            timeline.append((when_mono, pts_time))
+                _note_showinfo_frame_jump(state, line)
+                _note_showinfo_pts(state, line, when_mono)
 
             if "A-V:" in line and "aq=" in line and "vq=" in line:
                 state["stats_count"] = int(state.get("stats_count", 0) or 0) + 1
@@ -345,10 +361,8 @@ def _monitor_player_visual_state(
                     )
                     state["late_texture_warned"] = True
             first_stats_mono = float(state.get("first_stats_mono", 0.0) or 0.0)
-            if (
-                texture_created_mono > 0.0
-                and first_stats_mono <= 0.0
-                and not bool(state.get("late_stats_warned", False))
+            if first_stats_mono <= 0.0 < texture_created_mono and not bool(
+                state.get("late_stats_warned", False)
             ):
                 if now_mono - texture_created_mono > 6.0:
                     log.warning(
@@ -481,11 +495,7 @@ def _summarize_player_visual_state(
             first_showinfo_mono - run_started_mono,
             3,
         )
-    if (
-        showinfo_lines > 1
-        and first_showinfo_mono > 0.0
-        and last_showinfo_mono > first_showinfo_mono
-    ):
+    if showinfo_lines > 1 and 0.0 < first_showinfo_mono < last_showinfo_mono:
         showinfo_span = max(0.001, last_showinfo_mono - first_showinfo_mono)
         result["player_showinfo_estimated_fps"] = round(
             (showinfo_lines - 1) / showinfo_span,

@@ -12,6 +12,7 @@ import time
 from typing import Callable
 
 from ..p2p_streamer.codecs import demuxer_for
+from .ffmpeg_util import FFMPEG_BASE_CMD, terminate_process
 from ..p2p_streamer.codecs.base import CodecName
 from .audio_encoder import AacAudioEncoder
 from .mpegts import (
@@ -124,10 +125,7 @@ class FfmpegMuxer:
         fps_text = f"{input_fps:.3f}"
         setts = f"setts=pts=N/({fps_text}*TB):dts=N/({fps_text}*TB)"
         cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
+            *FFMPEG_BASE_CMD,
             "-fflags",
             "+genpts+igndts+discardcorrupt",
             "-probesize",
@@ -162,13 +160,13 @@ class FfmpegMuxer:
         ]
         self._audio.start()
         try:
-            self._proc = subprocess.Popen(
+            self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-        except Exception:
+        except OSError:
             self._audio.stop()
             raise
         self._running = True
@@ -192,21 +190,7 @@ class FfmpegMuxer:
         proc = self._proc
         self._proc = None
         self._audio.stop()
-        if proc is not None:
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
+        terminate_process(proc)
         self._drain_video_queue()
 
     def reset_live_timing(self) -> None:
@@ -276,12 +260,12 @@ class FfmpegMuxer:
         while self._running and self._proc is proc and proc.poll() is None:
             try:
                 ready, _, _ = select.select([proc.stdout], [], [], 0.03)
-            except Exception:
+            except (OSError, ValueError):
                 break
             if ready:
                 try:
                     data = proc.stdout.read1(65536)
-                except Exception:
+                except (OSError, ValueError):
                     break
                 if not data:
                     break
@@ -341,7 +325,11 @@ class FfmpegMuxer:
             step = max(1, int(max(0.001, pts_interval_s) * 90000))
         else:
             step = self._video_pts_step_ticks
-        pts = self._pts_carry if self._last_video_pts is None else self._last_video_pts + step
+        pts = (
+            self._pts_carry
+            if self._last_video_pts is None
+            else self._last_video_pts + step
+        )
         self._current_video_pts = pts
         self._pts_carry = pts + step
         return pts
@@ -419,7 +407,7 @@ class FfmpegMuxer:
                 line = raw.decode(errors="replace").strip()
                 if line:
                     _LOGGER.debug("ffmpeg[%s]: %s", self._codec, line)
-        except Exception:
+        except (OSError, ValueError):
             pass
 
     def _write_video(self, proc: subprocess.Popen) -> None:
@@ -427,7 +415,7 @@ class FfmpegMuxer:
             return
         try:
             stdin_fd = proc.stdin.fileno()
-        except Exception:
+        except (OSError, ValueError):
             return
 
         while self._running and self._proc is proc and proc.poll() is None:
@@ -447,13 +435,13 @@ class FfmpegMuxer:
             while view and self._running and self._proc is proc and proc.poll() is None:
                 try:
                     _, writable, _ = select.select([], [stdin_fd], [], 0.5)
-                except Exception:
+                except (OSError, ValueError):
                     return
                 if not writable:
                     continue
                 try:
                     written = os.write(stdin_fd, view)
-                except Exception:
+                except (OSError, ValueError):
                     return
                 if written <= 0:
                     return

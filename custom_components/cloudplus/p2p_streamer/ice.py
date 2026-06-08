@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import socket
 import struct
 
 from ..turn_client import (
-    ATTR_USERNAME,
     ATTR_XOR_MAPPED_ADDRESS,
-    BINDING_REQUEST,
     BINDING_RESPONSE,
     _add_integrity,
     _build_stun,
@@ -29,32 +27,7 @@ def build_ice_response(
     return msg
 
 
-def build_ice_binding_request(
-    *,
-    local_ufrag: str,
-    remote_ufrag: str,
-    remote_pwd: str,
-    use_candidate: bool = True,
-) -> bytes:
-    """Build an ICE STUN binding request payload."""
-    username = f"{remote_ufrag}:{local_ufrag}"
-    attrs = _encode_attr(ATTR_USERNAME, username.encode())
-    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-    attrs += _encode_attr(
-        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
-    )
-    if use_candidate:
-        attrs += _encode_attr(0x0025, b"")
-    txn_id = os.urandom(12)
-    attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, remote_pwd.encode())
-    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
-    return msg
-
-
 def _encode_xor_address(ip: str, port: int) -> bytes:
-    # Kept local to avoid importing internal helper from turn_client.
-    import socket
-
     magic_cookie = 0x2112A442
     magic_bytes = struct.pack(">I", magic_cookie)
     xor_port = port ^ (magic_cookie >> 16)

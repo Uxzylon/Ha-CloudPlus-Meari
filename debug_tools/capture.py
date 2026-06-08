@@ -53,7 +53,7 @@ class PacketCapture:
             "Starting packet capture: %s (filter: %s)", self.path, self.filter_expr
         )
         try:
-            self._proc = subprocess.Popen(
+            self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
                 argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
             )
         except OSError as err:
@@ -82,10 +82,10 @@ class PacketCapture:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             try:
                 proc.kill()
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 pass
         try:
             _LOGGER.info(

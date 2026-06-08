@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_STREAM_QUALITY, DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
+from .entity import CloudEdgeMeariEntity, CloudEdgeMeariIotEntity
 from .meari_commands import (
     ALARM_FREQUENCY,
     DAY_NIGHT_MODE,
@@ -30,6 +30,8 @@ _OPTION_TO_KEY = {v: k for k, v in STREAM_HOST_OPTIONS.items()}
 
 @dataclass(frozen=True)
 class IotSelectSpec:
+    """Declarative spec for an IoT-backed select entity."""
+
     feature: str | None
     code: int
     name: str
@@ -102,10 +104,8 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class CloudEdgeMeariIotSelect(SelectEntity):
+class CloudEdgeMeariIotSelect(CloudEdgeMeariIotEntity, SelectEntity):
     """Select entity backed by a Meari IoT value."""
-
-    _attr_has_entity_name = True
 
     def __init__(
         self,
@@ -113,45 +113,14 @@ class CloudEdgeMeariIotSelect(SelectEntity):
         entry: ConfigEntry,
         spec: IotSelectSpec,
     ) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
-        self._spec = spec
+        super().__init__(coordinator, entry, spec)
         self._label_to_value = {label: value for value, label in spec.options.items()}
-        self._attr_name = spec.name
-        self._attr_icon = spec.icon
         self._attr_options = list(spec.options.values())
         self._attr_unique_id = f"{coordinator.device_uuid}_iot_select_{spec.code}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return (
-            self._coordinator.available
-            and self._coordinator.get_iot_value(self._spec.code) is not None
-        )
 
     @property
     def current_option(self) -> str | None:
-        value = self._coordinator.get_iot_value(self._spec.code)
+        value = self._iot_value
         try:
             return self._spec.options.get(int(value))
         except (TypeError, ValueError):
@@ -170,10 +139,9 @@ class CloudEdgeMeariIotSelect(SelectEntity):
         self.async_write_ha_state()
 
 
-class CloudEdgeMeariStreamHostSelect(SelectEntity):
+class CloudEdgeMeariStreamHostSelect(CloudEdgeMeariEntity, SelectEntity):
     """Select entity to choose between IP address or Docker hostname for stream URL."""
 
-    _attr_has_entity_name = True
     _attr_name = "Stream Host Mode"
     _attr_icon = "mdi:ip-network"
     _attr_options = list(STREAM_HOST_OPTIONS.values())
@@ -181,33 +149,8 @@ class CloudEdgeMeariStreamHostSelect(SelectEntity):
     def __init__(
         self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
     ) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
+        super().__init__(coordinator, entry)
         self._attr_unique_id = f"{coordinator.device_uuid}_stream_host_mode"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available
 
     @property
     def current_option(self) -> str:
@@ -229,26 +172,17 @@ class CloudEdgeMeariStreamHostSelect(SelectEntity):
 _AUTO_LABEL = "AUTO"
 
 
-class CloudEdgeMeariStreamQualitySelect(SelectEntity):
+class CloudEdgeMeariStreamQualitySelect(CloudEdgeMeariEntity, SelectEntity):
     """Select entity to choose the camera stream quality profile."""
 
-    _attr_has_entity_name = True
     _attr_name = "Stream Quality"
     _attr_icon = "mdi:video-high-definition"
 
     def __init__(
         self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
     ) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
+        super().__init__(coordinator, entry)
         self._attr_unique_id = f"{coordinator.device_uuid}_stream_quality"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
         # Build option list from device capabilities
         self._profiles = coordinator.quality_profiles  # {int: str}
         self._label_to_id: dict[str, int | None] = {}
@@ -257,23 +191,6 @@ class CloudEdgeMeariStreamQualitySelect(SelectEntity):
         for pid, label in sorted(self._profiles.items()):
             self._label_to_id[label] = pid
         self._attr_options = list(self._label_to_id.keys())
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available
 
     @property
     def current_option(self) -> str:

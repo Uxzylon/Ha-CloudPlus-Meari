@@ -1,3 +1,5 @@
+"""Build an in-process coordinator from the integration modules for the harness."""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,10 +16,10 @@ from .devices import _select_device
 
 async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
     mods = _bootstrap_integration_modules()
-    MeariApiClient = mods["api"].MeariApiClient
-    CloudEdgeMeariCoordinator = mods["coordinator"].CloudEdgeMeariCoordinator
+    api_cls = mods["api"].MeariApiClient
+    coordinator_cls = mods["coordinator"].CloudEdgeMeariCoordinator
 
-    api = _login_api_with_fallback(MeariApiClient, args)
+    api = _login_api_with_fallback(api_cls, args)
     if hasattr(api, "get_camera_devices"):
         devices = api.get_camera_devices()
     else:
@@ -26,7 +28,7 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
 
     loop = asyncio.get_running_loop()
     hass = types.SimpleNamespace(loop=loop, data={})
-    coord = CloudEdgeMeariCoordinator(
+    coord = coordinator_cls(
         hass=hass,
         email=args.email,
         password=args.password,
@@ -52,9 +54,9 @@ async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
 
 async def _camera_stream_source(mods: dict[str, Any], coord: Any) -> str:
     """Build stream URL via integration camera entity code path."""
-    CloudEdgeMeariCamera = mods["camera"].CloudEdgeMeariCamera
+    camera_cls = mods["camera"].CloudEdgeMeariCamera
     entry_stub = types.SimpleNamespace(entry_id="dev-cli")
-    entity = CloudEdgeMeariCamera(coord, entry_stub)
+    entity = camera_cls(coord, entry_stub)
     source = await entity.stream_source()
     if not source:
         raise RuntimeError("Camera stream source is unavailable")

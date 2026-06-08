@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTime
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
+from .entity import CloudEdgeMeariEntity, CloudEdgeMeariIotNumericEntity
 from .meari_commands import (
     FLIGHT_BRIGHTNESS,
     FLIGHT_PIR_DURATION,
@@ -28,6 +28,8 @@ from .meari_commands import (
 
 @dataclass(frozen=True)
 class IotNumberSpec:
+    """Declarative spec for an IoT-backed number entity."""
+
     feature: str
     code: int
     name: str
@@ -137,10 +139,9 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class CloudEdgeMeariIotNumber(NumberEntity):
+class CloudEdgeMeariIotNumber(CloudEdgeMeariIotNumericEntity, NumberEntity):
     """Number entity backed by a Meari IoT value."""
 
-    _attr_has_entity_name = True
     _attr_mode = NumberMode.SLIDER
 
     def __init__(
@@ -149,50 +150,12 @@ class CloudEdgeMeariIotNumber(NumberEntity):
         entry: ConfigEntry,
         spec: IotNumberSpec,
     ) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
-        self._spec = spec
-        self._attr_name = spec.name
-        self._attr_icon = spec.icon
+        super().__init__(coordinator, entry, spec)
         self._attr_native_min_value = spec.min_value
         self._attr_native_max_value = spec.max_value
         self._attr_native_step = spec.step
         self._attr_native_unit_of_measurement = spec.unit
         self._attr_unique_id = f"{coordinator.device_uuid}_iot_number_{spec.code}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available and self.native_value is not None
-
-    @property
-    def native_value(self) -> float | None:
-        value = self._coordinator.get_iot_value(self._spec.code)
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
 
     async def async_set_native_value(self, value: float) -> None:
         """Update the camera IoT value."""
@@ -204,10 +167,9 @@ class CloudEdgeMeariIotNumber(NumberEntity):
         self.async_write_ha_state()
 
 
-class CloudEdgeMeariMotionTimeout(NumberEntity):
+class CloudEdgeMeariMotionTimeout(CloudEdgeMeariEntity, NumberEntity):
     """Number entity to control the motion-wake timeout (seconds)."""
 
-    _attr_has_entity_name = True
     _attr_name = "Motion Timeout"
     _attr_icon = "mdi:timer-outline"
     _attr_native_min_value = 10
@@ -219,33 +181,8 @@ class CloudEdgeMeariMotionTimeout(NumberEntity):
     def __init__(
         self, coordinator: CloudEdgeMeariCoordinator, entry: ConfigEntry
     ) -> None:
-        self._coordinator = coordinator
-        self._entry = entry
+        super().__init__(coordinator, entry)
         self._attr_unique_id = f"{coordinator.device_uuid}_motion_timeout"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.device_uuid)},
-            "name": f"CloudEdge / Meari {coordinator.device_name}",
-            "manufacturer": "CloudEdge / Meari",
-            "model": coordinator.device_model,
-        }
-        self._unsub_update: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        self._unsub_update = self._coordinator.register_update_callback(
-            self._handle_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._unsub_update:
-            self._unsub_update()
-
-    @callback
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        return self._coordinator.available
 
     @property
     def native_value(self) -> float:

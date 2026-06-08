@@ -4,10 +4,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Callable, Iterator
+
+
+def iter_annexb_headers(data: bytes) -> Iterator[int]:
+    """Yield the offset just past each Annex-B start code in ``data``.
+
+    Handles both 3-byte (``00 00 01``) and 4-byte (``00 00 00 01``)
+    start codes; shared by the H.264 and HEVC payload detectors.
+    """
+    i = 0
+    n = len(data)
+    while i < n - 3:
+        if data[i] == 0 and data[i + 1] == 0:
+            if data[i + 2] == 1:
+                start = i + 3
+            elif i + 3 < n and data[i + 2] == 0 and data[i + 3] == 1:
+                start = i + 4
+            else:
+                i += 1
+                continue
+            if start < n:
+                yield start
+                i = start
+                continue
+        i += 1
 
 
 class CodecName(str, Enum):
+    """Supported video codec identifiers."""
+
     H264 = "h264"
     HEVC = "hevc"
     AV1 = "av1"
@@ -27,6 +53,8 @@ class CodecName(str, Enum):
 
 @dataclass(frozen=True)
 class GapRecoveryPolicy:
+    """Per-codec timing policy for recovering from frame gaps."""
+
     skip_wait_s: float
     skip_interval_s: float
     keyframe_wait_s: float
@@ -51,6 +79,8 @@ DEFAULT_GAP_RECOVERY = GapRecoveryPolicy(
 
 @dataclass(frozen=True)
 class CodecRuntimePolicy:
+    """Per-codec runtime timing and gating policy for the live session."""
+
     clean_startup_seed: bool = False
     launch_gate_timeout_s: float = 11.0
     severe_gap_window_s: float = 5.8
@@ -77,6 +107,8 @@ DEFAULT_RUNTIME_POLICY = CodecRuntimePolicy()
 
 @dataclass(frozen=True)
 class CodecSpec:
+    """Full per-codec descriptor: demuxer, detection and runtime policies."""
+
     name: CodecName
     ffmpeg_demuxer: str
     detect: Callable[[bytes], bool]
