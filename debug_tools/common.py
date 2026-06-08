@@ -1,3 +1,5 @@
+"""Shared paths and auth defaults/env-key maps for the debug harness."""
+
 from __future__ import annotations
 from pathlib import Path
 

@@ -1,3 +1,5 @@
+"""Credential resolution (.env / CLI) and API login with fallback."""
+
 from __future__ import annotations
 
 import argparse
@@ -32,7 +34,7 @@ def _parse_dotenv_file(path: Path) -> dict[str, str]:
             elif " #" in value:
                 value = value.split(" #", 1)[0].rstrip()
             values[key] = value
-    except Exception:
+    except (OSError, ValueError, IndexError):
         logging.getLogger(__name__).debug(
             "Failed to parse .env file %s", path, exc_info=True
         )
@@ -110,21 +112,21 @@ def _prepare_auth_args(
             "Missing credentials. Provide --email/--password or define EMAIL/PASSWORD (or CLOUDPLUS_EMAIL/CLOUDPLUS_PASSWORD) in .env."
         )
 
-    args._auth_primary = primary_auth
-    args._auth_env_fallback = None
+    args.auth_primary = primary_auth
+    args.auth_env_fallback = None
     if cli_supplied and env_auth.get("email") and env_auth.get("password"):
         if any(
             primary_auth.get(field) != env_only_auth.get(field)
             for field in primary_auth
         ):
-            args._auth_env_fallback = env_only_auth
+            args.auth_env_fallback = env_only_auth
 
     for field, value in primary_auth.items():
         setattr(args, field, value)
 
 
-def _make_api_client(MeariApiClient: Any, auth: dict[str, str | None]) -> Any:
-    return MeariApiClient(
+def _make_api_client(api_cls: Any, auth: dict[str, str | None]) -> Any:
+    return api_cls(
         email=auth["email"],
         password=auth["password"],
         country_code=auth["country_code"],
@@ -133,21 +135,21 @@ def _make_api_client(MeariApiClient: Any, auth: dict[str, str | None]) -> Any:
     )
 
 
-def _login_api_with_fallback(MeariApiClient: Any, args: argparse.Namespace) -> Any:
-    auth = dict(getattr(args, "_auth_primary", {}))
-    api = _make_api_client(MeariApiClient, auth)
+def _login_api_with_fallback(api_cls: Any, args: argparse.Namespace) -> Any:
+    auth = dict(getattr(args, "auth_primary", {}))
+    api = _make_api_client(api_cls, auth)
     try:
         api.login()
-    except Exception:
-        fallback_auth = getattr(args, "_auth_env_fallback", None)
+    except (OSError, RuntimeError, ValueError, KeyError):
+        fallback_auth = getattr(args, "auth_env_fallback", None)
         if not fallback_auth:
             raise
         logging.getLogger(__name__).warning(
             "Login with CLI-priority credentials failed; retrying with .env credentials"
         )
-        api = _make_api_client(MeariApiClient, fallback_auth)
+        api = _make_api_client(api_cls, fallback_auth)
         api.login()
         for field, value in fallback_auth.items():
             setattr(args, field, value)
-        args._auth_primary = dict(fallback_auth)
+        args.auth_primary = dict(fallback_auth)
     return api

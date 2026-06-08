@@ -1,3 +1,5 @@
+"""``debug.py stream`` command: drive a live stream through ffplay with recording."""
+
 from __future__ import annotations
 
 import asyncio
@@ -58,6 +60,19 @@ from .visual import (
     _monitor_player_visual_state,
     _summarize_player_visual_state,
 )
+
+
+def _print_ts_metrics(ts_metrics: dict[str, Any]) -> None:
+    """Print recorded-TS analysis metrics with per-key formatting."""
+    for k, v in ts_metrics.items():
+        if k == "decode_errors_sample":
+            print(f"  {k}:")
+            for line in v:
+                print(f"    {line}")
+        elif isinstance(v, float):
+            print(f"  {k}: {v:.2f}")
+        else:
+            print(f"  {k}: {v}")
 
 
 async def cmd_stream(args) -> int:
@@ -445,8 +460,10 @@ async def cmd_stream(args) -> int:
                 "Launching stream recorder: ffmpeg → %s",
                 ts_record_path,
             )
-            recorder_log_fh = open(recorder_log_path, "wb")
-            recorder_proc = subprocess.Popen(
+            recorder_log_fh = open(  # pylint: disable=consider-using-with
+                recorder_log_path, "wb"
+            )
+            recorder_proc = subprocess.Popen(  # pylint: disable=consider-using-with
                 recorder_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -465,7 +482,7 @@ async def cmd_stream(args) -> int:
                 "Launching PCM audio recorder: ffmpeg → %s",
                 pcm_record_path,
             )
-            pcm_recorder_proc = subprocess.Popen(
+            pcm_recorder_proc = subprocess.Popen(  # pylint: disable=consider-using-with
                 pcm_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -635,10 +652,7 @@ async def cmd_stream(args) -> int:
                 print("\nFFplay observed stats (authoritative)")
                 print("-" * 78)
                 for k, v in player_metrics.items():
-                    if isinstance(v, list):
-                        print(f"  {k}: {v}")
-                    else:
-                        print(f"  {k}: {v}")
+                    print(f"  {k}: {v}")
                 run_failed = run_failed or bool(
                     player_metrics.get("player_has_issues", False)
                 )
@@ -670,10 +684,7 @@ async def cmd_stream(args) -> int:
                     print("\nRecorder log analysis (what ffmpeg recorder reported)")
                     print("-" * 78)
                     for k, v in recorder_metrics.items():
-                        if isinstance(v, list):
-                            print(f"  {k}: {v}")
-                        else:
-                            print(f"  {k}: {v}")
+                        print(f"  {k}: {v}")
                     recorder_only_timestamp_discontinuities = bool(
                         int(recorder_metrics.get("recorder_decode_error_lines", 0) or 0)
                         == 0
@@ -708,17 +719,7 @@ async def cmd_stream(args) -> int:
                 if ts_metrics:
                     print("\nTS recording analysis (what the player received)")
                     print("-" * 78)
-                    for k, v in ts_metrics.items():
-                        if k == "decode_errors_sample":
-                            print(f"  {k}:")
-                            for line in v:
-                                print(f"    {line}")
-                        elif isinstance(v, list):
-                            print(f"  {k}: {v}")
-                        elif isinstance(v, float):
-                            print(f"  {k}: {v:.2f}")
-                        else:
-                            print(f"  {k}: {v}")
+                    _print_ts_metrics(ts_metrics)
                     _print_ts_decode_correlation(
                         coord, recorder_started_mono, ts_metrics
                     )
@@ -821,7 +822,7 @@ async def cmd_stream(args) -> int:
             try:
                 player_log_fh.flush()
                 player_log_fh.close()
-            except Exception:
+            except (OSError, ValueError):
                 pass
         if player_decode_corr_thread is not None:
             player_decode_corr_stop.set()
@@ -830,7 +831,7 @@ async def cmd_stream(args) -> int:
             try:
                 recorder_log_fh.flush()
                 recorder_log_fh.close()
-            except Exception:
+            except (OSError, ValueError):
                 pass
         if coord:
             await coord.async_stop()

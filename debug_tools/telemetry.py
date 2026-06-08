@@ -1,5 +1,8 @@
+"""Optional gap/join telemetry dump for the debug harness."""
+
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -19,15 +22,13 @@ def _write_gap_telemetry(coord: Any, artifact_base: str, log: logging.Logger) ->
         if not gap_events and not join_events:
             return
 
-        import json as _json
-
         path = f"{artifact_base}_gap_telemetry.jsonl"
         join_by_gap: dict[int, list[dict[str, Any]]] = {}
         for event in join_events:
             gap_id = int(event.get("active_gap_event_id", 0) or 0)
             join_by_gap.setdefault(gap_id, []).append(_compact_join_event(event))
 
-        with open(path, "w") as file:
+        with open(path, "w", encoding="utf-8") as file:
             for event in gap_events:
                 event_id = int(event.get("event_id", 0) or 0)
                 record = {
@@ -47,12 +48,12 @@ def _write_gap_telemetry(coord: Any, artifact_base: str, log: logging.Logger) ->
                     "status": event.get("status"),
                     "join_events": join_by_gap.get(event_id, []),
                 }
-                file.write(_json.dumps(record) + "\n")
+                file.write(json.dumps(record) + "\n")
 
             for event in join_events:
                 if int(event.get("active_gap_event_id", 0) or 0) == 0:
                     file.write(
-                        _json.dumps(
+                        json.dumps(
                             {
                                 "type": "join_event_unlinked",
                                 **_compact_join_event(event),
@@ -66,7 +67,7 @@ def _write_gap_telemetry(coord: Any, artifact_base: str, log: logging.Logger) ->
             len(gap_events),
             len(join_events),
         )
-    except Exception:
+    except (OSError, TypeError, ValueError):
         log.debug("Failed to write gap telemetry", exc_info=True)
 
 

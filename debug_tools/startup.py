@@ -1,3 +1,5 @@
+"""Stream startup and bootstrap-state inspection for the debug harness."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +14,7 @@ def _get_startup_bootstrap_state(coord: Any) -> dict[str, Any]:
     if callable(getter):
         try:
             return dict(getter())
-        except Exception:
+        except (TypeError, ValueError):
             pass
 
     validator = getattr(coord, "_is_valid_idr_seed", None)
@@ -76,7 +78,7 @@ async def _await_clean_startup_seed(
             if callable(probe_fn) and seed_bytes:
                 try:
                     ok_probe, probe_reason = probe_fn(seed_bytes, max_frames=6)
-                except Exception:
+                except (ValueError, TypeError, IndexError, KeyError):
                     ok_probe, probe_reason = False, "seed-probe-exception"
                 last_state["clean_seed_probe_reason"] = probe_reason
                 if ok_probe and preferred_join_mode in {"ready", "ready-backlog"}:
@@ -98,7 +100,7 @@ def _count_recent_gap_events(
     if callable(count_recent_fn):
         try:
             return int(count_recent_fn(severity=severity, within_s=within_s) or 0)
-        except Exception:
+        except (ValueError, TypeError):
             return 0
     return 0
 
@@ -240,41 +242,50 @@ async def _await_adaptive_player_launch_gate(
             }
         )
 
-        if (
+        ready_backlog_match = (
             preferred_join_mode == "ready-backlog"
             and backlog_ready
             and seed_generation >= required_generation
-            and frames_since_gate >= fast_frames
+        )
+        ready_backlog_settled = (
+            frames_since_gate >= fast_frames
             and stable_for_s >= min(fast_quiet_s, policy.fast_quiet_cap_s)
             and video_age_s < 0.9
             and not severe_active
-        ):
+        )
+        if ready_backlog_match and ready_backlog_settled:
             last_state["launch_gate_reason"] = "ready-backlog"
             return True, last_state
 
-        if (
+        startup_safe_match = (
             startup_safe
             and seed_generation >= required_generation
             and frames_since_gate >= stable_frames
-            and stable_for_s >= stable_quiet_s
+        )
+        startup_safe_settled = (
+            stable_for_s >= stable_quiet_s
             and video_age_s < 0.85
             and recent_severe == 0
             and not severe_recent
-        ):
+        )
+        if startup_safe_match and startup_safe_settled:
             last_state["launch_gate_reason"] = "startup-safe"
             return True, last_state
 
-        if (
+        fast_flow_match = (
             policy.allow_fast_live_flow
             and not adaptive_stream
             and frames_since_gate >= max(8, fast_frames - 2)
             and stable_for_s >= max(0.8, fast_quiet_s)
-            and video_age_s < 0.7
+        )
+        fast_flow_settled = (
+            video_age_s < 0.7
             and seed_strong
             and seed_generation >= required_generation
             and recent_severe <= 1
             and not severe_active
-        ):
+        )
+        if fast_flow_match and fast_flow_settled:
             last_state["launch_gate_reason"] = "fast-live-flow"
             return True, last_state
 

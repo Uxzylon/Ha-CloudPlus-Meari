@@ -29,7 +29,7 @@ from .const import (
     DEFAULT_PHONE_CODE,
     DOMAIN,
 )
-from .api import MeariApiClient
+from .api import build_api_client
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,12 +96,8 @@ class CloudEdgeMeariConfigFlow(ConfigFlow, domain=DOMAIN):
             )
             app_profile = user_input.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE)
 
-            client = MeariApiClient(
-                email=email,
-                password=password,
-                country_code=country_code,
-                phone_code=phone_code,
-                app_profile=app_profile,
+            client = build_api_client(
+                email, password, country_code, phone_code, app_profile
             )
             try:
                 await self.hass.async_add_executor_job(client.login)
@@ -109,7 +105,7 @@ class CloudEdgeMeariConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
             except (ConnectionError, OSError):
                 errors["base"] = "cannot_connect"
-            except Exception:
+            except (RuntimeError, ValueError, KeyError):
                 _LOGGER.exception("Unexpected exception during login")
                 errors["base"] = "unknown"
             else:

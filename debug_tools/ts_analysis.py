@@ -1,3 +1,5 @@
+"""Recorded MPEG-TS decode-error timeline analysis via ffmpeg showinfo."""
+
 from __future__ import annotations
 
 import logging
@@ -11,7 +13,7 @@ from .visual import _PLAYER_DECODE_MARKERS, _SHOWINFO_PTS_TIME_RE
 
 
 def _collect_ts_decode_error_timeline(
-    ts_path: str, log: logging.Logger
+    ts_path: str, _log: logging.Logger
 ) -> dict[str, Any]:
     """Approximate recorded-TS decode-error timestamps using ffmpeg showinfo."""
     result: dict[str, Any] = {}
@@ -106,7 +108,7 @@ def _analyze_recorded_ts(ts_path: str, log: logging.Logger) -> dict[str, Any]:
             timeout=30,
             stderr=subprocess.DEVNULL,
         ).decode(errors="replace")
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         log.warning("ffprobe frame extraction failed: %s", e)
         return result
 
@@ -182,7 +184,7 @@ def _analyze_recorded_ts(ts_path: str, log: logging.Logger) -> dict[str, Any]:
             timeout=15,
             stderr=subprocess.DEVNULL,
         ).decode(errors="replace")
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         log.warning("ffprobe audio extraction failed: %s", e)
         raw_audio = ""
 
@@ -242,13 +244,13 @@ def _analyze_recorded_ts(ts_path: str, log: logging.Logger) -> dict[str, Any]:
         result["decode_error_lines"] = len(error_lines)
         if error_lines:
             result["decode_errors_sample"] = error_lines[:5]
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         log.warning("TS decode error check failed: %s", e)
 
     if int(result.get("decode_error_lines", 0) or 0) > 0:
         try:
             result.update(_collect_ts_decode_error_timeline(ts_path, log))
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             log.warning("TS decode timeline correlation failed: %s", e)
 
     return result
@@ -270,7 +272,7 @@ def _analyze_media_client_log(
 
     try:
         raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
+    except OSError as e:
         log.warning("%s log read failed: %s", prefix, e)
         return result
 
@@ -292,16 +294,7 @@ def _analyze_media_client_log(
         "tb:1/16000",
         "w:2304 h:1296 pixfmt:",
     ) + tuple(benign_patterns)
-    decode_markers = (
-        "Could not find ref with POC",
-        "Error constructing the frame RPS",
-        "Skipping invalid undecodable NALU",
-        "Invalid NAL unit",
-        "decode_slice_header error",
-        "Error while decoding stream",
-        "concealing",
-        "corrupt",
-    )
+    decode_markers = _PLAYER_DECODE_MARKERS + ("concealing", "corrupt")
     continuity_markers = (
         "Continuity check failed",
         "Packet corrupt",

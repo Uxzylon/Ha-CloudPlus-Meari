@@ -1,3 +1,5 @@
+"""``debug.py list`` command: authenticate and print discovered cameras."""
+
 from __future__ import annotations
 
 from .auth import _login_api_with_fallback
@@ -6,10 +8,10 @@ from .bootstrap import _bootstrap_integration_modules
 
 async def cmd_list(args) -> int:
     mods = _bootstrap_integration_modules()
-    MeariApiClient = mods["api"].MeariApiClient
+    api_cls = mods["api"].MeariApiClient
     quality_options = mods["p2p_streamer"].quality_options
 
-    api = _login_api_with_fallback(MeariApiClient, args)
+    api = _login_api_with_fallback(api_cls, args)
 
     print("=" * 78)
     print(f"Profile: {args.profile}")

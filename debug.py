@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""CloudPlus camera local debug harness entry point."""
+
 from __future__ import annotations
 
 import argparse

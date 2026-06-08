@@ -128,12 +128,12 @@ class P2PStreamer(LiveSessionMixin):
         if stop_live is not None:
             try:
                 stop_live()
-            except Exception:
+            except OSError:
                 pass
         if self._active_sig is not None:
             try:
                 self._active_sig.close()
-            except Exception:
+            except OSError:
                 pass
         sock = self._active_sock
         if sock is not None:
@@ -374,7 +374,7 @@ class P2PStreamer(LiveSessionMixin):
             if self.on_disconnect:
                 try:
                     self.on_disconnect()
-                except Exception:
+                except (OSError, RuntimeError):
                     pass
 
     def _run_session_once(
@@ -429,7 +429,7 @@ class P2PStreamer(LiveSessionMixin):
                 if not self._running:
                     break
                 _LOGGER.info("%s; trying next signaling candidate", err)
-            except Exception as err:
+            except (OSError, RuntimeError, ValueError, KeyError) as err:
                 last_error = err
                 if not self._running:
                     _LOGGER.debug("P2P session interrupted during stop: %s", err)
@@ -456,7 +456,7 @@ class P2PStreamer(LiveSessionMixin):
                 if sig is not None:
                     try:
                         sig.send_logout(self._device_uuid)
-                    except Exception:
+                    except OSError:
                         pass
                     sig.close()
 
@@ -525,11 +525,11 @@ class P2PStreamer(LiveSessionMixin):
                         local_ips,
                         16685,
                     )
-                except Exception:
+                except OSError:
                     _LOGGER.debug("signaling wake_connect failed", exc_info=True)
                 try:
                     self._api.wake_device(self._sn_num, self._device.get("deviceID", 0))
-                except Exception:
+                except (OSError, RuntimeError, ValueError, KeyError):
                     pass
 
             # Request coturn *before* any wake (the app's order) — firing the
@@ -676,7 +676,7 @@ class P2PStreamer(LiveSessionMixin):
                         pass
                     last_offer = now
                 try:
-                    _ingest(sig._recv_webrtc_content())
+                    _ingest(sig.recv_webrtc_content())
                 except (socket.timeout, OSError):
                     pass
                 if ufrag and pwd and candidates:

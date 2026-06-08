@@ -1,3 +1,5 @@
+"""Meari IoT command and property code constants, decoded from the vendor apps."""
+
 # --- IOT CONSTANTS - COMPLETE LIST ---
 
 USER_ID = 1  # (String) userId / Account ID

@@ -46,6 +46,7 @@ Python 3.12+. `ffmpeg`/`ffplay` on PATH. A `.env` next to `debug.py` with
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install pycryptodome paho-mqtt voluptuous aiohttp homeassistant
+pip install pylint   # linter (dev only)
 ```
 
 ## Iteration loop
@@ -60,7 +61,9 @@ python debug.py --debug stream --device-id <id> --duration 30    # verbose
 
 For protocol changes, cross-check against any local packet captures your
 environment provides (see [`AGENTS.local.md`](AGENTS.local.md)). Lint with
-`flake8` ([.flake8](.flake8), `max-line-length = 250`).
+`pylint custom_components debug_tools debug.py` ([.pylintrc](.pylintrc)) —
+keep it at **10.00/10**. Most checks are on. Prefer fixing code over 
+adding suppressions.
 
 ## Code style
 
@@ -95,7 +98,7 @@ environment provides (see [`AGENTS.local.md`](AGENTS.local.md)). Lint with
 
 Allowed without asking: reading any file, editing integration/engine/doc
 files, running `python debug.py …` against the user's camera, running
-`flake8`.
+`pylint`.
 
 Ask first: adding a runtime dependency (`manifest.json` `requirements`),
 bumping `manifest.json` `version` (triggers

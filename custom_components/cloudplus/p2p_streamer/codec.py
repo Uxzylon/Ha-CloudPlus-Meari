@@ -27,6 +27,8 @@ _TLS = threading.local()
 
 @dataclass(frozen=True)
 class StreamFrame:
+    """A parsed VVP stream frame: type, header size and payload."""
+
     frame_type: int
     header_size: int
     payload: bytes
@@ -195,7 +197,7 @@ def parse_stream_frame(data: bytes):
             return None
         payload = data[0x3C : 0x3C + data_len] if data_len > 0 else data[0x3C:]
         return StreamFrame(frame_type, 0x3C, payload, timestamp_ms, sequence)
-    elif frame_type == STREAM_TYPE_PFRAME:
+    if frame_type == STREAM_TYPE_PFRAME:
         if len(data) < 0x34:
             return None
         sequence = struct.unpack_from("<I", data, 0x08)[0]
@@ -205,7 +207,7 @@ def parse_stream_frame(data: bytes):
             return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
         return StreamFrame(frame_type, 0x34, payload, timestamp_ms, sequence)
-    elif frame_type == STREAM_TYPE_AUDIO:
+    if frame_type == STREAM_TYPE_AUDIO:
         if len(data) < 0x34:
             return None
         timestamp_ms = struct.unpack_from("<I", data, 0x28)[0]
@@ -214,7 +216,7 @@ def parse_stream_frame(data: bytes):
             return None
         payload = data[0x34 : 0x34 + data_len] if data_len > 0 else data[0x34:]
         return StreamFrame(frame_type, 0x34, payload, timestamp_ms)
-    elif frame_type == STREAM_TYPE_INFO:
+    if frame_type == STREAM_TYPE_INFO:
         if len(data) < 8:
             return None
         data_len = struct.unpack_from("<H", data, 6)[0]

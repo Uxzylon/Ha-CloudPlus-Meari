@@ -1,3 +1,5 @@
+"""Coordinator mixin exposing camera availability and IoT-derived state."""
+
 from __future__ import annotations
 
 import logging
@@ -23,6 +25,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class CoordinatorStateMixin:
+    """Mixin exposing availability and IoT-derived state to HA entities."""
+
     @property
     def available(self) -> bool:
         return self._available
@@ -170,7 +174,7 @@ class CoordinatorStateMixin:
             changed = self._apply_video_encryption_info(info) or changed
             if changed:
                 self._fire_update()
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
             _LOGGER.warning("Battery prefetch failed for %s: %s", self._sn_num, exc)
 
     def prefetch_status(self, api: MeariApiClient) -> None:
@@ -182,7 +186,7 @@ class CoordinatorStateMixin:
             return
         try:
             iot = api.get_device_iot_config(self._sn_num)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
             _LOGGER.debug("Lamp/status prefetch failed for %s: %s", self._sn_num, exc)
             return
         changed = self._apply_iot_values(iot)
@@ -359,12 +363,12 @@ class CoordinatorStateMixin:
                 if changed:
                     self._fire_update()
                 return
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 if attempt == 0:
                     _LOGGER.debug("Battery poll retry for %s: %s", self._sn_num, exc)
                     try:
                         api.login()
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError, KeyError):
                         pass
                     continue
                 _LOGGER.debug("Battery poll failed for %s: %s", self._sn_num, exc)
@@ -375,7 +379,7 @@ class CoordinatorStateMixin:
             return
         try:
             iot = api.get_device_iot_config(self._sn_num)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
             _LOGGER.debug("Status poll failed for %s: %s", self._sn_num, exc)
             return
 

@@ -1,3 +1,5 @@
+"""Correlate ffplay decode errors with coordinator gap/skip events."""
+
 from __future__ import annotations
 
 from typing import Any

@@ -40,6 +40,7 @@ from .msgsvr_codec import (
     build_frame as _build_frame,
     recv_frame as _recv_frame,
 )
+from .turn_client import close_socket
 
 
 class MsgSvrClient:
@@ -123,7 +124,7 @@ class MsgSvrClient:
         method = METHOD_ROUTED if to_webrtcsvr and self.webrtcsvr else METHOD_DIRECT
         self._send(method, CMD_WEBRTC, json.dumps(msg, separators=(",", ":")))
 
-    def _recv_webrtc_content(self):
+    def recv_webrtc_content(self):
         """Receive a webrtcsvr response and decode the inner content."""
         resp = self._recv()
         if resp["json"] and "content" in resp["json"]:
@@ -210,22 +211,22 @@ class MsgSvrClient:
             try:
                 self.sock.settimeout(1.0)
                 _recv_frame(self.sock)
-            except Exception:
+            except (OSError, ValueError):
                 pass
             finally:
                 try:
                     self.sock.settimeout(old_timeout)
-                except Exception:
+                except OSError:
                     pass
 
     def webrtc_hello(self):
         """Step 2: Hello to webrtcsvr, get tag for later SDP exchange."""
         self._send_webrtc({"cmd": "hello"}, to_webrtcsvr=False)
-        inner = self._recv_webrtc_content()
+        inner = self.recv_webrtc_content()
 
         # The response's outer "from" has the webrtcsvr address
         # We need to re-read from the raw frame to get the outer envelope
-        # Actually, _recv_webrtc_content already decoded the inner content
+        # Actually, recv_webrtc_content already decoded the inner content
         # We need to capture the outer frame too.
         # Let's redo this properly.
         return inner
@@ -281,7 +282,7 @@ class MsgSvrClient:
         resp = self._recv()
         return resp["json"]
 
-    def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
+    def send_wake_connect(self, _device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
         outer_sid = uuid_mod.uuid4().hex[:16]
         msg = json.dumps(
@@ -327,7 +328,7 @@ class MsgSvrClient:
                 "method": "coturn",
             }
         )
-        return self._recv_webrtc_content()
+        return self.recv_webrtc_content()
 
     def send_offer(self, device_uuid, sdp):
         """Step 6: Send SDP offer with ICE candidates."""
@@ -346,7 +347,7 @@ class MsgSvrClient:
                 "tag": tag,
             }
         )
-        return self._recv_webrtc_content()
+        return self.recv_webrtc_content()
 
     def send_candidate_complete(self, device_uuid):
         """Step 7: Signal ICE candidate negotiation complete."""
@@ -364,7 +365,7 @@ class MsgSvrClient:
                 },
             }
         )
-        return self._recv_webrtc_content()
+        return self.recv_webrtc_content()
 
     def send_logout(self, device_uuid):
         """Disconnect session."""
@@ -395,9 +396,5 @@ class MsgSvrClient:
         return None
 
     def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        close_socket(self.sock)
+        self.sock = None

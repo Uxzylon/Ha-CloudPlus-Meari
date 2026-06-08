@@ -1,3 +1,5 @@
+"""Stream summary and diagnostics formatting for the debug harness."""
+
 from __future__ import annotations
 
 import time
@@ -52,7 +54,7 @@ def _print_live_stream_details(
     media_span = float(diagnostics.get("video_media_span_s", 0.0) or 0.0)
     sample_span = media_span or elapsed
     observed_fps = float(diagnostics.get("video_timestamp_fps", 0.0) or 0.0)
-    if observed_fps <= 0.0 and elapsed > 0.0:
+    if observed_fps <= 0.0 < elapsed:
         observed_fps = source_video_frames / elapsed
     video_kbps = video_bytes * 8.0 / 1000.0 / sample_span if sample_span > 0.0 else 0.0
     audio_kbps = audio_bytes * 8.0 / 1000.0 / sample_span if sample_span > 0.0 else 0.0

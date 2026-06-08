@@ -15,7 +15,6 @@ import random
 import time
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 import requests
 from Crypto.Cipher import AES, DES
@@ -27,10 +26,16 @@ from .const import (
     DEFAULT_CA_SECRET,
     DES_IV,
     DES_KEY,
+    IOT_CODE_PTZ_START,
+    IOT_CODE_PTZ_STOP,
+    IOT_CODE_PTZ2_START,
+    IOT_CODE_PTZ2_STOP,
     PHONE_TYPE,
+    PTZ_DIRECTIONS,
     REDIRECT_URL,
     TTID,
 )
+from .url_util import parse_host as _host
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -174,18 +179,6 @@ def format_sn(sn: str) -> str:
     if len(sn) == 9:
         return "0000000" + sn
     return sn[4:]
-
-
-def _host(value: str | None) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if "://" in raw:
-        try:
-            return (urlparse(raw).hostname or "").strip().lower()
-        except Exception:
-            return ""
-    return raw
 
 
 def _region_code(*hints: str | None) -> str:
@@ -640,7 +633,7 @@ class MeariApiClient:
         default_payload: Optional[dict[str, Any]] = None
         try:
             default_payload = self._post("/v1/app/device/info/get", {"funSwitch": "1"})
-        except Exception as err:
+        except (OSError, ValueError, KeyError, RuntimeError) as err:
             _LOGGER.debug("Default device list failed: %s", err)
 
         if isinstance(default_payload, dict):
@@ -653,7 +646,7 @@ class MeariApiClient:
         # Multi-home fallback/augmentation for invited/family homes.
         try:
             homes = self._get_homes()
-        except Exception as err:
+        except (OSError, ValueError, KeyError, RuntimeError) as err:
             home_error = str(err)
             _LOGGER.debug("Home list discovery failed: %s", err)
             homes = []
@@ -665,7 +658,7 @@ class MeariApiClient:
             try:
                 home_devices = self._get_home_devices(str(home_id))
                 devices.update(home_devices)
-            except Exception as err:
+            except (OSError, ValueError, KeyError, RuntimeError) as err:
                 _LOGGER.debug("Home device list failed for home %s: %s", home_id, err)
 
         if not devices:
@@ -718,7 +711,7 @@ class MeariApiClient:
         try:
             result = self._openapi_get("/openapi/device/status", params)
             return result.get("status", "unknown")
-        except Exception as e:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
             _LOGGER.debug("Status query failed: %s", e)
             return "unknown"
 
@@ -734,7 +727,7 @@ class MeariApiClient:
             )
             if data.get("resultCode") == "1001":
                 return data.get("result", {}).get(sn_num, {})
-        except Exception as e:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
             _LOGGER.debug("Battery info failed: %s", e)
         return {}
 
@@ -812,12 +805,6 @@ class MeariApiClient:
         The command is sent WITHOUT ``target=server`` so it reaches the
         device directly (as the official app does for codes 800-899).
         """
-        from .const import (
-            IOT_CODE_PTZ_START,
-            IOT_CODE_PTZ2_START,
-            PTZ_DIRECTIONS,
-        )
-
         ps, ts = PTZ_DIRECTIONS.get(direction, (0, 0))
         code = IOT_CODE_PTZ2_START if use_ptz2 else IOT_CODE_PTZ_START
         value_str = json.dumps({"ps": ps, "ts": ts, "zs": 0}, separators=(",", ":"))
@@ -840,8 +827,6 @@ class MeariApiClient:
 
     def ptz_stop(self, sn_num: str, *, use_ptz2: bool = True) -> bool:
         """Send a PTZ stop command."""
-        from .const import IOT_CODE_PTZ_STOP, IOT_CODE_PTZ2_STOP
-
         code = IOT_CODE_PTZ2_STOP if use_ptz2 else IOT_CODE_PTZ_STOP
 
         dev_uuid = format_sn(sn_num)
@@ -882,14 +867,14 @@ class MeariApiClient:
                 r = self.session.get(url, params=params)
                 if r.status_code == 200:
                     success = True
-            except Exception as e:
+            except OSError as e:
                 _LOGGER.debug("OpenAPI wake failed: %s", e)
 
         # Method 2: Bell remote wake
         try:
             self._post("/v1/app/bell/remote/wake", {"deviceID": str(device_id)})
             success = True
-        except Exception as e:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
             _LOGGER.debug("Bell wake failed: %s", e)
 
         return success
@@ -907,6 +892,23 @@ class MeariApiClient:
             r = self.session.get(url, timeout=10)
             if r.status_code == 200 and len(r.content) > 100:
                 return r.content
-        except Exception:
+        except OSError:
             pass
         return None
+
+
+def build_api_client(
+    email: str,
+    password: str,
+    country_code: str,
+    phone_code: str,
+    app_profile: str,
+) -> MeariApiClient:
+    """Construct a MeariApiClient from resolved credential fields."""
+    return MeariApiClient(
+        email=email,
+        password=password,
+        country_code=country_code,
+        phone_code=phone_code,
+        app_profile=app_profile,
+    )

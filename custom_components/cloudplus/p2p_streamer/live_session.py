@@ -178,7 +178,7 @@ class LiveSessionMixin:
             for endpoint in lan_connect_endpoints:
                 try:
                     turn.sock.sendto(lan_connect_frame, endpoint)
-                except Exception:
+                except OSError:
                     pass
             last_lan_connect = now_ts
 
@@ -191,7 +191,7 @@ class LiveSessionMixin:
         )
         try:
             turn.refresh()
-        except Exception:
+        except OSError:
             pass
 
         confirmed_peer: list[tuple[str, int, bool] | None] = [None]
@@ -206,25 +206,25 @@ class LiveSessionMixin:
                     try:
                         turn.sock.sendto(data, (peer_ip, peer_port))
                         direct_sent = True
-                    except Exception:
+                    except OSError:
                         pass
                 try:
                     turn.send_to_peer(peer_ip, peer_port, data)
                     if not fanout:
                         return
-                except Exception:
+                except OSError:
                     pass
                 if direct_sent and not fanout:
                     return
             for cand in camera_candidates:
                 try:
                     turn.send_to_peer(cand["ip"], cand["port"], data)
-                except Exception:
+                except OSError:
                     pass
                 if not self._remote and cand.get("type") != "relay":
                     try:
                         turn.sock.sendto(data, (cand["ip"], cand["port"]))
-                    except Exception:
+                    except OSError:
                         pass
 
         kcp = KcpTunnel(_send_udp, recv_wnd=KCP_WND)
@@ -322,7 +322,7 @@ class LiveSessionMixin:
         def _send_signal_heartbeat() -> None:
             try:
                 sig.send_heartbeat(read_response=True)
-            except Exception:
+            except (OSError, ValueError):
                 _LOGGER.debug("Signaling heartbeat failed", exc_info=True)
             finally:
                 signal_heartbeat_pending[0] = False
@@ -341,7 +341,7 @@ class LiveSessionMixin:
                         camera_ufrag,
                         camera_pwd,
                     )
-                except Exception:
+                except OSError:
                     pass
                 if not self._remote and cand.get("type") != "relay":
                     try:
@@ -353,7 +353,7 @@ class LiveSessionMixin:
                             camera_ufrag,
                             camera_pwd,
                         )
-                    except Exception:
+                    except OSError:
                         pass
 
         def _handle_kcp_payload(payload: bytes) -> bool:
@@ -453,8 +453,7 @@ class LiveSessionMixin:
                 idle_retry_s = runtime_policy.idle_start_live_retry_s
                 if (
                     live_started
-                    and idle_retry_s > 0.0
-                    and stall_time >= idle_retry_s
+                    and 0.0 < idle_retry_s <= stall_time
                     and now_ts >= last_idle_start_live + idle_retry_s
                 ):
                     if _send_start_live(
@@ -537,7 +536,7 @@ class LiveSessionMixin:
                             turn.sock.sendto(response, peer)
                         else:
                             turn.send_to_peer(peer[0], peer[1], response)
-                    except Exception:
+                    except OSError:
                         pass
                     return
                 if msg_type == BINDING_RESPONSE:
@@ -656,7 +655,7 @@ class LiveSessionMixin:
             if now >= turn_refresh:
                 try:
                     turn.refresh()
-                except Exception:
+                except OSError:
                     pass
                 turn_refresh = now + 60.0
 
@@ -689,7 +688,7 @@ class LiveSessionMixin:
 
         try:
             _send_stop_live()
-        except Exception:
+        except OSError:
             pass
         finally:
             if self._active_stop_live is _send_stop_live:
