@@ -1,3 +1,5 @@
+"""Build ffmpeg/ffplay player command lines and manage their processes."""
+
 from __future__ import annotations
 
 import logging
@@ -108,7 +110,7 @@ def _stop_player_process(proc: subprocess.Popen | None) -> None:
             return
         try:
             action()
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             continue
         try:
             proc.wait(timeout=timeout_s)
@@ -117,7 +119,7 @@ def _stop_player_process(proc: subprocess.Popen | None) -> None:
             logging.getLogger(__name__).debug(
                 "ffplay did not exit after %s, escalating", label
             )
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return
 
 

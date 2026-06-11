@@ -54,7 +54,7 @@ class SnapDeviceKeepalive:
             if fetch is None:
                 return
             fetch(self._sn_num, SNAP_KEEPALIVE_CODES)
-        except Exception:
+        except (OSError, RuntimeError, ValueError, KeyError):
             _LOGGER.debug("Snap live keepalive failed", exc_info=True)
         finally:
             with self._lock:

@@ -17,10 +17,9 @@ from ..turn_client import (
     _encode_xor_address,
     _decode_xor_address,
     _parse_stun,
-    BINDING_REQUEST,
+    build_ice_binding_request,
     BINDING_RESPONSE,
     DATA_INDICATION,
-    ATTR_USERNAME,
     ATTR_XOR_MAPPED_ADDRESS,
     ATTR_DATA,
     ATTR_XOR_PEER_ADDRESS,
@@ -74,7 +73,7 @@ def _get_local_ips() -> list[str]:
             ip = info[4][0]
             if ip not in ips and not ip.startswith("127."):
                 ips.append(ip)
-    except Exception:
+    except OSError:
         pass
     if not ips:
         try:
@@ -82,7 +81,7 @@ def _get_local_ips() -> list[str]:
             s.connect(("8.8.8.8", 80))
             ips.append(s.getsockname()[0])
             s.close()
-        except Exception:
+        except OSError:
             ips.append("0.0.0.0")
     return ips
 
@@ -100,7 +99,7 @@ def _extract_host(value: str | None) -> str:
         try:
             host = urlparse(raw).hostname or ""
             return host.strip().lower()
-        except Exception:
+        except ValueError:
             return ""
     return raw.lower()
 
@@ -264,17 +263,11 @@ def _send_direct_ice_binding(
     remote_ufrag: str,
     remote_pwd: str,
 ) -> None:
-    username = f"{remote_ufrag}:{local_ufrag}"
-    attrs = _encode_attr(ATTR_USERNAME, username.encode())
-    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-    attrs += _encode_attr(
-        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+    msg = build_ice_binding_request(
+        local_ufrag=local_ufrag,
+        remote_ufrag=remote_ufrag,
+        remote_pwd=remote_pwd,
     )
-    attrs += _encode_attr(0x0025, b"")
-    txn_id = os.urandom(12)
-    ice_key = remote_pwd.encode()
-    attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
-    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
     sock.sendto(msg, (peer_ip, peer_port))
 
 

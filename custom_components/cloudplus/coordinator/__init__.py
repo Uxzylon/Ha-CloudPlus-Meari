@@ -1,3 +1,5 @@
+"""Per-camera coordinator: worker, state machine, MPEG-TS mux and fan-out."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,9 +10,6 @@ import time
 from typing import Any, Callable, TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
-
-if TYPE_CHECKING:
-    from homeassistant.config_entries import ConfigEntry
 
 from ..api import MeariApiClient
 from ..const import (
@@ -44,6 +43,9 @@ from .motion import MotionEventListener
 from .muxer import FfmpegMuxer
 from .state import CoordinatorStateMixin
 from .stream_server import StreamServer
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -153,6 +155,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._video_mux_target_fps = 15.0
         self._p2p_session_generation = 0
         self._stream_started_at = 0.0
+        self._wake_active_at = 0.0
         self._last_p2p_video_time = 0.0
         self._last_p2p_audio_time = 0.0
         self._last_video_time = 0.0
@@ -243,7 +246,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                     self._stop_motion_listener()
                     self._stop_streamer(join_timeout=4)
                     self._api = None
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 _LOGGER.warning("Coordinator session loop failed: %s", exc)
                 self._available = False
                 self._set_camera_awake(False)
@@ -432,7 +435,7 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
             return
         try:
             self._api.wake_device(self._sn_num, self._device_id)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
             _LOGGER.debug("Wake failed for %s: %s", self._sn_num, exc)
 
     def _start_motion_listener(self, api: MeariApiClient) -> None:
@@ -588,13 +591,21 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         worker = self._stream_thread
         if worker is None or not worker.is_alive() or self._stream_started_at <= 0.0:
             return False
+        streamer = self._p2p_streamer
+        if streamer is not None and getattr(streamer, "awaiting_wake", False):
+            # Dormant camera still being woken: the engine owns this window
+            # (DORMANCY_WAKE_TIMEOUT_S). Don't restart underneath it, and only
+            # start the first-video clock once the wake completes.
+            self._wake_active_at = now
+            return False
         if self._last_p2p_video_time >= self._stream_started_at:
             timeout = max(
                 LIVE_VIDEO_STALL_RESTART_S,
                 runtime_policy_for(self._video_codec).source_idle_reconnect_s,
             )
             return now - self._last_p2p_video_time >= timeout
-        return now - self._stream_started_at >= LIVE_STARTUP_STALL_RESTART_S
+        baseline = max(self._stream_started_at, self._wake_active_at)
+        return now - baseline >= LIVE_STARTUP_STALL_RESTART_S
 
     def _restart_stale_stream(self, now: float, *, context: str) -> None:
         if self._last_p2p_video_time >= self._stream_started_at:
@@ -669,7 +680,9 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
             and now - self._last_snapshot_convert_time < interval
         ):
             return
-        if not self._snapshot_convert_lock.acquire(blocking=False):
+        if not self._snapshot_convert_lock.acquire(  # pylint: disable=consider-using-with
+            blocking=False
+        ):
             return
         self._last_snapshot_convert_time = now
         threading.Thread(
@@ -719,8 +732,9 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 input=payload,
                 capture_output=True,
                 timeout=10,
+                check=False,
             )
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             _LOGGER.debug("Snapshot conversion failed: %s", exc)
             return None
         return proc.stdout if proc.returncode == 0 and proc.stdout else None

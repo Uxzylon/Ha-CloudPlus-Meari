@@ -1,3 +1,5 @@
+"""Audio capture, PCM analysis and raw-audio monitoring for the debug harness."""
+
 from __future__ import annotations
 
 import collections
@@ -120,7 +122,7 @@ def _muxer_audio_snapshot(coord: Any) -> dict[str, Any]:
         return {}
     try:
         return dict(getter())
-    except Exception:
+    except (TypeError, ValueError):
         return {}
 
 
@@ -149,7 +151,7 @@ def _poll_player_audio_diag(player_proc: subprocess.Popen) -> None:
                 timeout=3,
                 stderr=subprocess.DEVNULL,
             ).decode(errors="replace")
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             if checked <= 2:
                 log.warning("Audio diag: pactl not available")
             break
@@ -250,7 +252,7 @@ def _resolve_sink_name(sink_id: str) -> str:
             timeout=2,
             stderr=subprocess.DEVNULL,
         ).decode(errors="replace")
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return sink_id
     sid = sink_id.replace("Sink:", "").strip()
     for line in sinks_raw.splitlines():

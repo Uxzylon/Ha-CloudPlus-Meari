@@ -46,6 +46,11 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - The WebRTC-like flow is: register / hello → device status → coturn
   credentials → SDP offer with local *host*, *mapped* and *relay* candidates
   → SDP answer + trickle → candidate-complete.
+- **A dormant camera answers the offer, not a status poll.** When device
+  status is `dormancy`, the offer/live request itself wakes the camera: it
+  answers in ~10–15 s, whereas its `status=online` push lags by 40–60 s. Send
+  coturn + offer while dormant (don't block on `online`) and treat the SDP
+  answer as the wake confirmation. See [streaming.md](streaming.md).
 - Some newer shared snap cameras require **stable app-like client
   UUID/session values**. Randomising those can make the camera appear
   offline even when wake commands work.
@@ -95,6 +100,20 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   server_ip` filter is only meaningful for direct (non-TURN) packets, where
   `is_turn_server_stun` already covers TURN-server STUN replies on the same
   socket.
+- **ICE connectivity-check cadence matters on LAN.** On the same LAN the
+  camera (which is ICE-**controlled**, `xts-ice-1.0.0`) gates video on ICE
+  completion: it floods us with `BINDING_REQUEST`s and only starts KCP once
+  our nominated check (`USE-CANDIDATE`, ICE-controlling) gets a success
+  response. Official captures show the app firing checks roughly **every
+  ~30 ms** until a pair is valid (ICE settles in <100 ms), then media flows.
+  At a lazy ~2 s cadence the camera answers only a fraction of our checks and
+  a pair rarely nominates before a source-idle reconnect resets ICE — the
+  stream then sits in connectivity-check limbo with **zero KCP** (the camera
+  sends only STUN). The engine therefore re-issues ICE checks aggressively
+  (and tightens the receive loop to answer the camera's checks promptly)
+  **until a media peer is confirmed**, then backs off to ~2 s. Off-LAN this is
+  harmless: the direct candidates are unreachable and the relay path confirms
+  the peer quickly, ending the aggressive phase.
 
 ## KCP / IVA
 

@@ -14,17 +14,17 @@ How the code is laid out and which file owns what.
 ├── custom_components/cloudplus/   # The HA integration (HACS-shipped code)
 ├── debug_tools/                   # Reusable bits of the CLI harness
 ├── debug.py                       # CLI entry point — `python debug.py …`
-├── reverse_engineering/           # APK decompiles + pcap captures (gitignored)
-├── tools/                         # Helper scripts (APK download / decompile)
 ├── docs/                          # Protocol + dev docs (this folder)
 ├── README.md                      # User-facing
 ├── AGENTS.md                      # AI-assistant onboarding
 └── hacs.json / manifest.json      # HACS + HA metadata
 ```
 
-`reverse_engineering/` is gitignored — it holds large APK extractions and
-network captures used as ground truth when the code disagrees with the
-official app. Treat it as read-only evidence, not as runtime data.
+Some contributors keep local-only evidence and tooling (APK extractions,
+packet captures, a sandbox for the official app) outside the repo as ground
+truth when the code disagrees with the official app. It's gitignored and
+per-contributor — see [`AGENTS.local.md`](../AGENTS.local.md) at the repo
+root if present.
 
 ## Integration entry points
 
@@ -80,14 +80,16 @@ Pure-asyncio; can be driven from HA or from `debug.py` without changes.
 
 | File | Layer |
 |------|-------|
-| `engine.py` | The orchestrator — discovery → signaling → ICE → KCP → VVP → media. |
+| `engine.py` | `P2PStreamer` — lifecycle + session orchestration (discovery → signaling → wake → coturn). |
+| `live_session.py` | `LiveSessionMixin._stream_with_turn` — the per-session ICE → KCP → VVP → media loop (split out to keep files <1000 lines). |
+| `session_support.py` | Shared session constants, identity helpers, `SignalingClusterMiss`. |
 | `root_discovery.py` | Native UDP root protocol on port 9253. |
 | `network.py` | Socket plumbing, packet routing, NAT timers. |
 | `ice.py` + `sdp.py` | Candidate gathering + SDP parsing (relay implicit in `m=audio`). |
 | `relay_probe.py` | TURN allocation, permissions, channel binding. |
 | `lan.py` | Direct-LAN punch (plaintext msgsvr "connect" to host candidates). |
 | `kcp_tunnel.py` (sibling under `cloudplus/`) | KCP reliable transport over UDP. |
-| `protocol.py` + `frames.py` | IVA framing (`0x7010` / `0x7012`). |
+| `protocol.py` | IVA framing (`0x7010` / `0x7012`). |
 | `codec.py` | VVP packet codec (magic `0x56565099`). |
 | `quality.py` | Quality-profile → stream-id mapping (AUTO=105, profile=100+id). |
 | `keepalive.py` | `0x888E` heartbeat + proactive `START_LIVE` re-issue. |

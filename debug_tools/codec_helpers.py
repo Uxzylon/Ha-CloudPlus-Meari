@@ -1,3 +1,5 @@
+"""Codec lookup and formatting helpers bridging the harness to the integration."""
+
 from __future__ import annotations
 
 import sys

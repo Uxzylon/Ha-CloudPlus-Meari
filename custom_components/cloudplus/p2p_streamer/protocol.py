@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import struct
 
+from .quality import best_quality_profile
+
 VVP_MAGIC = 0x56565099
 VVP_CMD_START_LIVE = 0x11FF
 VVP_CMD_STOP = 0x12FF
@@ -80,8 +82,6 @@ def build_vvp_packet(
 
 def _best_quality_from_device(device: dict) -> int:
     try:
-        from .quality import best_quality_profile
-
         return int(best_quality_profile(device))
-    except Exception:
+    except (ValueError, TypeError, KeyError):
         return 0

@@ -23,6 +23,8 @@ class _Client:
 
 
 class StreamServer:
+    """Local TCP server that fans the muxed MPEG-TS stream out to clients."""
+
     def __init__(self, on_missing_bootstrap: Callable[[], bool] | None = None) -> None:
         self._sock: socket.socket | None = None
         self._port = 0
@@ -61,7 +63,7 @@ class StreamServer:
         if self._sock is not None:
             try:
                 self._sock.close()
-            except Exception:
+            except OSError:
                 pass
             self._sock = None
         if self._accept_thread is not None:
@@ -72,7 +74,7 @@ class StreamServer:
                 client.event.set()
                 try:
                     client.sock.close()
-                except Exception:
+                except OSError:
                     pass
             self._clients.clear()
             self._bootstrap.reset()
@@ -130,7 +132,7 @@ class StreamServer:
                 try:
                     if self._on_missing_bootstrap():
                         wait_generation = target_generation
-                except Exception:
+                except (OSError, RuntimeError):
                     pass
             with self._lock:
                 if wait_generation:
@@ -167,7 +169,7 @@ class StreamServer:
                 while queue:
                     chunk = queue.popleft()
                     client.sendall(chunk)
-        except Exception:
+        except OSError:
             pass
         finally:
             with self._lock:
@@ -176,5 +178,5 @@ class StreamServer:
                 ]
             try:
                 client.close()
-            except Exception:
+            except OSError:
                 pass
