@@ -31,7 +31,7 @@ from .const import (
     PTZ_DIRECTIONS,
 )
 from .coordinator import CloudEdgeMeariCoordinator
-from .api import MeariApiClient
+from .api import MeariApiClient, build_api_client
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -255,16 +255,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         phone_code = entry.data.get(CONF_PHONE_CODE, DEFAULT_PHONE_CODE)
         app_profile = entry.data.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE)
 
-        api = MeariApiClient(
-            email=email,
-            password=password,
-            country_code=country_code,
-            phone_code=phone_code,
-            app_profile=app_profile,
-        )
+        api = build_api_client(email, password, country_code, phone_code, app_profile)
         try:
             await hass.async_add_executor_job(api.login)
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError):
             _LOGGER.exception("Account entry %s failed to login", entry.title)
             return False
 
@@ -331,13 +325,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device = entry.data["device"]
     video_password = str(entry.options.get(CONF_VIDEO_PASSWORD) or "").strip()
 
-    api = MeariApiClient(
-        email=email,
-        password=password,
-        country_code=country_code,
-        phone_code=phone_code,
-        app_profile=app_profile,
-    )
+    api = build_api_client(email, password, country_code, phone_code, app_profile)
     await hass.async_add_executor_job(api.login)
 
     coord = CloudEdgeMeariCoordinator(

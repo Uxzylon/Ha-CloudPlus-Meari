@@ -129,6 +129,37 @@ def _add_fingerprint(msg_type, attrs_bytes, txn_id):
     return attrs_bytes
 
 
+def build_ice_binding_request(
+    *,
+    local_ufrag: str,
+    remote_ufrag: str,
+    remote_pwd: str,
+    use_candidate: bool = True,
+) -> bytes:
+    """Build an ICE STUN binding request with PRIORITY / ICE-CONTROLLING."""
+    username = f"{remote_ufrag}:{local_ufrag}"
+    attrs = _encode_attr(ATTR_USERNAME, username.encode())
+    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
+    attrs += _encode_attr(
+        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+    )
+    if use_candidate:
+        attrs += _encode_attr(0x0025, b"")
+    txn_id = os.urandom(12)
+    attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, remote_pwd.encode())
+    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
+    return msg
+
+
+def close_socket(sock) -> None:
+    """Best-effort close of a socket; never raises."""
+    if sock:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _parse_stun(data):
     """Parse a STUN message into type, txn_id, and attributes dict."""
     if len(data) < 20:
@@ -186,7 +217,7 @@ class TurnClient:
         # High-detail scenes can arrive as large UDP bursts.
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
-        except Exception:
+        except OSError:
             pass
 
     def _send(self, data):
@@ -194,7 +225,7 @@ class TurnClient:
 
     def _recv(self, timeout=5.0):
         self.sock.settimeout(timeout)
-        data, addr = self.sock.recvfrom(65536)
+        data, _ = self.sock.recvfrom(65536)
         return data
 
     def drain_socket(self):
@@ -342,7 +373,7 @@ class TurnClient:
         resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=True)
         if resp and resp["type"] == ALLOCATE_RESPONSE:
             return apply_success(resp)
-        elif resp:
+        if resp:
             err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
             if len(err) >= 4:
                 code = err[2] * 100 + err[3]
@@ -378,7 +409,7 @@ class TurnClient:
                 code = err[2] * 100 + err[3]
                 print(f"[TURN] Refresh error: {code}")
         else:
-            print(f"[TURN] Refresh timeout")
+            print("[TURN] Refresh timeout")
         return False
 
     def channel_bind(self, peer_ip, peer_port):
@@ -454,7 +485,7 @@ class TurnClient:
         """
         self.sock.settimeout(timeout)
         try:
-            raw, addr = self.sock.recvfrom(65536)
+            raw, _ = self.sock.recvfrom(65536)
         except socket.timeout:
             return None, None, None
 
@@ -500,36 +531,15 @@ class TurnClient:
         This is used for ICE connectivity checks. The binding request is
         sent as TURN data to the peer's address.
         """
-        username = f"{remote_ufrag}:{local_ufrag}"
-        # Build STUN Binding Request with ICE attributes
-        attrs = _encode_attr(ATTR_USERNAME, username.encode())
-
-        # PRIORITY attribute (0x0024)
-        attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-
-        # ICE-CONTROLLING (0x802A)
-        attrs += _encode_attr(
-            0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+        msg = build_ice_binding_request(
+            local_ufrag=local_ufrag,
+            remote_ufrag=remote_ufrag,
+            remote_pwd=remote_pwd,
+            use_candidate=use_candidate,
         )
-
-        # USE-CANDIDATE (0x0025) - empty attribute
-        if use_candidate:
-            attrs += _encode_attr(0x0025, b"")
-
-        # Add MESSAGE-INTEGRITY with ICE password as key
-        txn_id = os.urandom(12)
-        ice_key = remote_pwd.encode()
-        attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
-
-        msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
-
         # Send through TURN relay
         self.send_to_peer(peer_ip, peer_port, msg)
 
     def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        close_socket(self.sock)
+        self.sock = None

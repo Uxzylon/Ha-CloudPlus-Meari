@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""CloudPlus camera local debug harness entry point."""
+
 from __future__ import annotations
 
 import argparse
@@ -38,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument(
         "--wake-timeout",
         type=int,
-        default=45,
+        default=90,
         help="Seconds to wait for live frames before launching playback",
     )
     stream.add_argument(
@@ -56,6 +58,22 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ffplay", "full"],
         default="ffplay",
         help="Use ffplay-only verdicts, or include recorder/TS/PCM diagnostics",
+    )
+    stream.add_argument(
+        "--capture",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Capture host traffic with tcpdump for the stream's lifetime "
+        "(needs root/sudo). Bare flag auto-names a .pcap next to the artifacts; "
+        "pass a PATH to override. Diff against the official-app captures.",
+    )
+    stream.add_argument(
+        "--capture-filter",
+        default="udp",
+        help="tcpdump BPF filter for --capture (default: udp — root discovery, "
+        "STUN/TURN and P2P; skips HTTPS API noise)",
     )
     return parser
 

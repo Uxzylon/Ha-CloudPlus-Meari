@@ -21,7 +21,7 @@ def packet_pid(packet: bytes) -> int:
     return ((packet[1] & 0x1F) << 8) | packet[2]
 
 
-def _payload(packet: bytes) -> bytes:
+def packet_payload(packet: bytes) -> bytes:
     off = 4
     afc = (packet[3] >> 4) & 0x03
     if afc & 0x02:
@@ -32,7 +32,7 @@ def _payload(packet: bytes) -> bytes:
 
 
 def packet_pts(packet: bytes) -> int | None:
-    if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47 or not (packet[1] & 0x40):
+    if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47 or not packet[1] & 0x40:
         return None
     afc = (packet[3] >> 4) & 0x03
     payload_off = 4
@@ -53,7 +53,7 @@ def packet_has_random_access(packet: bytes) -> bool:
     if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47:
         return False
     afc = (packet[3] >> 4) & 0x03
-    if not (afc & 0x02):
+    if not afc & 0x02:
         return False
     adaptation_len = packet[4]
     if adaptation_len < 1 or 5 + adaptation_len > TS_PACKET_SIZE:
@@ -159,7 +159,7 @@ def build_pmt_packet(codec: CodecName | str, cc: int = 0) -> bytes:
 
 
 def codec_from_pmt_packet(packet: bytes) -> CodecName | None:
-    payload = _payload(packet)
+    payload = packet_payload(packet)
     if not payload:
         return None
     pointer = payload[0]

@@ -1,3 +1,5 @@
+"""Live video cadence tracking and freeze-window reporting."""
+
 from __future__ import annotations
 
 import logging
@@ -89,7 +91,7 @@ class StreamHealthTracker:
         if progressed:
             if self._last_frame_ts > 0.0:
                 self._max_gap_s = max(
-                    self._max_gap_s, max(0.0, frame_ts - self._last_frame_ts)
+                    self._max_gap_s, 0.0, frame_ts - self._last_frame_ts
                 )
             if self._stall_start_ts is not None:
                 stall_s = max(0.0, frame_ts - self._stall_start_ts)

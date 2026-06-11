@@ -1,3 +1,5 @@
+"""Meari P2P streaming stack: discovery, signaling, ICE/TURN, KCP and VVP."""
+
 from .quality import (
     ADAPTIVE_STREAM_ID,
     AUTO_QUALITY_LABEL,

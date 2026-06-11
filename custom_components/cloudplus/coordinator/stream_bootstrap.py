@@ -9,6 +9,7 @@ from .mpegts import (
     VIDEO_PID,
     codec_from_pmt_packet,
     packet_has_random_access,
+    packet_payload,
     packet_pid,
 )
 from ..p2p_streamer.codecs import CodecName, nal_types, spec_for
@@ -18,6 +19,19 @@ MAX_BOOTSTRAP_BYTES = 32 * 1024 * 1024
 
 class StreamBootstrap:
     """Keep a clean PAT/PMT + latest-IDR TS seed for new TCP clients."""
+
+    _pat_packet: bytes
+    _pmt_packet: bytes
+    _seed: bytes
+    _buf: bytearray
+    _pending_group: bytearray
+    _pending_has_idr: bool
+    _pending_nal_types: set[int]
+    _pending_probe_tail: bytes
+    _generation: int
+    _frames_since_seed: int
+    _codec: CodecName
+    _seed_strong: bool
 
     def __init__(self, *, max_bytes: int = MAX_BOOTSTRAP_BYTES) -> None:
         self._max_bytes = max_bytes
@@ -30,7 +44,7 @@ class StreamBootstrap:
         self._buf = bytearray()
         self._pending_group = bytearray()
         self._pending_has_idr = False
-        self._pending_nal_types: set[int] = set()
+        self._pending_nal_types = set()
         self._pending_probe_tail = b""
         self._generation = 0
         self._frames_since_seed = 0
@@ -198,7 +212,7 @@ class StreamBootstrap:
 
     @staticmethod
     def _video_payload(packet: bytes) -> bytes:
-        payload = StreamBootstrap._payload(packet)
+        payload = packet_payload(packet)
         if not payload:
             return b""
         if packet[1] & 0x40 and payload[:3] == b"\x00\x00\x01":
@@ -206,13 +220,3 @@ class StreamBootstrap:
                 return b""
             return payload[9 + payload[8] :]
         return payload
-
-    @staticmethod
-    def _payload(packet: bytes) -> bytes:
-        off = 4
-        afc = (packet[3] >> 4) & 0x03
-        if afc & 0x02:
-            off = 5 + packet[4]
-        if off >= TS_PACKET_SIZE:
-            return b""
-        return packet[off:TS_PACKET_SIZE]

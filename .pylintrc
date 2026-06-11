@@ -1,0 +1,21 @@
+# Usage: pylint custom_components debug_tools debug.py
+
+[MAIN]
+ignored-modules = homeassistant
+
+[FORMAT]
+max-line-length = 250
+max-module-lines = 1000
+
+[MESSAGES CONTROL]
+disable =
+    missing-function-docstring,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-branches,
+    too-many-statements,
+    too-many-return-statements,
+    too-many-instance-attributes,
+    too-many-public-methods,
+    too-few-public-methods,

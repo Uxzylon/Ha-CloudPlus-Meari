@@ -37,10 +37,12 @@ Useful flags on `stream`:
 | Flag | Purpose |
 |------|---------|
 | `--quality` | `AUTO`, `SD`, `HD`, `QHD`, or a raw profile id. |
-| `--wake-timeout` | Seconds to wait for live frames before giving up (default 45, bumped to 90 for deep-dormancy). |
+| `--wake-timeout` | Seconds to wait for live frames before giving up (default 90, sized for worst-case deep-dormancy wakes). |
 | `--video-password` | E2EE password if the camera has it enabled. |
 | `--output-file <base>` | Dump `.ts` / `.wav` and recorder/player logs under that basename. |
 | `--analysis-mode full` | Also produce TS + PCM diagnostics on top of the ffplay verdict. |
+| `--capture [PATH]` | Run `tcpdump` for the session (needs root → prompts for `sudo`). Bare flag writes a `.pcap` next to the artifacts; pass a `PATH` to override. Captures `-i any` (incl. VPN tunnels). |
+| `--capture-filter <bpf>` | BPF filter for `--capture` (default `udp` — root discovery, STUN/TURN and P2P; HTTPS API noise skipped). |
 
 ## DEBUG logs are noisy
 
@@ -83,11 +85,17 @@ issues, or a misrouted TURN relay (see [protocol.md](protocol.md)).
 If a behaviour seems to disagree with the official app, capture both sides:
 
 1. Run the official app against the camera and `tcpdump` on the LAN.
-2. Run `debug.py stream` against the same camera with `--debug` + a
-   `tcpdump`.
+2. Run `debug.py stream … --debug --capture` against the same camera — the
+   `--capture` flag runs `tcpdump` for the session's lifetime and writes a
+   `.pcap` next to the artifacts (no separate terminal needed). Because the
+   failure is intermittent, leave `--capture` on across repeated runs until you
+   catch a bad one.
 3. Diff the SDP, the KCP `sn` ordering at start-of-session, the relay
    addresses in the SDP `m=audio` / `c=IN IP4 …` lines, and the VVP
-   `START_LIVE` parameters.
+   `START_LIVE` parameters. When reading the relay leg, mind that media rides
+   in **TURN ChannelData**, not raw UDP — see the capture-analysis note in your
+   local tooling before concluding the framing is wrong.
 
-Captures live under `reverse_engineering/network_recordings/` (gitignored)
-and are the ground truth when the code disagrees with a vendor change.
+Reproduce and store these captures with your local tooling (see
+[`AGENTS.local.md`](../AGENTS.local.md) at the repo root); they're the ground
+truth when the code disagrees with a vendor change.

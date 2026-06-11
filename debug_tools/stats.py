@@ -1,3 +1,5 @@
+"""Small statistics helpers (percentiles) for the debug harness."""
+
 from __future__ import annotations
 
 

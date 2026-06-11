@@ -8,6 +8,8 @@ import ssl
 import threading
 from typing import Callable
 
+import paho.mqtt.client as mqtt
+
 from ..api import MeariApiClient
 from ..motion_event import parse_motion_event
 
@@ -74,11 +76,6 @@ class MotionEventListener:
             return
         if not self._api.mqtt_host:
             return
-        try:
-            import paho.mqtt.client as mqtt
-        except ImportError:
-            _LOGGER.warning("paho-mqtt is not installed; using alarm polling only")
-            return
 
         user_id = str(self._api.user_id or "").strip()
         topics = _event_topics(self._api)
@@ -133,12 +130,12 @@ class MotionEventListener:
                 self._api.mqtt_host, self._api.mqtt_port, keepalive=300
             )
             client.loop_start()
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             _LOGGER.warning("MQTT motion listener failed to start: %s", exc)
             self._client = None
             try:
                 client.disconnect()
-            except Exception:
+            except OSError:
                 pass
 
     def stop(self) -> None:
@@ -150,7 +147,7 @@ class MotionEventListener:
         try:
             client.loop_stop()
             client.disconnect()
-        except Exception:
+        except OSError:
             pass
 
     def _start_alarm_poll(self) -> None:
@@ -174,7 +171,7 @@ class MotionEventListener:
                 self._handle_alarm_events(events, dispatch=seeded)
                 seeded = True
                 wait_s = ALARM_POLL_INTERVAL
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 _LOGGER.debug("Latest alarm poll failed: %s", exc)
                 wait_s = ALARM_POLL_ERROR_INTERVAL
             self._stop_poll.wait(wait_s)
@@ -218,7 +215,7 @@ class MotionEventListener:
     def _handle_payload(self, payload: bytes) -> None:
         try:
             event = parse_motion_event(payload)
-        except Exception as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             _LOGGER.debug("MQTT motion payload parse failed: %s", exc)
             return
         if not event or not event["is_motion"]:

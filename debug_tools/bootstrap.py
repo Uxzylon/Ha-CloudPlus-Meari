@@ -1,3 +1,5 @@
+"""Load the HA integration's modules standalone (no Home Assistant runtime)."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -58,10 +60,10 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
     if "homeassistant.core" not in sys.modules:
         core_mod = types.ModuleType("homeassistant.core")
 
-        class HomeAssistant:  # pragma: no cover - runtime stub
-            pass
+        class HomeAssistant:
+            """Stub of HA's HomeAssistant core type for standalone loading."""
 
-        def callback(func):  # pragma: no cover - runtime stub
+        def callback(func):
             return func
 
         core_mod.HomeAssistant = HomeAssistant
@@ -76,11 +78,15 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
     if "homeassistant.components.camera" not in sys.modules:
         camera_mod = types.ModuleType("homeassistant.components.camera")
 
-        class Camera:  # pragma: no cover - runtime stub
+        class Camera:
+            """Stub of HA's Camera entity base for standalone loading."""
+
             def __init__(self) -> None:
                 pass
 
-        class CameraEntityFeature:  # pragma: no cover - runtime stub
+        class CameraEntityFeature:
+            """Stub of HA's CameraEntityFeature flags for standalone loading."""
+
             STREAM = 2
 
         camera_mod.Camera = Camera
@@ -90,8 +96,8 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
     if "homeassistant.config_entries" not in sys.modules:
         cfg_mod = types.ModuleType("homeassistant.config_entries")
 
-        class ConfigEntry:  # pragma: no cover - runtime stub
-            pass
+        class ConfigEntry:
+            """Stub of HA's ConfigEntry type for standalone loading."""
 
         cfg_mod.ConfigEntry = ConfigEntry
         sys.modules["homeassistant.config_entries"] = cfg_mod
@@ -100,6 +106,14 @@ def _bootstrap_integration_modules() -> dict[str, Any]:
         helpers_mod = types.ModuleType("homeassistant.helpers")
         helpers_mod.__path__ = []
         sys.modules["homeassistant.helpers"] = helpers_mod
+    if "homeassistant.helpers.entity" not in sys.modules:
+        entity_mod = types.ModuleType("homeassistant.helpers.entity")
+
+        class Entity:
+            """Stub of HA's Entity base for standalone loading."""
+
+        entity_mod.Entity = Entity
+        sys.modules["homeassistant.helpers.entity"] = entity_mod
     if "homeassistant.helpers.entity_platform" not in sys.modules:
         ep_mod = types.ModuleType("homeassistant.helpers.entity_platform")
         ep_mod.AddEntitiesCallback = object

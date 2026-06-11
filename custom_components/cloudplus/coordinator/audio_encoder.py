@@ -10,6 +10,8 @@ import subprocess
 import threading
 import time
 
+from .ffmpeg_util import FFMPEG_BASE_CMD, terminate_process
+
 AUDIO_GAIN_DB = 0.0
 G711_SAMPLE_RATE = 8000
 G711_FRAME_RATE = 25
@@ -41,10 +43,7 @@ class AacAudioEncoder:
             else []
         )
         cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
+            *FFMPEG_BASE_CMD,
             "-f",
             "mulaw",
             "-ar",
@@ -70,7 +69,7 @@ class AacAudioEncoder:
             "adts",
             "pipe:1",
         ]
-        self._proc = subprocess.Popen(
+        self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -91,21 +90,7 @@ class AacAudioEncoder:
         self._running = False
         proc = self._proc
         self._proc = None
-        if proc is not None:
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
+        terminate_process(proc)
         self._drain_queue()
         self._frames.clear()
         self._last_real_audio_at = 0.0
@@ -158,7 +143,7 @@ class AacAudioEncoder:
             return
         try:
             fd = proc.stdin.fileno()
-        except Exception:
+        except (OSError, ValueError):
             return
 
         while self._running and self._proc is proc and proc.poll() is None:
@@ -186,7 +171,7 @@ class AacAudioEncoder:
         while self._running and self._proc is proc and proc.poll() is None:
             try:
                 data = proc.stdout.read1(4096)
-            except Exception:
+            except (OSError, ValueError):
                 return
             if not data:
                 return
@@ -221,13 +206,13 @@ class AacAudioEncoder:
         while view and self._running and self._proc is proc and proc.poll() is None:
             try:
                 _, writable, _ = select.select([], [fd], [], 0.5)
-            except Exception:
+            except (OSError, ValueError):
                 return False
             if not writable:
                 continue
             try:
                 written = os.write(fd, view)
-            except Exception:
+            except (OSError, ValueError):
                 return False
             if written <= 0:
                 return False

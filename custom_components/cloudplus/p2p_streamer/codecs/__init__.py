@@ -86,7 +86,7 @@ def identify_codec(payload: bytes) -> CodecName | None:
         try:
             if spec.detect(payload):
                 return spec.name
-        except Exception:
+        except (IndexError, ValueError):
             continue
     return None
 
@@ -227,6 +227,8 @@ def is_recovery_keyframe(payload: bytes, *, require_param_sets: bool = True) -> 
 
 
 class CodecParameterCache:
+    """Cache of per-codec parameter-set NAL units (SPS/PPS/VPS)."""
+
     def __init__(self) -> None:
         self._units: dict[CodecName, dict[int, bytes]] = {}
 

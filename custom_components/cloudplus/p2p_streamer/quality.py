@@ -14,6 +14,8 @@ QUALITY_LABELS = {0: "SD", 1: "HD", 2: "QHD"}
 
 @dataclass(frozen=True)
 class QualityOption:
+    """A selectable stream quality option (label, profile and stream id)."""
+
     quality: int | None
     label: str
     stream_id: int
@@ -44,7 +46,7 @@ def parse_quality_profiles(device: dict[str, Any]) -> dict[int, str]:
         if not isinstance(bps2, dict):
             return {}
         return {int(k): str(v) for k, v in bps2.items()}
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError):
         return {}
 
 
@@ -69,7 +71,7 @@ def supports_adaptive_stream(device: dict[str, Any]) -> bool:
             int(capability.get("ver", 0)) >= 81
             and int(_caps(device).get("adb", 0)) == 1
         )
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError):
         return False
 
 
