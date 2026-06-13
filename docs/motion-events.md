@@ -24,6 +24,13 @@ payload shapes to expect.
   client-id can make the broker disconnect older sessions — this is the
   single most common cause of "no motion events in HA": another live login
   (phone, second HA instance, etc.) is bumping us off.
+- **The broker pins the MQTT client-id to the numeric user-id.** Connecting
+  with any other client-id is rejected with CONNACK *Not authorized* (verified
+  against the live EU broker). So we cannot side-step the collision by picking
+  a unique client-id — HA and the phone app *must* both connect as the
+  user-id and therefore evict each other. There is no MQTT-layer fix; the
+  remedies are a dedicated HA account (so nothing competes) **and** the
+  polling fallback below (which works regardless of who owns the live socket).
 - The setup docs recommend a dedicated secondary account for HA for exactly
   this reason.
 
@@ -65,18 +72,40 @@ Human body, Person). Other alarm types (Visitor, Noise, Package, etc.) are
 classified by `motion_event.py` but currently routed only to logs / future
 event sensors.
 
-## Fallback: notification-center polling
+## Fallback: event-log polling
 
-The app also reads notification-center summaries from:
+Because the MQTT session is regularly evicted whenever the account is also
+logged in on a phone (see Transport — the broker forces client-id == user-id),
+polling is **not just a catch-up source, it is the path that actually works**
+for most users. The MQTT push stays as the low-latency bonus when nothing
+competes (e.g. a dedicated HA account).
+
+The poller mirrors the official app's Messages tab and reads the real
+per-device **event log**, once per registered camera:
 
 ```
-POST /v3/app/event/new/get   { "listAllDevice": 1, … }
+GET /v3/app/event/list   { deviceID, day=YYYYMMDD, direction=1, index=0 }
+→ { "alertMsg": [ { "msgID", "eventType", "eventTime", "deviceID", … }, … ] }
 ```
 
-This is a useful fallback for shared accounts or long-lived MQTT sessions
-where events were recorded by the cloud but not delivered through the live
-socket. The integration uses it as a recovery / catch-up source rather than
-a primary signal, because polling has higher latency than the MQTT push.
+This was chosen over the older `/v3/app/event/new/get` summary for three
+reasons, all of which broke motion for real users:
+
+- **Read-state independent.** `event/new/get` returns an `evt` *has-unread
+  flag* (not the alarm type) plus `imageAlertType`. Once the phone app reads
+  the notification, `evt` flips to `"0"` and our parser — which keys on `evt`
+  first — classified it as a non-motion event, so the sensor never fired.
+  `event/list` always returns the full day's events regardless of read-state.
+- **Correct alarm type.** `event/list` entries carry the actual `eventType`
+  (e.g. `2` = Motion), so `parse_motion_event` classifies them correctly
+  without relying on the ambiguous `evt` flag.
+- **Stable de-dup.** Each entry has a unique `msgID`; we remember
+  `(deviceID, msgID)` so the same event is never re-fired. The seed pass at
+  startup records existing ids without dispatching; the set is cleared on day
+  rollover and capped to stay bounded.
+
+`MotionEventListener` polls every `ALARM_POLL_INTERVAL` (15 s), so worst-case
+motion latency without MQTT is ~15 s.
 
 ## Practical guidance
 
@@ -84,9 +113,9 @@ a primary signal, because polling has higher latency than the MQTT push.
   client is logging in with the same account. The broker silently drops the
   older session.
 - If you intentionally share an account between phone and HA, the
-  notification-center fallback will surface most events with a few seconds
-  of latency, but the live MQTT push will keep flapping. **Use a dedicated
-  HA account** for production setups.
+  event-log poll will still surface every event within ~15 s, but the live
+  MQTT push will keep flapping. **Use a dedicated HA account** if you want the
+  sub-second MQTT push as well.
 - Alarm types observed in the wild but not currently in `MOTION_ALARM_TYPES`
   are intentionally non-motion (e.g. `21 SD card removed`, `10 Tamper`).
   Adding them to motion would create false positives.
