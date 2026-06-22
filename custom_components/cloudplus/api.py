@@ -691,18 +691,40 @@ class MeariApiClient:
             if str(d.get("_category", "")).lower() in CAMERA_CATEGORIES
         ]
 
-    def get_latest_alarm_events(self) -> list[dict[str, Any]]:
-        """Return newest alarm-message summaries for all devices."""
-        data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
-        if str(data.get("resultCode", "")) != "1001":
-            raise RuntimeError(f"Latest alarm events failed: {data}")
+    def get_device_events(
+        self,
+        device_id: int | str,
+        day: str,
+        *,
+        index: int = 0,
+        direction: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Return the alarm-event log for one device on a given day.
 
-        result = data.get("result")
-        if isinstance(result, dict):
-            devices = result.get("device") or result.get("devices")
-        else:
-            devices = data.get("device")
-        return devices if isinstance(devices, list) else []
+        Mirrors the official app's Messages tab (``/v3/app/event/list``).
+        Unlike ``/v3/app/event/new/get`` this is the real per-event log: each
+        entry carries the actual ``eventType`` and a stable ``msgID``, and it is
+        independent of notification read-state — so it stays reliable even when
+        the user's phone app has already read (and cleared) the notifications,
+        and when the live MQTT push is being evicted by a duplicate login.
+
+        *day* is ``YYYYMMDD`` in the device's local time; *direction* ``1`` is
+        newest-first, *index* ``0`` is the first (most recent) page.
+        """
+        data = self._get(
+            "/v3/app/event/list",
+            {
+                "deviceID": str(device_id),
+                "day": str(day),
+                "direction": str(direction),
+                "index": str(index),
+            },
+        )
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Device event list failed: {data}")
+        # The event log is returned at the top level (not under ``result``).
+        events = data.get("alertMsg")
+        return events if isinstance(events, list) else []
 
     def get_device_status(self, sn_num: str) -> str:
         """Query device status via OpenAPI. Returns online/offline/dormancy."""

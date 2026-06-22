@@ -81,9 +81,9 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   usually port 9100**.
 - The client allocates a relay, creates permissions for camera candidates,
   and channel-binds peers for ChannelData.
-- Official captures for snap cameras often use the relay path even when the
-  camera is on the same LAN. The integration therefore **prefers relay for
-  snap devices** while still advertising direct candidates as fallback.
+- Official captures still allocate TURN on LAN, but good QHD sessions move
+  media to the direct host pair once ICE nominates it. The integration keeps
+  TURN as fallback while preferring a confirmed direct peer.
 - Both sides' relay endpoints are carried by the SDP `m=audio <port>` /
   `c=IN IP4 <ip>` lines, **NOT** by an `a=candidate ... typ srflx` / `typ
   relay` entry. Official offers therefore only enumerate `host` and (when
@@ -104,16 +104,15 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   camera (which is ICE-**controlled**, `xts-ice-1.0.0`) gates video on ICE
   completion: it floods us with `BINDING_REQUEST`s and only starts KCP once
   our nominated check (`USE-CANDIDATE`, ICE-controlling) gets a success
-  response. Official captures show the app firing checks roughly **every
-  ~30 ms** until a pair is valid (ICE settles in <100 ms), then media flows.
-  At a lazy ~2 s cadence the camera answers only a fraction of our checks and
-  a pair rarely nominates before a source-idle reconnect resets ICE — the
-  stream then sits in connectivity-check limbo with **zero KCP** (the camera
-  sends only STUN). The engine therefore re-issues ICE checks aggressively
-  (and tightens the receive loop to answer the camera's checks promptly)
-  **until a media peer is confirmed**, then backs off to ~2 s. Off-LAN this is
-  harmless: the direct candidates are unreachable and the relay path confirms
-  the peer quickly, ending the aggressive phase.
+  response. Official captures show the app firing checks roughly every
+  **30 ms** until the pair is valid, then around **1 s** as keepalive; app
+  responses to camera checks are bare 20-byte Binding successes. A lazy ~2 s
+  cadence rarely nominates the direct pair before source-idle reconnect resets
+  ICE, so the engine keeps the rapid cadence until a direct peer is confirmed
+  (or the direct-seek window expires), then backs off to the keepalive cadence.
+  Before startup KCP, the engine gives LAN/VPN host candidates a short direct
+  ICE grace and sends initial KCP direct-only once direct STUN succeeds; this
+  avoids racing QHD startup onto a relay path the native app would not use.
 
 ## KCP / IVA
 
@@ -122,8 +121,9 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   - `0x7012` — IVA handshake
   - `0x7010` — IVA data carrying VVP payloads
 - The receive window seen in official ACKs is `1024`.
-- ACK packets are commonly sent as small compound batches; batching three
-  ACK segments matches app captures well.
+- ACK packets are commonly sent as compound batches. Recent WAN QHD captures
+  show the app ACKing sparsely with up to 16 ACK segments per compound packet,
+  relying on cumulative `una` rather than one ACK for every inbound PUSH.
 - When packet loss creates a persistent gap, recovery should resume only at
   a complete IVA/VVP boundary, and preferably at an I-frame for video
   startup.

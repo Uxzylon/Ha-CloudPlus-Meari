@@ -51,6 +51,11 @@ from .session_support import (
     AUTH_FALLBACK_NO_VIDEO_S,
     AUTH_FALLBACK_RESULT,
     CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S,
+    DIRECT_ICE_CHECK_INTERVAL_S,
+    DIRECT_ICE_SEEK_WINDOW_S,
+    DIRECT_STARTUP_ICE_GRACE_S,
+    DIRECT_SOURCE_IDLE_RECONNECT_S,
+    ICE_KEEPALIVE_INTERVAL_S,
     IVA_HEARTBEAT_S,
     VVP_HEARTBEAT_S,
     _unwrap_iva_payload,
@@ -195,9 +200,16 @@ class LiveSessionMixin:
             pass
 
         confirmed_peer: list[tuple[str, int, bool] | None] = [None]
+        direct_ice_peer: list[tuple[str, int] | None] = [None]
         candidate_fanout_until = time.time() + 8.0
 
         def _send_udp(data: bytes) -> None:
+            if confirmed_peer[0] is None and direct_ice_peer[0] is not None:
+                try:
+                    turn.sock.sendto(data, direct_ice_peer[0])
+                    return
+                except OSError:
+                    pass
             fanout = time.time() < candidate_fanout_until
             if confirmed_peer[0] is not None:
                 peer_ip, peer_port, direct = confirmed_peer[0]
@@ -442,7 +454,7 @@ class LiveSessionMixin:
                 )
                 if now_ts - last_ack_probe > 0.35 and kcp.send_ack_probe():
                     last_ack_probe = now_ts
-                if stall_time > 1.2:
+                if stall_time > 1.2 and not self._remote:
                     candidate_fanout_until = max(candidate_fanout_until, now_ts + 4.0)
                 kcp_pending = bool(
                     getattr(kcp, "recv_buf", None)
@@ -464,6 +476,12 @@ class LiveSessionMixin:
                     ):
                         last_idle_start_live = now_ts
                 idle_reconnect_s = runtime_policy.source_idle_reconnect_s
+                if self.direct_confirmed:
+                    # Direct LAN often survives brief camera radio silences;
+                    # keep nudging START_LIVE before falling back to reconnect.
+                    idle_reconnect_s = max(
+                        idle_reconnect_s, DIRECT_SOURCE_IDLE_RECONNECT_S
+                    )
                 if stall_time >= idle_reconnect_s and not kcp_pending:
                     _LOGGER.warning(
                         "P2P source idle %.1fs; reconnecting session",
@@ -513,7 +531,7 @@ class LiveSessionMixin:
                 _process_pending_payloads()
 
         def _handle_peer_packet(packet) -> None:
-            nonlocal last_udp_time, last_kcp_push_time
+            nonlocal candidate_fanout_until, last_udp_time, last_kcp_push_time
             last_udp_time = time.time()
             peer = packet.peer
             if peer is None and not packet.via_turn:
@@ -528,6 +546,8 @@ class LiveSessionMixin:
             if parsed:
                 msg_type = parsed.get("type")
                 if msg_type == BINDING_REQUEST and peer is not None:
+                    if not packet.via_turn and not self._remote:
+                        direct_ice_peer[0] = peer
                     try:
                         response = _build_ice_response(
                             parsed, ice_pwd, peer[0], peer[1]
@@ -540,6 +560,8 @@ class LiveSessionMixin:
                         pass
                     return
                 if msg_type == BINDING_RESPONSE:
+                    if peer is not None and not packet.via_turn and not self._remote:
+                        direct_ice_peer[0] = peer
                     kcp.retransmit_unacked()
                     return
 
@@ -565,6 +587,16 @@ class LiveSessionMixin:
                     current = confirmed_peer[0]
                     if current is None or (direct and not current[2]):
                         confirmed_peer[0] = (peer[0], peer[1], direct)
+                        if direct:
+                            # Prefer confirmed LAN media and stop fallback fanout.
+                            self.direct_confirmed = True
+                            candidate_fanout_until = 0.0
+                        elif self._remote and packet.via_turn:
+                            # On WAN, the native app settles on the relay quickly.
+                            # Continuing candidate fanout multiplies ACKs and
+                            # recovery nudges across fallbacks that cannot carry
+                            # media from here.
+                            candidate_fanout_until = 0.0
                         _LOGGER.debug(
                             "Confirmed media peer %s via %s",
                             format_endpoint(peer),
@@ -586,6 +618,26 @@ class LiveSessionMixin:
                         kcp.retransmit_unacked()
                 _drain_kcp_queue()
 
+        def _seek_direct_ice_before_startup() -> None:
+            if self._remote or not lan_connect_endpoints:
+                return
+            deadline = time.time() + DIRECT_STARTUP_ICE_GRACE_S
+            while (
+                self._running and direct_ice_peer[0] is None and time.time() < deadline
+            ):
+                now_ts = time.time()
+                _send_lan_connect(now_ts, force=True)
+                _send_ice_checks()
+                for packet in recv_peer_packets(
+                    turn,
+                    timeout=DIRECT_ICE_CHECK_INTERVAL_S,
+                    max_packets=256,
+                ):
+                    _handle_peer_packet(packet)
+                kcp.flush_acks()
+
+        now = time.time()
+        _seek_direct_ice_before_startup()
         now = time.time()
         _send_lan_connect(now, force=True)
         kcp.send_handshake()
@@ -595,9 +647,15 @@ class LiveSessionMixin:
         # echoes the IVA handshake, then ignores a delayed START_LIVE.
         _send_start_live("startup", now)
         last_iva_heartbeat = now + IVA_HEARTBEAT_S
+        ice_aggressive_deadline = now + DIRECT_ICE_SEEK_WINDOW_S
 
         while self._running:
             now = time.time()
+            # Keep ICE rapid until a direct pair wins or the seek window expires.
+            peer = confirmed_peer[0]
+            ice_aggressive = peer is None or (
+                not peer[2] and now < ice_aggressive_deadline
+            )
             _send_lan_connect(now)
 
             if auth_fallback_at and self._video_count <= 0 and now >= auth_fallback_at:
@@ -605,11 +663,13 @@ class LiveSessionMixin:
 
             if now >= last_ice:
                 _send_ice_checks()
-                # Match the official app's rapid ICE cadence until a media peer
-                # is confirmed. On LAN the camera (ICE-controlled) gates video on
-                # ICE completion and answers only a fraction of our checks, so 2s
-                # spacing rarely nominates a pair before a reconnect resets it.
-                last_ice = now + (2.0 if confirmed_peer[0] is not None else 0.05)
+                # Match the official app's LAN cadence: rapid nominated checks
+                # until direct media wins, then lightweight ICE keepalives.
+                last_ice = now + (
+                    DIRECT_ICE_CHECK_INTERVAL_S
+                    if ice_aggressive
+                    else ICE_KEEPALIVE_INTERVAL_S
+                )
             snap_keepalive.tick()
 
             if now >= next_signal_heartbeat:
@@ -624,7 +684,10 @@ class LiveSessionMixin:
 
             if self._keyframe_request.is_set():
                 self._keyframe_request.clear()
-                if live_started and now >= (
+                client_join_stale = live_started and runtime_policy_for(
+                    self._video_codec
+                ).idle_start_live_retry_s <= _video_wait_s(now)
+                if client_join_stale and now >= (
                     last_client_keyframe_request + CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S
                 ):
                     _send_start_live("client-join", now, min_interval=0.5)
@@ -659,11 +722,12 @@ class LiveSessionMixin:
                     pass
                 turn_refresh = now + 60.0
 
-            # Spin tighter while ICE is unconfirmed so we answer the camera's
-            # connectivity-check flood promptly and re-issue our own checks fast.
+            # Keep the loop tight while seeking/streaming so ICE replies and
+            # KCP ACKs stay close to native cadence.
+            streaming_or_seeking = ice_aggressive or confirmed_peer[0] is not None
             packets = recv_peer_packets(
                 turn,
-                timeout=0.08 if confirmed_peer[0] is not None else 0.02,
+                timeout=0.02 if streaming_or_seeking else 0.08,
                 max_packets=2048,
             )
             if not packets:

@@ -82,18 +82,18 @@ old 45 s window).
 
 ## Source-idle recovery (sustaining the stream)
 
-The `0x888E` VVP heartbeat keeps the **P2P session** alive but NOT the
-video. Many of these cameras have a separate stream-idle timeout and stop
-sending video after a short burst (sometimes a single opening keyframe)
-unless the live request is periodically re-issued. Reference clients
-confirm this: re-send the full live request every ~30 s, and re-issue it
-again after a few seconds of video idle, instead of tearing the session
-down.
+The `0x888E` VVP heartbeat keeps the **P2P session** alive. Native QHD HEVC
+captures send one startup `START_LIVE`, then VVP heartbeats, then `STOP_LIVE`;
+they do not proactively send `START_LIVE` while video is flowing. Re-sending it
+mid-flow can make WAN relay sessions go silent on this camera.
 
 The integration therefore:
 
-- **Proactively** re-issues `START_LIVE` every ~30 s while video flows (HEVC
-  `start_live_keepalive_s`), well inside the camera's stream-idle window.
+- Uses VVP heartbeats while video is flowing.
+- Late client joins use the cached PAT/PMT + keyframe seed; they do **not**
+  proactively send another `START_LIVE` while video is current. A join-triggered
+  `START_LIVE` is only used if the source is already stale enough to be in the
+  reactive recovery path.
 - **Reactively** re-issues `START_LIVE` when video stalls with no
   recoverable KCP gap (~5 s, `idle_start_live_retry_s`), repeating every few
   seconds. This fires whether the camera went fully silent or is still
@@ -108,10 +108,25 @@ session has stayed without video past `source_idle_reconnect_s` it still
 gives up, even though several retry pings were issued. Without this,
 retries would loop forever on a truly stuck camera.
 
+QHD/HEVC uses a longer reconnect budget than H.264. WAN relay captures show
+that the official app tolerates short HEVC pauses and keeps the existing
+session alive; reconnecting too quickly can push a snap camera back through
+dormancy/offline signaling, which is much slower than waiting out a temporary
+source pause.
+
 This resumes far faster than a full reconnect and avoids re-waking a
 battery camera, which is itself flaky right after a dormancy transition.
 A full reconnect remains the final escalation if the camera still doesn't
 resume.
+
+## Direct-LAN media
+
+On the camera's LAN, TURN is still allocated and advertised as fallback, but the
+native app moves QHD media to the direct host pair once ICE nominates it. The
+engine mirrors that: it gives startup a short direct-ICE grace before KCP, keeps
+rapid ICE checks going while seeking a direct peer, stops candidate fanout once
+direct KCP is confirmed, and gives confirmed direct sessions a longer
+source-idle window before reconnecting.
 
 ## Timing rules
 
