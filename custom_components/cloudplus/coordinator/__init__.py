@@ -26,6 +26,7 @@ from ..p2p_streamer import (
     parse_quality_setting,
     stream_id_for_quality,
 )
+from ..p2p_streamer.session_support import DIRECT_VIDEO_STALL_RESTART_S
 from ..p2p_streamer.codecs import (
     CodecName,
     CodecParameterCache,
@@ -603,6 +604,12 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 LIVE_VIDEO_STALL_RESTART_S,
                 runtime_policy_for(self._video_codec).source_idle_reconnect_s,
             )
+            if streamer is not None and getattr(streamer, "direct_confirmed", False):
+                # A confirmed direct LAN peer is hard-won on battery cameras;
+                # let the engine ride out brief silences (it stays patient for
+                # DIRECT_SOURCE_IDLE_RECONNECT_S) rather than restarting it back
+                # onto the lossy relay.
+                timeout = max(timeout, DIRECT_VIDEO_STALL_RESTART_S)
             return now - self._last_p2p_video_time >= timeout
         baseline = max(self._stream_started_at, self._wake_active_at)
         return now - baseline >= LIVE_STARTUP_STALL_RESTART_S

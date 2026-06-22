@@ -6,6 +6,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 from typing import Callable
 
 import paho.mqtt.client as mqtt
@@ -16,6 +17,8 @@ from ..motion_event import parse_motion_event
 _LOGGER = logging.getLogger(__name__)
 ALARM_POLL_INTERVAL = 15.0
 ALARM_POLL_ERROR_INTERVAL = 60.0
+# Cap on remembered event ids so the dedup set can't grow without bound.
+_SEEN_ALARM_CAP = 4000
 
 
 def _event_topics(api: MeariApiClient) -> list[str]:
@@ -44,7 +47,8 @@ class MotionEventListener:
         self._lock = threading.Lock()
         self._stop_poll = threading.Event()
         self._poll_thread: threading.Thread | None = None
-        self._seen_alarm_keys: set[tuple[str, str, str]] = set()
+        self._seen_alarm_keys: set[tuple[str, str]] = set()
+        self._poll_day: str = ""
 
     @property
     def has_callbacks(self) -> bool:
@@ -164,40 +168,62 @@ class MotionEventListener:
             self._poll_thread = None
 
     def _alarm_poll_loop(self) -> None:
+        # The first pass seeds the "already seen" set without dispatching, so
+        # pre-existing events don't fire motion at startup. This is the primary
+        # delivery path whenever the live MQTT push is unavailable — most often
+        # because the broker requires clientId == userID, so a phone logged in
+        # to the same account keeps evicting our MQTT session.
         seeded = False
         while not self._stop_poll.is_set():
             try:
-                events = self._api.get_latest_alarm_events()
-                self._handle_alarm_events(events, dispatch=seeded)
+                self._poll_device_events(dispatch=seeded)
                 seeded = True
                 wait_s = ALARM_POLL_INTERVAL
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
-                _LOGGER.debug("Latest alarm poll failed: %s", exc)
+                _LOGGER.debug("Alarm event poll failed: %s", exc)
                 wait_s = ALARM_POLL_ERROR_INTERVAL
             self._stop_poll.wait(wait_s)
 
-    @staticmethod
-    def _alarm_key(event: dict) -> tuple[str, str, str]:
-        device_id = str(event.get("deviceID") or event.get("deviceId") or "").strip()
-        event_time = str(event.get("devLocalTime") or event.get("eventTime") or "")
-        event_type = str(
-            event.get("evt")
-            or event.get("eventType")
-            or event.get("imageAlertType")
-            or ""
-        )
-        return device_id, event_time, event_type
+    def _poll_device_events(self, dispatch: bool) -> None:
+        """Poll each registered device's event log and dispatch new motions."""
+        day = time.strftime("%Y%m%d")
+        if day != self._poll_day:
+            # Day rolled over: yesterday's ids won't reappear in today's log, so
+            # drop them. New events on the fresh day still dispatch normally.
+            self._poll_day = day
+            self._seen_alarm_keys.clear()
 
-    def _handle_alarm_events(self, events: list[dict], dispatch: bool) -> None:
-        for raw_event in events:
-            if not isinstance(raw_event, dict):
+        with self._lock:
+            devices = {(dev_id, sn) for dev_id, sn, _cb in self._callbacks}
+
+        for device_id, _sn in devices:
+            try:
+                events = self._api.get_device_events(device_id, day)
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                _LOGGER.debug("Event list poll failed for %s: %s", device_id, exc)
                 continue
-            key = self._alarm_key(raw_event)
-            if not any(key) or key in self._seen_alarm_keys:
-                continue
-            self._seen_alarm_keys.add(key)
-            if dispatch:
-                self._handle_payload(json.dumps(raw_event).encode())
+            for raw_event in events:
+                if not isinstance(raw_event, dict):
+                    continue
+                msg_id = str(
+                    raw_event.get("msgID")
+                    or raw_event.get("msgId")
+                    or raw_event.get("eventTime")
+                    or ""
+                ).strip()
+                if not msg_id:
+                    continue
+                key = (str(device_id), msg_id)
+                if key in self._seen_alarm_keys:
+                    continue
+                self._seen_alarm_keys.add(key)
+                if dispatch:
+                    self._handle_payload(json.dumps(raw_event).encode())
+
+        if len(self._seen_alarm_keys) > _SEEN_ALARM_CAP:
+            # Keep the set bounded; trimming the oldest is fine because only
+            # events newer than the last poll can ever be dispatched.
+            self._seen_alarm_keys = set(list(self._seen_alarm_keys)[-_SEEN_ALARM_CAP:])
 
     def _matching_callbacks(
         self, device_id: str, license_id: str

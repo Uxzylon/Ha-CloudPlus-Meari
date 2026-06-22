@@ -39,8 +39,9 @@ KCP_CMD_WINS = 84  # 0x54 - window probe response
 KCP_HEADER_SIZE = 24
 KCP_MSS = 1176  # Outbound control payloads are tiny; keep plenty of UDP headroom.
 KCP_WND = 1024  # Matches the official app's receive window in ACK packets.
-KCP_ACK_BATCH_SEGMENTS = 3
-KCP_ACK_FLUSH_INTERVAL_S = 0.01
+KCP_ACK_BATCH_SEGMENTS = 16
+KCP_ACK_EVERY_SEGMENTS = 8
+KCP_ACK_FLUSH_INTERVAL_S = 0.02
 KCP_ACK_PROBE_SEGMENTS = 32
 
 # IVA frame constants
@@ -259,11 +260,27 @@ class KcpTunnel:
         return (int(time.time() * 1000) - self.ts_base) & 0xFFFFFFFF
 
     def _wnd(self):
-        """Advertise remaining receive slots without overstating backlog."""
-        used = len(self.recv_buf) + len(self.recv_queue) + len(self.recv_frag_buf)
+        """Advertise free receive slots the way the official app does.
+
+        Only genuine backlog beyond ``next_recv_sn`` occupies the window:
+        out-of-order segments held in ``recv_buf`` and completed-but-unread
+        messages in ``recv_queue``. Fragments of the message currently being
+        reassembled (``recv_frag_buf``) are already in order *below*
+        ``next_recv_sn`` — they have been received and acknowledged, so they do
+        not occupy receive-window slots. Counting them shrank our advertised
+        window by ~one IDR's worth of fragments (a 207 KB QHD keyframe is ~176
+        segments) on every keyframe, whereas the official app holds its window
+        near-constant at ~1024. On a battery camera that rate-adapts to the
+        advertised window, that needless dip throttles the stream.
+        """
+        used = len(self.recv_buf) + len(self.recv_queue)
         return max(0, self.recv_wnd - used)
 
     def _remember_ack(self, sn, ts):
+        if self.next_recv_sn >= 0 and sn >= self.next_recv_sn:
+            in_gap = self.next_recv_sn not in self.recv_buf
+            if not in_gap and sn % KCP_ACK_EVERY_SEGMENTS:
+                return
         self.pending_acks.append((sn, ts))
         self.recent_acks.append((sn, ts))
         if len(self.recent_acks) > KCP_ACK_PROBE_SEGMENTS * 2:

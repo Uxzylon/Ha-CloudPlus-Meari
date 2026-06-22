@@ -159,9 +159,12 @@ async def cmd_stream(args) -> int:
                 else f"{artifact_base}.pcap"
             )
             capture = PacketCapture(
-                capture_path, filter_expr=getattr(args, "capture_filter", "udp")
+                capture_path,
+                filter_expr=getattr(args, "capture_filter", "udp"),
+                iface=getattr(args, "capture_iface", "any"),
             )
-            capture.start()
+            if not capture.start():
+                capture = None
 
         setattr(args, "skip_initial_grab", bool(args.wake and args.play))
         if args.wake and args.play:

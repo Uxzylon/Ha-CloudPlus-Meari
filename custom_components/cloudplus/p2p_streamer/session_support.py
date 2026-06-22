@@ -24,6 +24,23 @@ AUTH_FALLBACK_NO_VIDEO_S = 10.0
 # via `P2PStreamer.awaiting_wake`.
 DORMANCY_WAKE_TIMEOUT_S = 75.0
 WAKE_RETRY_S = 4.0
+# On LAN the camera may confirm relay first, but the official app keeps rapid
+# nominated ICE checks going until the direct host pair wins. Captures show a
+# ~30 ms burst followed by ~1 s keepalive checks; slower cadences can leave QHD
+# HEVC stuck on the relay.
+DIRECT_ICE_SEEK_WINDOW_S = 12.0
+DIRECT_ICE_CHECK_INTERVAL_S = 0.03
+DIRECT_STARTUP_ICE_GRACE_S = 0.7
+ICE_KEEPALIVE_INTERVAL_S = 1.0
+# Once direct LAN media is confirmed, keep that session patient through brief
+# camera radio/power-save silences. Relay and not-yet-confirmed sessions keep the
+# codec policy's shorter reconnect timeout.
+DIRECT_SOURCE_IDLE_RECONNECT_S = 40.0
+# Watchdog counterpart to the above: the coordinator (and debug harness) must not
+# restart a confirmed-direct session underneath the engine's own patience window.
+# Kept above DIRECT_SOURCE_IDLE_RECONNECT_S so the engine manages its session
+# first and an external restart is only a last resort.
+DIRECT_VIDEO_STALL_RESTART_S = 45.0
 AUTH_FALLBACK_RESULT = (-1, -1)
 SIGNALING_CONNECT_TIMEOUT_S = 5.0
 CLIENT_KEYFRAME_REQUEST_DEBOUNCE_S = 4.0
