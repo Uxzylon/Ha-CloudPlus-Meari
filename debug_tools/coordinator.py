@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 import types
 from typing import Any
@@ -12,6 +13,8 @@ from urllib.parse import urlparse
 from .auth import _login_api_with_fallback
 from .bootstrap import _bootstrap_integration_modules
 from .devices import _select_device
+
+_DIRECT_VIDEO_STALL_RESTART_FALLBACK_S = 45.0
 
 
 async def _create_coordinator(args) -> tuple[Any, dict[str, Any], Any]:
@@ -105,11 +108,26 @@ def _maybe_restart_stalled_stream(
     if stall_started_at is None:
         return now
 
-    if now - stall_started_at >= float(stall_timeout):
+    effective_timeout = float(stall_timeout)
+    if getattr(p2p, "direct_confirmed", False):
+        session_support = sys.modules.get(
+            "custom_components.cloudplus.p2p_streamer.session_support"
+        )
+        direct_restart_s = float(
+            getattr(
+                session_support,
+                "DIRECT_VIDEO_STALL_RESTART_S",
+                _DIRECT_VIDEO_STALL_RESTART_FALLBACK_S,
+            )
+        )
+        effective_timeout = max(effective_timeout, direct_restart_s)
+
+    if now - stall_started_at >= effective_timeout:
         p2p = getattr(coord, "_p2p_streamer", None)
         if p2p:
             logging.getLogger(__name__).warning(
-                "No live video for %ss, restarting stalled P2P session", stall_timeout
+                "No live video for %ss, restarting stalled P2P session",
+                effective_timeout,
             )
             p2p.request_stop()
         # Immediately queue another wake so coordinator can restart

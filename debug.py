@@ -6,10 +6,31 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import sys
+from typing import IO
 
 from debug_tools.auth import _prepare_auth_args
 from debug_tools.list_cmd import cmd_list
 from debug_tools.stream_cmd import cmd_stream
+
+
+class _Tee:
+    def __init__(self, primary: IO[str], mirror: IO[str]) -> None:
+        self._primary = primary
+        self._mirror = mirror
+
+    def write(self, data: str) -> int:
+        self._primary.write(data)
+        self._mirror.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._mirror.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._primary, name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,6 +96,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="tcpdump BPF filter for --capture (default: udp — root discovery, "
         "STUN/TURN and P2P; skips HTTPS API noise)",
     )
+    stream.add_argument(
+        "--capture-iface",
+        default="any",
+        metavar="IFACE",
+        help="Interface for --capture (default: any). Set to the LAN interface "
+        "facing the camera (e.g. wlan0) to capture the direct P2P path cleanly "
+        "without unrelated docker-bridge/VPN noise.",
+    )
+    stream.add_argument(
+        "--log-file",
+        default="",
+        metavar="PATH",
+        help="Tee all CLI output (logs + analysis) to this file as well as the "
+        "terminal. Pairs with --capture for a full text+pcap record of a run.",
+    )
     return parser
 
 
@@ -90,11 +126,26 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     _prepare_auth_args(parser, args)
+    log_file_arg = str(getattr(args, "log_file", "") or "").strip()
+    log_fh = None
+    if log_file_arg:
+        log_path = os.path.abspath(os.path.expanduser(log_file_arg))
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        log_fh = open(log_path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
+        sys.stdout = _Tee(sys.stdout, log_fh)
+        sys.stderr = _Tee(sys.stderr, log_fh)
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    return asyncio.run(async_main(args))
+    try:
+        return asyncio.run(async_main(args))
+    finally:
+        if log_fh is not None:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            log_fh.flush()
+            log_fh.close()
 
 
 if __name__ == "__main__":
