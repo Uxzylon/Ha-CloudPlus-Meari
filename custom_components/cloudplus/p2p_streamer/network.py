@@ -12,15 +12,11 @@ from urllib.parse import urlparse
 
 from ..turn_client import (
     _build_stun,
-    _encode_attr,
-    _add_integrity,
-    _encode_xor_address,
     _decode_xor_address,
     _parse_stun,
     build_ice_binding_request,
     BINDING_RESPONSE,
     DATA_INDICATION,
-    ATTR_XOR_MAPPED_ADDRESS,
     ATTR_DATA,
     ATTR_XOR_PEER_ADDRESS,
 )
@@ -244,14 +240,10 @@ def _resolve_signaling_server_candidates(
 
 
 def _build_ice_response(
-    binding_req: dict, local_ice_pwd: str, peer_ip: str, peer_port: int
+    binding_req: dict, _local_ice_pwd: str, _peer_ip: str, _peer_port: int
 ) -> bytes:
-    txn_id = binding_req["txn_id"]
-    ice_key = local_ice_pwd.encode()
-    mapped = _encode_xor_address(peer_ip, peer_port)
-    attrs = _encode_attr(ATTR_XOR_MAPPED_ADDRESS, mapped)
-    attrs = _add_integrity(BINDING_RESPONSE, attrs, txn_id, ice_key)
-    msg, _ = _build_stun(BINDING_RESPONSE, attrs, txn_id)
+    """Build the bare Binding success response used by the native app."""
+    msg, _ = _build_stun(BINDING_RESPONSE, b"", binding_req["txn_id"])
     return msg
 
 

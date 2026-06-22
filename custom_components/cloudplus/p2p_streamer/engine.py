@@ -120,6 +120,12 @@ class P2PStreamer(LiveSessionMixin):
         # True while a dormant camera is actively being woken — watchdogs must
         # not restart the session underneath the dormancy-wake budget.
         self.awaiting_wake = False
+        # True once this session has confirmed a *direct* LAN media peer. The
+        # direct path is precious on battery cameras (see
+        # DIRECT_SOURCE_IDLE_RECONNECT_S), so while it holds, the engine and the
+        # restart watchdogs stay patient through brief mid-stream silences
+        # instead of abandoning it for the lossy relay.
+        self.direct_confirmed = False
 
     def request_stop(self) -> None:
         self._running = False
@@ -359,6 +365,7 @@ class P2PStreamer(LiveSessionMixin):
                 self._last_video_timestamp_ms = None
                 self._last_turn_endpoint = None
                 self._last_candidate_count = 0
+                self.direct_confirmed = False
                 result = self._run_session_once(
                     host_key,
                     allow_auth_fallback=uses_video_password,
