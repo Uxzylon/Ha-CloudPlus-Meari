@@ -610,8 +610,8 @@ class P2PStreamer(LiveSessionMixin):
         self._active_sock = turn.sock
         if not turn.allocate():
             _LOGGER.error("TURN allocation failed")
-            turn.close()
             self._active_sock = None
+            turn.close()
             self.awaiting_wake = False
             return (0, 0)
 
