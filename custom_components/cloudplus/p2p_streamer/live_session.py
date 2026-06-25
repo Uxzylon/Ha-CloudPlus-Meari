@@ -182,7 +182,7 @@ class LiveSessionMixin:
                 return
             for endpoint in lan_connect_endpoints:
                 try:
-                    turn.sock.sendto(lan_connect_frame, endpoint)
+                    turn.send_direct(endpoint[0], endpoint[1], lan_connect_frame)
                 except OSError:
                     pass
             last_lan_connect = now_ts
@@ -206,7 +206,8 @@ class LiveSessionMixin:
         def _send_udp(data: bytes) -> None:
             if confirmed_peer[0] is None and direct_ice_peer[0] is not None:
                 try:
-                    turn.sock.sendto(data, direct_ice_peer[0])
+                    peer_ip, peer_port = direct_ice_peer[0]
+                    turn.send_direct(peer_ip, peer_port, data)
                     return
                 except OSError:
                     pass
@@ -216,7 +217,7 @@ class LiveSessionMixin:
                 direct_sent = False
                 if direct and not self._remote:
                     try:
-                        turn.sock.sendto(data, (peer_ip, peer_port))
+                        turn.send_direct(peer_ip, peer_port, data)
                         direct_sent = True
                     except OSError:
                         pass
@@ -235,7 +236,7 @@ class LiveSessionMixin:
                     pass
                 if not self._remote and cand.get("type") != "relay":
                     try:
-                        turn.sock.sendto(data, (cand["ip"], cand["port"]))
+                        turn.send_direct(cand["ip"], cand["port"], data)
                     except OSError:
                         pass
 
@@ -358,7 +359,7 @@ class LiveSessionMixin:
                 if not self._remote and cand.get("type") != "relay":
                     try:
                         _send_direct_ice_binding(
-                            turn.sock,
+                            turn.open_socket(),
                             cand["ip"],
                             cand["port"],
                             ice_ufrag,
@@ -553,7 +554,7 @@ class LiveSessionMixin:
                             parsed, ice_pwd, peer[0], peer[1]
                         )
                         if not packet.via_turn and not self._remote:
-                            turn.sock.sendto(response, peer)
+                            turn.send_direct(peer[0], peer[1], response)
                         else:
                             turn.send_to_peer(peer[0], peer[1], response)
                     except OSError:

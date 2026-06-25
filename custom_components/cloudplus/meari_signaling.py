@@ -78,10 +78,11 @@ class MsgSvrClient:
 
     def _send_unlocked(self, method, cmd, payload_json):
         """Build and send a frame."""
-        if self.sock is None:
+        sock = self.sock
+        if sock is None:
             raise ConnectionError("Signaling socket is closed")
         frame = _build_frame(NODE_CLIENT, method, cmd, payload_json)
-        self.sock.sendall(frame)
+        sock.sendall(frame)
 
     def _send(self, method, cmd, payload_json):
         with self._io_lock:
@@ -89,10 +90,11 @@ class MsgSvrClient:
 
     def _recv(self):
         """Receive one frame."""
-        if self.sock is None:
-            raise ConnectionError("Signaling socket is closed")
         with self._io_lock:
-            return _recv_frame(self.sock)
+            sock = self.sock
+            if sock is None:
+                raise ConnectionError("Signaling socket is closed")
+            return _recv_frame(sock)
 
     def _send_webrtc(self, inner_json, to_webrtcsvr=True):
         """Send a webrtcsvr-routed message with base64-encoded content."""
@@ -396,5 +398,6 @@ class MsgSvrClient:
         return None
 
     def close(self):
-        close_socket(self.sock)
+        sock = self.sock
         self.sock = None
+        close_socket(sock)
