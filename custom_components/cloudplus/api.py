@@ -726,6 +726,21 @@ class MeariApiClient:
         events = data.get("alertMsg")
         return events if isinstance(events, list) else []
 
+    def get_new_device_events(self) -> list[dict[str, Any]]:
+        """Return all-device unread/new alarm summaries.
+
+        CloudEdge home screen calls ``/v3/app/event/new/get`` with
+        ``listAllDevice=1``. It is not as complete as the per-device event log
+        because read state can clear it.
+        """
+        data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
+        if str(data.get("resultCode", "")) != "1001":
+            return []
+        devices = data.get("result", {}).get("device")
+        if isinstance(devices, list):
+            return [event for event in devices if isinstance(event, dict)]
+        return []
+
     def get_device_status(self, sn_num: str) -> str:
         """Query device status via OpenAPI. Returns online/offline/dormancy."""
         device_id = format_sn(sn_num)

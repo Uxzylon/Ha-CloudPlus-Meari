@@ -60,10 +60,11 @@ differently. The parser must accept any of:
 
 Alarm-type fields the parser looks for, in order:
 
-- `evt`
 - `eventType`
 - `alarmType`
 - `imageAlertType`
+- `alertType`
+- `evt`
 
 See [`const.py`](../custom_components/cloudplus/const.py) `ALARM_TYPE_NAMES`
 and `MOTION_ALARM_TYPES` for the active mapping. The motion binary sensor
@@ -72,7 +73,7 @@ Human body, Person). Other alarm types (Visitor, Noise, Package, etc.) are
 classified by `motion_event.py` but currently routed only to logs / future
 event sensors.
 
-## Fallback: event-log polling
+## Fallback: cloud event polling
 
 Because the MQTT session is regularly evicted whenever the account is also
 logged in on a phone (see Transport — the broker forces client-id == user-id),
@@ -88,7 +89,7 @@ GET /v3/app/event/list   { deviceID, day=YYYYMMDD, direction=1, index=0 }
 → { "alertMsg": [ { "msgID", "eventType", "eventTime", "deviceID", … }, … ] }
 ```
 
-This was chosen over the older `/v3/app/event/new/get` summary for three
+The per-device log remains primary over the older `/v3/app/event/new/get` summary for three
 reasons, all of which broke motion for real users:
 
 - **Read-state independent.** `event/new/get` returns an `evt` *has-unread
@@ -104,11 +105,24 @@ reasons, all of which broke motion for real users:
   startup records existing ids without dispatching; the set is cleared on day
   rollover and capped to stay bounded.
 
+The poller also calls:
+
+```
+GET /v3/app/event/new/get { listAllDevice=1 } → { "result": { "device": [ { "evt", "imageAlertType", "devLocalTime", "deviceID", … }, … ] } }
+```
+
+Those summary rows are a secondary source only. They are de-duplicated by the
+reported device and local event time (or a stable raw-row fallback), seeded on
+startup without dispatching, and parsed with `imageAlertType` so `evt` still
+behaves as a read/unread flag rather than the alarm type.
+
 `MotionEventListener` polls every `ALARM_POLL_INTERVAL` (15 s), so worst-case
 motion latency without MQTT is ~15 s.
 
 ## Practical guidance
 
+- If MQTT connect logs `Bad user name or password`, low-latency MQTT push is
+  unavailable for that session but cloud polling remains active.
 - If MQTT events stop after running for a long time, check that no other
   client is logging in with the same account. The broker silently drops the
   older session.
