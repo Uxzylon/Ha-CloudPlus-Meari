@@ -220,28 +220,50 @@ class TurnClient:
         except OSError:
             pass
 
+    def _open_socket(self):
+        sock = self.sock
+        if sock is None:
+            raise OSError("TURN socket is closed")
+        return sock
+
+    def open_socket(self):
+        """Return the underlying UDP socket or raise if the TURN client is closed."""
+        return self._open_socket()
+
+    def send_direct(self, peer_ip: str, peer_port: int, data: bytes) -> None:
+        """Send raw UDP data directly to a peer using the TURN socket."""
+        self._open_socket().sendto(data, (peer_ip, peer_port))
+
     def _send(self, data):
-        self.sock.sendto(data, (self.server_ip, self.server_port))
+        self._open_socket().sendto(data, (self.server_ip, self.server_port))
 
     def _recv(self, timeout=5.0):
-        self.sock.settimeout(timeout)
-        data, _ = self.sock.recvfrom(65536)
+        sock = self._open_socket()
+        sock.settimeout(timeout)
+        data, _ = sock.recvfrom(65536)
         return data
 
     def drain_socket(self):
         """Drain any buffered packets from the socket (non-blocking)."""
+        try:
+            sock = self._open_socket()
+        except OSError:
+            return
         drained = 0
-        self.sock.setblocking(False)
+        sock.setblocking(False)
         try:
             for _ in range(200):
                 try:
-                    self.sock.recvfrom(65536)
+                    sock.recvfrom(65536)
                     drained += 1
                 except (BlockingIOError, OSError):
                     break
         finally:
-            self.sock.setblocking(True)
-            self.sock.settimeout(5.0)
+            try:
+                sock.setblocking(True)
+                sock.settimeout(5.0)
+            except OSError:
+                pass
         if drained:
             print(f"[TURN] Drained {drained} buffered packets")
 
@@ -483,9 +505,10 @@ class TurnClient:
 
         Returns (data_bytes, peer_ip, peer_port) or (None, None, None) on timeout.
         """
-        self.sock.settimeout(timeout)
+        sock = self._open_socket()
+        sock.settimeout(timeout)
         try:
-            raw, _ = self.sock.recvfrom(65536)
+            raw, _ = sock.recvfrom(65536)
         except socket.timeout:
             return None, None, None
 
@@ -541,5 +564,6 @@ class TurnClient:
         self.send_to_peer(peer_ip, peer_port, msg)
 
     def close(self):
-        close_socket(self.sock)
+        sock = self.sock
         self.sock = None
+        close_socket(sock)
