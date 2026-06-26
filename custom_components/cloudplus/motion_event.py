@@ -12,7 +12,7 @@ from typing import Any
 from .const import ALARM_TYPE_NAMES, MOTION_ALARM_TYPES
 
 _WRAPPER_KEYS = ("params", "data", "msg", "result", "items", "payload")
-_EVENT_KEYS = ("evt", "eventType", "alarmType", "imageAlertType", "alertType")
+_EVENT_KEYS = ("eventType", "alarmType", "imageAlertType", "alertType", "evt")
 _DEVICE_KEYS = (
     "deviceID",
     "deviceId",

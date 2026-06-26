@@ -21,6 +21,27 @@ ALARM_POLL_ERROR_INTERVAL = 60.0
 _SEEN_ALARM_CAP = 4000
 
 
+def _mqtt_callback_code(args: tuple) -> object:
+    """Return rc/reason_code from Paho v1/v2 callback tail args."""
+    if len(args) >= 2:
+        return args[1]
+    if args:
+        return args[0]
+    return 0
+
+
+def _mqtt_code_ok(code: object) -> bool:
+    if code is None or code == 0:
+        return True
+    value = getattr(code, "value", None)
+    if value == 0:
+        return True
+    try:
+        return int(code) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _event_topics(api: MeariApiClient) -> list[str]:
     user_id = str(api.user_id or "").strip()
     if not user_id:
@@ -49,6 +70,7 @@ class MotionEventListener:
         self._poll_thread: threading.Thread | None = None
         self._seen_alarm_keys: set[tuple[str, str]] = set()
         self._poll_day: str = ""
+        self._mqtt_connect_warned = False
 
     @property
     def has_callbacks(self) -> bool:
@@ -86,8 +108,10 @@ class MotionEventListener:
         if not user_id or not topics:
             return
 
-        def on_connect(client, _userdata, _flags, rc, *_args):
-            if rc == 0:
+        def on_connect(client, _userdata, *args):
+            rc = _mqtt_callback_code(args)
+            if _mqtt_code_ok(rc):
+                self._mqtt_connect_warned = False
                 for topic in topics:
                     client.subscribe(topic, qos=2)
                 _LOGGER.debug(
@@ -95,10 +119,16 @@ class MotionEventListener:
                     ", ".join(topics),
                 )
             else:
-                _LOGGER.warning("MQTT motion listener connect failed: rc=%s", rc)
+                msg = "MQTT motion listener connect failed: rc=%s; using poll fallback"
+                if self._mqtt_connect_warned:
+                    _LOGGER.debug(msg, rc)
+                else:
+                    self._mqtt_connect_warned = True
+                    _LOGGER.warning(msg, rc)
 
-        def on_disconnect(_client, _userdata, _flags, rc, *_args):
-            if rc:
+        def on_disconnect(_client, _userdata, *args):
+            rc = _mqtt_callback_code(args)
+            if not _mqtt_code_ok(rc):
                 _LOGGER.debug("MQTT motion listener disconnected: rc=%s", rc)
 
         def on_message(_client, _userdata, msg):
@@ -184,6 +214,56 @@ class MotionEventListener:
                 wait_s = ALARM_POLL_ERROR_INTERVAL
             self._stop_poll.wait(wait_s)
 
+    def _remember_event(self, device_id: str, event_id: str) -> bool:
+        """Return True first time a cloud event key is seen."""
+        key = (device_id, event_id)
+        if key in self._seen_alarm_keys:
+            return False
+        self._seen_alarm_keys.add(key)
+        return True
+
+    def _trim_seen_events(self) -> None:
+        if len(self._seen_alarm_keys) > _SEEN_ALARM_CAP:
+            # Keep bounded; trimming oldest is fine because only events newer
+            # than the last poll can ever be dispatched.
+            self._seen_alarm_keys = set(list(self._seen_alarm_keys)[-_SEEN_ALARM_CAP:])
+
+    def _event_id(self, raw_event: dict, *, prefix: str = "") -> str:
+        event_id = str(
+            raw_event.get("msgID")
+            or raw_event.get("msgId")
+            or raw_event.get("eventTime")
+            or raw_event.get("devLocalTime")
+            or ""
+        ).strip()
+        if event_id:
+            return f"{prefix}{event_id}"
+        return f"{prefix}{json.dumps(raw_event, sort_keys=True, separators=(',', ':'))}"
+
+    def _poll_new_event_summary(
+        self, devices: set[tuple[str, str]], dispatch: bool
+    ) -> None:
+        registered_ids = {device_id for device_id, _sn in devices}
+        try:
+            events = self._api.get_new_device_events()
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            _LOGGER.debug("New-event summary poll failed: %s", exc)
+            return
+        for raw_event in events:
+            device_id = str(
+                raw_event.get("deviceID")
+                or raw_event.get("deviceId")
+                or raw_event.get("device_id")
+                or ""
+            ).strip()
+            if not device_id or device_id not in registered_ids:
+                continue
+            event_id = self._event_id(raw_event, prefix="summary:")
+            if not self._remember_event(device_id, event_id):
+                continue
+            if dispatch:
+                self._handle_payload(json.dumps(raw_event).encode())
+
     def _poll_device_events(self, dispatch: bool) -> None:
         """Poll each registered device's event log and dispatch new motions."""
         day = time.strftime("%Y%m%d")
@@ -195,6 +275,8 @@ class MotionEventListener:
 
         with self._lock:
             devices = {(dev_id, sn) for dev_id, sn, _cb in self._callbacks}
+        if not devices:
+            return
 
         for device_id, _sn in devices:
             try:
@@ -220,10 +302,9 @@ class MotionEventListener:
                 if dispatch:
                     self._handle_payload(json.dumps(raw_event).encode())
 
-        if len(self._seen_alarm_keys) > _SEEN_ALARM_CAP:
-            # Keep the set bounded; trimming the oldest is fine because only
-            # events newer than the last poll can ever be dispatched.
-            self._seen_alarm_keys = set(list(self._seen_alarm_keys)[-_SEEN_ALARM_CAP:])
+        self._poll_new_event_summary(devices, dispatch)
+
+        self._trim_seen_events()
 
     def _matching_callbacks(
         self, device_id: str, license_id: str

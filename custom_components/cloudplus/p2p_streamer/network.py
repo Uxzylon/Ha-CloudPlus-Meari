@@ -299,9 +299,10 @@ def recv_peer_packet(turn, timeout: float = 1.0) -> PeerPacket | None:
     The streamer needs it for direct ICE checks, so this helper keeps both the
     raw source address and the logical peer address.
     """
-    turn.sock.settimeout(timeout)
+    sock = turn.open_socket()
+    sock.settimeout(timeout)
     try:
-        raw, addr = turn.sock.recvfrom(65536)
+        raw, addr = sock.recvfrom(65536)
     except socket.timeout:
         return None
     return _unwrap_peer_packet(turn, raw, addr)
@@ -319,7 +320,7 @@ def recv_peer_packets(
         return []
 
     packets = [first]
-    sock = turn.sock
+    sock = turn.open_socket()
     sock.setblocking(False)
     try:
         for _ in range(max(0, max_packets - 1)):
