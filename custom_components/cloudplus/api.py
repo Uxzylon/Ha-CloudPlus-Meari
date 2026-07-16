@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import random
+import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -43,6 +44,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Linux; U; Android 14; en-us; Pixel Build/UP1A.231105.001) "
     "AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1"
 )
+HTTP_TIMEOUT = (10.0, 30.0)
 
 APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
     "cloudplus": {
@@ -219,6 +221,7 @@ class MeariApiClient:
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        self._request_lock = threading.RLock()
 
         self.api_server: str = ""
         self.user_id: Optional[int] = None
@@ -245,6 +248,16 @@ class MeariApiClient:
         self._redirect_url = default_profile["redirect_url"]
         self._partner_id = default_profile["partner_id"]
         self._ttid = default_profile["ttid"]
+
+    def _http_get(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.get(url, **kwargs)
+
+    def _http_post(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.post(url, **kwargs)
 
     def _select_profile(self, profile: str) -> None:
         cfg = APP_PROFILE_CONFIG.get(profile)
@@ -357,7 +370,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -368,7 +381,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.post(url, data=params, headers=headers)
+        r = self._http_post(url, data=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -391,7 +404,7 @@ class MeariApiClient:
         params["expires"] = timeout
         params["signature"] = sig
         url = self.openapi_server + path
-        r = self.session.get(url, params=params)
+        r = self._http_get(url, params=params)
         r.raise_for_status()
         return r.json()
 
@@ -401,11 +414,12 @@ class MeariApiClient:
 
     def login(self) -> None:
         """Full login: redirect → login → IoT config → device list."""
-        self._select_profile(self.app_profile)
-        self._redirect()
-        self._do_login()
-        self._get_iot_config()
-        self._get_devices()
+        with self._request_lock:
+            self._select_profile(self.app_profile)
+            self._redirect()
+            self._do_login()
+            self._get_iot_config()
+            self._get_devices()
 
     def _redirect(self) -> None:
         ts = int(time.time() * 1000)
@@ -435,7 +449,7 @@ class MeariApiClient:
         path = "/ppstrongs/redirect"
         headers = self._ca_headers(path)
         url = self._redirect_url + path
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         data = r.json()
         if data.get("resultCode") != "1001":
@@ -482,7 +496,7 @@ class MeariApiClient:
                 params["encryStatus"] = "1"
 
             headers = self._ca_headers(path)
-            r = self.session.post(url, data=params, headers=headers)
+            r = self._http_post(url, data=params, headers=headers)
             r.raise_for_status()
             data = r.json()
 
@@ -735,7 +749,7 @@ class MeariApiClient:
         """
         data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
         if str(data.get("resultCode", "")) != "1001":
-            return []
+            raise RuntimeError(f"New-device event summary failed: {data}")
         devices = data.get("result", {}).get("device")
         if isinstance(devices, list):
             return [event for event in devices if isinstance(event, dict)]
@@ -754,19 +768,16 @@ class MeariApiClient:
 
     def get_battery_info(self, sn_num: str) -> dict[str, Any]:
         """Get battery info for a device. Returns {code: value} dict."""
-        try:
-            sn_map = {sn_num: BATTERY_CODES}
-            data = self._get(
-                "/v2/app/iot/model/get/batch",
-                {
-                    "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
-                },
-            )
-            if data.get("resultCode") == "1001":
-                return data.get("result", {}).get(sn_num, {})
-        except (OSError, ValueError, KeyError, RuntimeError) as e:
-            _LOGGER.debug("Battery info failed: %s", e)
-        return {}
+        sn_map = {sn_num: BATTERY_CODES}
+        data = self._get(
+            "/v2/app/iot/model/get/batch",
+            {
+                "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
+            },
+        )
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Battery info failed: {data}")
+        return data.get("result", {}).get(sn_num, {})
 
     # ------------------------------------------------------------------
     # Lamp / LED control via OpenAPI device config
@@ -792,6 +803,8 @@ class MeariApiClient:
                 "target": "server",
             },
         )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT config failed: {resp}")
         return resp.get("iot", {})
 
     def get_device_iot_values(
@@ -814,6 +827,8 @@ class MeariApiClient:
                 "deviceid": dev_uuid,
             },
         )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT values failed: {resp}")
         return resp.get("iot", {})
 
     def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
@@ -901,7 +916,7 @@ class MeariApiClient:
                     "sid": sid,
                 }
                 url = self.openapi_server + "/openapi/device/awaken"
-                r = self.session.get(url, params=params)
+                r = self._http_get(url, params=params)
                 if r.status_code == 200:
                     success = True
             except OSError as e:
@@ -926,7 +941,7 @@ class MeariApiClient:
         if not url:
             return None
         try:
-            r = self.session.get(url, timeout=10)
+            r = self._http_get(url, timeout=10)
             if r.status_code == 200 and len(r.content) > 100:
                 return r.content
         except OSError:

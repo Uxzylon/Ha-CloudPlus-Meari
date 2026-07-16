@@ -206,13 +206,34 @@ class MotionEventListener:
         seeded = False
         while not self._stop_poll.is_set():
             try:
-                self._poll_device_events(dispatch=seeded)
+                if not self._poll_device_events(dispatch=seeded):
+                    raise RuntimeError("all motion event endpoints failed")
                 seeded = True
                 wait_s = ALARM_POLL_INTERVAL
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 _LOGGER.debug("Alarm event poll failed: %s", exc)
-                wait_s = ALARM_POLL_ERROR_INTERVAL
+                wait_s = (
+                    ALARM_POLL_INTERVAL
+                    if self._reauthenticate_api()
+                    else ALARM_POLL_ERROR_INTERVAL
+                )
             self._stop_poll.wait(wait_s)
+
+    def _reauthenticate_api(self) -> bool:
+        try:
+            self._api.login()
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            _LOGGER.warning("Motion event reauthentication failed: %s", exc)
+            return False
+
+        client = self._client
+        if client is not None:
+            client.username_pw_set(
+                self._api.access_id,
+                self._api.mqtt_signature,
+            )
+        _LOGGER.info("Motion event cloud session reauthenticated")
+        return True
 
     def _remember_event(self, device_id: str, event_id: str) -> bool:
         """Return True first time a cloud event key is seen."""
@@ -242,13 +263,13 @@ class MotionEventListener:
 
     def _poll_new_event_summary(
         self, devices: set[tuple[str, str]], dispatch: bool
-    ) -> None:
+    ) -> bool:
         registered_ids = {device_id for device_id, _sn in devices}
         try:
             events = self._api.get_new_device_events()
         except (OSError, RuntimeError, ValueError, KeyError) as exc:
             _LOGGER.debug("New-event summary poll failed: %s", exc)
-            return
+            return False
         for raw_event in events:
             device_id = str(
                 raw_event.get("deviceID")
@@ -263,8 +284,9 @@ class MotionEventListener:
                 continue
             if dispatch:
                 self._handle_payload(json.dumps(raw_event).encode())
+        return True
 
-    def _poll_device_events(self, dispatch: bool) -> None:
+    def _poll_device_events(self, dispatch: bool) -> bool:
         """Poll each registered device's event log and dispatch new motions."""
         day = time.strftime("%Y%m%d")
         if day != self._poll_day:
@@ -276,14 +298,16 @@ class MotionEventListener:
         with self._lock:
             devices = {(dev_id, sn) for dev_id, sn, _cb in self._callbacks}
         if not devices:
-            return
+            return True
 
+        event_log_ok = False
         for device_id, _sn in devices:
             try:
                 events = self._api.get_device_events(device_id, day)
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 _LOGGER.debug("Event list poll failed for %s: %s", device_id, exc)
                 continue
+            event_log_ok = True
             for raw_event in events:
                 if not isinstance(raw_event, dict):
                     continue
@@ -302,9 +326,10 @@ class MotionEventListener:
                 if dispatch:
                     self._handle_payload(json.dumps(raw_event).encode())
 
-        self._poll_new_event_summary(devices, dispatch)
+        summary_ok = self._poll_new_event_summary(devices, dispatch)
 
         self._trim_seen_events()
+        return event_log_ok or summary_ok
 
     def _matching_callbacks(
         self, device_id: str, license_id: str
