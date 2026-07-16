@@ -119,6 +119,12 @@ behaves as a read/unread flag rather than the alarm type.
 `MotionEventListener` polls every `ALARM_POLL_INTERVAL` (15 s), so worst-case
 motion latency without MQTT is ~15 s.
 
+All cloud requests have finite connect/read timeouts. If both event-log
+sources fail, the account-scoped listener performs a fresh platform login,
+updates the MQTT credentials used for later reconnects, and resumes polling.
+This prevents an expired token or a wedged HTTPS connection from leaving
+motion delivery permanently stopped until Home Assistant restarts.
+
 ## Practical guidance
 
 - If MQTT connect logs `Bad user name or password`, low-latency MQTT push is

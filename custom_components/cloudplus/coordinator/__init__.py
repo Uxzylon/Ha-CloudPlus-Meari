@@ -240,8 +240,8 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 self._api = api
                 self._available = True
                 self._fire_update()
-                self._start_motion_listener(api)
                 try:
+                    self._start_motion_listener(api)
                     self._session_loop()
                 finally:
                     self._stop_motion_listener()
@@ -249,9 +249,16 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                     self._api = None
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 _LOGGER.warning("Coordinator session loop failed: %s", exc)
-                self._available = False
-                self._set_camera_awake(False)
-                self._fire_update()
+            except Exception:  # pylint: disable=broad-exception-caught
+                # This is the final boundary of a daemon thread. Letting an
+                # unforeseen library/protocol exception escape would freeze
+                # every entity at its last value until HA restarts.
+                _LOGGER.exception("Unexpected coordinator session loop failure")
+            self._available = False
+            self._set_motion(False)
+            self._set_camera_awake(False)
+            self._fire_update()
+            if self._running:
                 time.sleep(2)
 
     def _session_loop(self) -> None:

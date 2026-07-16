@@ -153,6 +153,9 @@ source-idle window before reconnecting.
 
 - Maintain one P2P session per camera stream and fan out the same MPEG-TS
   TCP stream to all consumers.
+- The local TCP listener is health-checked whenever HA requests a stream
+  source. If its accept thread stopped unexpectedly, it is recreated and HA
+  receives the new port instead of repeatedly opening a dead endpoint.
 - New clients need **PAT/PMT plus a current keyframe seed** before live
   packets.
 - Idle streams reuse the latest keyframe/still with the same advertised

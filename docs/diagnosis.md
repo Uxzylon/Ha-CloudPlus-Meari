@@ -64,6 +64,16 @@ python debug.py --debug stream … 2>&1 | grep -E \
 | `Restarting stale` | HA coordinator watchdog — the engine didn't deliver frames in time. If you see this without retries, dormancy-wake is broken (see [streaming.md](streaming.md)). |
 | `skipped gaps` | KCP-level recovery skipped over a missing range to resume at a clean IVA/VVP boundary. A handful is fine; a flood means persistent loss. |
 | `source-idle` | The reactive `START_LIVE` retry fired because video stopped flowing. Repeated retries mean the camera is silent at the source. |
+| `Unexpected coordinator session loop failure` | A per-camera worker hit an unforeseen error. Its final recovery boundary clears stale awake/motion state and starts a fresh authenticated session; entities should not remain frozen. |
+| `Motion event cloud session reauthenticated` | Both motion polling endpoints failed and the listener renewed its cloud credentials before continuing. |
+| `Local stream listener stopped` | The HA-facing TCP accept loop exited unexpectedly. The next stream-source request recreates it on a healthy port. |
+
+HA's own `Stream ended; no additional packets` message means that one stream
+consumer ran out of MPEG-TS data; `Connection refused` means its saved local
+TCP endpoint was no longer listening. These errors are contained by HA's
+stream worker and do not themselves stop coordinator polling. The integration
+health-checks the listener on the next source request, while coordinator and
+HTTP recovery are responsible for keeping entity updates alive.
 
 ## Quality matters
 
