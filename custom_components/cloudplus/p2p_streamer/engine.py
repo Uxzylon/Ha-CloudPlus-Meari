@@ -91,7 +91,10 @@ class P2PStreamer(LiveSessionMixin):
         self._webrtc_session_index = _next_session_index(api)
         self._vvp_stream_id = stream_id_for_quality(device, vvp_quality)
         app_profile = str(getattr(api, "app_profile", "") or "").lower()
-        self._vvp_stream_flag = 0 if app_profile == "cloudedge" else 1
+        default_stream_flag = 0 if app_profile == "cloudedge" else 1
+        self._vvp_stream_flag = int(
+            getattr(api, "vvp_stream_flag", default_stream_flag)
+        )
 
         self.on_video = on_video
         self.on_audio = on_audio

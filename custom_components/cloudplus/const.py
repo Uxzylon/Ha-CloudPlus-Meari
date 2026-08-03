@@ -19,7 +19,13 @@ DEFAULT_MOTION_TIMEOUT = 120
 DEFAULT_COUNTRY_CODE = "FR"
 DEFAULT_PHONE_CODE = "33"
 DEFAULT_APP_PROFILE = "cloudedge"
-APP_PROFILES = ["cloudedge", "cloudplus", "iegeek"]
+APP_PROFILE_NAMES = {
+    "cloudedge": "CloudEdge",
+    "cloudplus": "CloudPlus / CloudHome",
+    "iegeek": "ieGeek",
+    "arenti": "Arenti",
+}
+APP_PROFILES = list(APP_PROFILE_NAMES)
 
 # CloudEdge / Meari API
 PARTNER_ID = "77"

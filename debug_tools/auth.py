@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .common import AUTH_DEFAULTS, AUTH_ENV_KEYS, REPO_ROOT
+from .common import AUTH_DEFAULTS, AUTH_ENV_KEYS, AUTH_PROFILES, REPO_ROOT
 
 
 def _parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -102,9 +102,11 @@ def _prepare_auth_args(
     env_only_auth = _build_auth_values(args, env_auth, use_cli=False)
 
     profile = str(primary_auth.get("profile") or "").lower()
-    if profile not in {"cloudedge", "cloudplus", "iegeek"}:
+    if profile not in AUTH_PROFILES:
         parser.error(
-            "Invalid profile. Use --profile cloudedge|cloudplus|iegeek or set PROFILE/CLOUDPLUS_PROFILE/CLOUDEDGE_PROFILE in .env."
+            "Invalid profile. Use --profile "
+            f"{'|'.join(AUTH_PROFILES)} or set "
+            "PROFILE/CLOUDPLUS_PROFILE/CLOUDEDGE_PROFILE in .env."
         )
 
     if not primary_auth.get("email") or not primary_auth.get("password"):

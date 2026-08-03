@@ -1,7 +1,7 @@
 # Protocol Reference
 
 Wire-level notes for the Meari / VVP / PPStrong stack used by CloudEdge,
-CloudPlus, Meari and ieGeek battery cameras. These are the load-bearing
+CloudPlus, Meari, ieGeek and Arenti battery cameras. These are the load-bearing
 facts the integration relies on — change them at your peril.
 
 For control-flow patterns built on top of these primitives (live-start
@@ -17,7 +17,8 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - App profile selects both the HTTP host family and the VVP stream flag:
   - `cloudedge` → CloudEdge app/API, VVP stream flag `0`
   - `cloudplus` → CloudPlus / CloudHome app/API, VVP stream flag `1`
-  - `iegeek` → ieGeek-branded host family, behaves like `cloudedge`
+  - `iegeek` → ieGeek app identity, VVP stream flag `1`
+  - `arenti` → Arenti app/API host family, VVP stream flag `1`
 - Login starts with the app redirect endpoint, then normal signed Meari API
   requests fetch device lists, IoT config, model values, wake controls and
   OpenAPI credentials.
@@ -137,7 +138,8 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   - `0x888e` — heartbeat
 - `START_LIVE` uses parameter `8`, the camera host key, a formatted licence
   ID, a stream id, and the app-profile stream flag (`0` cloudedge / `1`
-  cloudplus, see [Discovery](#discovery-and-http-api)).
+  cloudplus, ieGeek and Arenti; see
+  [Discovery](#discovery-and-http-api)).
 - Quality stream ids:
   - explicit profiles → `100 + profile_id`
   - app `AUTO` → stream id `105`

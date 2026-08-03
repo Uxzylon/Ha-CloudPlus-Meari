@@ -9,7 +9,7 @@
           "password": "Password",
           "country_code": "Country code (ISO, e.g. FR, US)",
           "phone_code": "Phone code (e.g. 33, 1)",
-          "app_profile": "App profile (cloudedge/cloudplus)"
+          "app_profile": "App used to register the account"
         }
       },
       "camera": {

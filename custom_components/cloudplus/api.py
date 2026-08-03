@@ -14,6 +14,7 @@ import logging
 import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -46,31 +47,32 @@ USER_AGENT = (
 )
 HTTP_TIMEOUT = (10.0, 30.0)
 
-APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
-    "cloudplus": {
-        "source_app": "77",
-        "app_ver": "6.0.1",
-        "app_ver_code": "1029",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "77",
-        "ttid": TTID,
-    },
-    "cloudedge": {
-        "source_app": "8",
-        "app_ver": "6.1.4",
-        "app_ver_code": "616",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "8",
-        "ttid": TTID,
-    },
-    "iegeek": {
-        "source_app": "81",
-        "app_ver": "5.5.2",
-        "app_ver_code": "552",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "81",
-        "ttid": TTID,
-    },
+
+@dataclass(frozen=True, slots=True)
+class AppProfileConfig:
+    """Wire identity and behavior of one official Meari-family app."""
+
+    source_app: str
+    app_ver: str
+    app_ver_code: str
+    redirect_url: str
+    partner_id: str
+    ttid: str = TTID
+    encrypted_login: bool = False
+    vvp_stream_flag: int = 1
+
+
+APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
+    "cloudplus": AppProfileConfig("77", "6.0.1", "1029", REDIRECT_URL, "77"),
+    "cloudedge": AppProfileConfig(
+        "8", "6.1.4", "616", REDIRECT_URL, "8", encrypted_login=True,
+        vvp_stream_flag=0,
+    ),
+    "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
+    "arenti": AppProfileConfig(
+        "39", "5.0.3", "168", "https://apis.arenti.net", "39",
+        encrypted_login=True,
+    ),
 }
 
 PLATFORM_REGIONS = {"eu", "us", "as", "cn"}
@@ -242,12 +244,7 @@ class MeariApiClient:
 
         # Active app profile settings (selected during login)
         default_profile = APP_PROFILE_CONFIG["cloudplus"]
-        self._source_app = default_profile["source_app"]
-        self._app_ver = default_profile["app_ver"]
-        self._app_ver_code = default_profile["app_ver_code"]
-        self._redirect_url = default_profile["redirect_url"]
-        self._partner_id = default_profile["partner_id"]
-        self._ttid = default_profile["ttid"]
+        self._apply_profile(default_profile)
 
     def _http_get(self, url: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", HTTP_TIMEOUT)
@@ -263,12 +260,17 @@ class MeariApiClient:
         cfg = APP_PROFILE_CONFIG.get(profile)
         if not cfg:
             raise ValueError(f"Unknown app profile: {profile}")
-        self._source_app = cfg["source_app"]
-        self._app_ver = cfg["app_ver"]
-        self._app_ver_code = cfg["app_ver_code"]
-        self._redirect_url = cfg["redirect_url"]
-        self._partner_id = cfg["partner_id"]
-        self._ttid = cfg["ttid"]
+        self._apply_profile(cfg)
+
+    def _apply_profile(self, cfg: AppProfileConfig) -> None:
+        self._source_app = cfg.source_app
+        self._app_ver = cfg.app_ver
+        self._app_ver_code = cfg.app_ver_code
+        self._redirect_url = cfg.redirect_url
+        self._partner_id = cfg.partner_id
+        self._ttid = cfg.ttid
+        self._encrypted_login = cfg.encrypted_login
+        self.vvp_stream_flag = cfg.vvp_stream_flag
 
     def _apply_platform_defaults(self) -> None:
         code = _region_code(self.api_server, self.openapi_server, self.platform_domain)
@@ -491,8 +493,7 @@ class MeariApiClient:
                 "iotType": "4",
                 "equipmentNo": " ",
             }
-            if self._source_app == "8":
-                # CloudEdge app sends this flag explicitly.
+            if self._encrypted_login:
                 params["encryStatus"] = "1"
 
             headers = self._ca_headers(path)
