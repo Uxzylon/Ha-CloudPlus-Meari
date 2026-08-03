@@ -106,6 +106,8 @@ class CoordinatorStateMixin:
 
     @property
     def stream_port(self) -> int:
+        if self._running:
+            return self._stream_server.ensure_running()
         return self._stream_server.port
 
     @property
@@ -348,6 +350,20 @@ class CoordinatorStateMixin:
                 )
         return changed
 
+    def _reauthenticate_api(self, api: MeariApiClient, context: str) -> bool:
+        try:
+            api.login()
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            _LOGGER.debug(
+                "%s reauthentication failed for %s: %s",
+                context,
+                self._sn_num,
+                exc,
+            )
+            return False
+        _LOGGER.info("%s reauthenticated for %s", context, self._sn_num)
+        return True
+
     def _poll_battery(self) -> None:
         api = self._api
         if not self._is_snap or api is None:
@@ -366,10 +382,7 @@ class CoordinatorStateMixin:
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 if attempt == 0:
                     _LOGGER.debug("Battery poll retry for %s: %s", self._sn_num, exc)
-                    try:
-                        api.login()
-                    except (OSError, RuntimeError, ValueError, KeyError):
-                        pass
+                    self._reauthenticate_api(api, "Battery poll")
                     continue
                 _LOGGER.debug("Battery poll failed for %s: %s", self._sn_num, exc)
 
@@ -377,11 +390,18 @@ class CoordinatorStateMixin:
         api = self._api
         if api is None or not api.openapi_server:
             return
-        try:
-            iot = api.get_device_iot_config(self._sn_num)
-        except (OSError, RuntimeError, ValueError, KeyError) as exc:
-            _LOGGER.debug("Status poll failed for %s: %s", self._sn_num, exc)
-            return
+        iot: dict[str, Any] = {}
+        for attempt in range(2):
+            try:
+                iot = api.get_device_iot_config(self._sn_num)
+                break
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                if attempt == 0:
+                    _LOGGER.debug("Status poll retry for %s: %s", self._sn_num, exc)
+                    self._reauthenticate_api(api, "Status poll")
+                    continue
+                _LOGGER.debug("Status poll failed for %s: %s", self._sn_num, exc)
+                return
 
         changed = self._apply_iot_values(iot)
         changed = self._apply_battery_info(iot) or changed

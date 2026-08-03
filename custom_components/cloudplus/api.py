@@ -12,7 +12,9 @@ import hmac
 import json
 import logging
 import random
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -43,32 +45,34 @@ USER_AGENT = (
     "Mozilla/5.0 (Linux; U; Android 14; en-us; Pixel Build/UP1A.231105.001) "
     "AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1"
 )
+HTTP_TIMEOUT = (10.0, 30.0)
 
-APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
-    "cloudplus": {
-        "source_app": "77",
-        "app_ver": "6.0.1",
-        "app_ver_code": "1029",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "77",
-        "ttid": TTID,
-    },
-    "cloudedge": {
-        "source_app": "8",
-        "app_ver": "6.1.4",
-        "app_ver_code": "616",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "8",
-        "ttid": TTID,
-    },
-    "iegeek": {
-        "source_app": "81",
-        "app_ver": "5.5.2",
-        "app_ver_code": "552",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "81",
-        "ttid": TTID,
-    },
+
+@dataclass(frozen=True, slots=True)
+class AppProfileConfig:
+    """Wire identity and behavior of one official Meari-family app."""
+
+    source_app: str
+    app_ver: str
+    app_ver_code: str
+    redirect_url: str
+    partner_id: str
+    ttid: str = TTID
+    encrypted_login: bool = False
+    vvp_stream_flag: int = 1
+
+
+APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
+    "cloudplus": AppProfileConfig("77", "6.0.1", "1029", REDIRECT_URL, "77"),
+    "cloudedge": AppProfileConfig(
+        "8", "6.1.4", "616", REDIRECT_URL, "8", encrypted_login=True,
+        vvp_stream_flag=0,
+    ),
+    "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
+    "arenti": AppProfileConfig(
+        "39", "5.0.3", "168", "https://apis.arenti.net", "39",
+        encrypted_login=True,
+    ),
 }
 
 PLATFORM_REGIONS = {"eu", "us", "as", "cn"}
@@ -219,6 +223,7 @@ class MeariApiClient:
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        self._request_lock = threading.RLock()
 
         self.api_server: str = ""
         self.user_id: Optional[int] = None
@@ -239,23 +244,33 @@ class MeariApiClient:
 
         # Active app profile settings (selected during login)
         default_profile = APP_PROFILE_CONFIG["cloudplus"]
-        self._source_app = default_profile["source_app"]
-        self._app_ver = default_profile["app_ver"]
-        self._app_ver_code = default_profile["app_ver_code"]
-        self._redirect_url = default_profile["redirect_url"]
-        self._partner_id = default_profile["partner_id"]
-        self._ttid = default_profile["ttid"]
+        self._apply_profile(default_profile)
+
+    def _http_get(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.get(url, **kwargs)
+
+    def _http_post(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.post(url, **kwargs)
 
     def _select_profile(self, profile: str) -> None:
         cfg = APP_PROFILE_CONFIG.get(profile)
         if not cfg:
             raise ValueError(f"Unknown app profile: {profile}")
-        self._source_app = cfg["source_app"]
-        self._app_ver = cfg["app_ver"]
-        self._app_ver_code = cfg["app_ver_code"]
-        self._redirect_url = cfg["redirect_url"]
-        self._partner_id = cfg["partner_id"]
-        self._ttid = cfg["ttid"]
+        self._apply_profile(cfg)
+
+    def _apply_profile(self, cfg: AppProfileConfig) -> None:
+        self._source_app = cfg.source_app
+        self._app_ver = cfg.app_ver
+        self._app_ver_code = cfg.app_ver_code
+        self._redirect_url = cfg.redirect_url
+        self._partner_id = cfg.partner_id
+        self._ttid = cfg.ttid
+        self._encrypted_login = cfg.encrypted_login
+        self.vvp_stream_flag = cfg.vvp_stream_flag
 
     def _apply_platform_defaults(self) -> None:
         code = _region_code(self.api_server, self.openapi_server, self.platform_domain)
@@ -357,7 +372,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -368,7 +383,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.post(url, data=params, headers=headers)
+        r = self._http_post(url, data=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -391,7 +406,7 @@ class MeariApiClient:
         params["expires"] = timeout
         params["signature"] = sig
         url = self.openapi_server + path
-        r = self.session.get(url, params=params)
+        r = self._http_get(url, params=params)
         r.raise_for_status()
         return r.json()
 
@@ -401,11 +416,12 @@ class MeariApiClient:
 
     def login(self) -> None:
         """Full login: redirect → login → IoT config → device list."""
-        self._select_profile(self.app_profile)
-        self._redirect()
-        self._do_login()
-        self._get_iot_config()
-        self._get_devices()
+        with self._request_lock:
+            self._select_profile(self.app_profile)
+            self._redirect()
+            self._do_login()
+            self._get_iot_config()
+            self._get_devices()
 
     def _redirect(self) -> None:
         ts = int(time.time() * 1000)
@@ -435,7 +451,7 @@ class MeariApiClient:
         path = "/ppstrongs/redirect"
         headers = self._ca_headers(path)
         url = self._redirect_url + path
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         data = r.json()
         if data.get("resultCode") != "1001":
@@ -477,12 +493,11 @@ class MeariApiClient:
                 "iotType": "4",
                 "equipmentNo": " ",
             }
-            if self._source_app == "8":
-                # CloudEdge app sends this flag explicitly.
+            if self._encrypted_login:
                 params["encryStatus"] = "1"
 
             headers = self._ca_headers(path)
-            r = self.session.post(url, data=params, headers=headers)
+            r = self._http_post(url, data=params, headers=headers)
             r.raise_for_status()
             data = r.json()
 
@@ -735,7 +750,7 @@ class MeariApiClient:
         """
         data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
         if str(data.get("resultCode", "")) != "1001":
-            return []
+            raise RuntimeError(f"New-device event summary failed: {data}")
         devices = data.get("result", {}).get("device")
         if isinstance(devices, list):
             return [event for event in devices if isinstance(event, dict)]
@@ -754,19 +769,16 @@ class MeariApiClient:
 
     def get_battery_info(self, sn_num: str) -> dict[str, Any]:
         """Get battery info for a device. Returns {code: value} dict."""
-        try:
-            sn_map = {sn_num: BATTERY_CODES}
-            data = self._get(
-                "/v2/app/iot/model/get/batch",
-                {
-                    "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
-                },
-            )
-            if data.get("resultCode") == "1001":
-                return data.get("result", {}).get(sn_num, {})
-        except (OSError, ValueError, KeyError, RuntimeError) as e:
-            _LOGGER.debug("Battery info failed: %s", e)
-        return {}
+        sn_map = {sn_num: BATTERY_CODES}
+        data = self._get(
+            "/v2/app/iot/model/get/batch",
+            {
+                "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
+            },
+        )
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Battery info failed: {data}")
+        return data.get("result", {}).get(sn_num, {})
 
     # ------------------------------------------------------------------
     # Lamp / LED control via OpenAPI device config
@@ -792,6 +804,8 @@ class MeariApiClient:
                 "target": "server",
             },
         )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT config failed: {resp}")
         return resp.get("iot", {})
 
     def get_device_iot_values(
@@ -814,6 +828,8 @@ class MeariApiClient:
                 "deviceid": dev_uuid,
             },
         )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT values failed: {resp}")
         return resp.get("iot", {})
 
     def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
@@ -901,7 +917,7 @@ class MeariApiClient:
                     "sid": sid,
                 }
                 url = self.openapi_server + "/openapi/device/awaken"
-                r = self.session.get(url, params=params)
+                r = self._http_get(url, params=params)
                 if r.status_code == 200:
                     success = True
             except OSError as e:
@@ -926,7 +942,7 @@ class MeariApiClient:
         if not url:
             return None
         try:
-            r = self.session.get(url, timeout=10)
+            r = self._http_get(url, timeout=10)
             if r.status_code == 200 and len(r.content) > 100:
                 return r.content
         except OSError:

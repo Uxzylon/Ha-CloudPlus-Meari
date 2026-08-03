@@ -13,8 +13,8 @@ means the doc is broken — fix it now, not later.
 ## What this is
 
 A Home Assistant custom integration for Meari-family battery cameras
-(CloudEdge / CloudPlus / Meari / ieGeek). Pure asyncio, no build step, no
-test suite, runtime is HA. Validate with [debug.py](debug.py).
+(CloudEdge / CloudPlus / Meari / ieGeek / Arenti). Pure asyncio, no build
+step, no test suite, runtime is HA. Validate with [debug.py](debug.py).
 
 ## Repo map
 

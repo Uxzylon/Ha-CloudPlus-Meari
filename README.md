@@ -3,14 +3,14 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Home Assistant custom integration for **CloudEdge / CloudPlus / Meari**
+A Home Assistant custom integration for **CloudEdge / CloudPlus / Meari / Arenti**
 battery-powered Wi-Fi cameras.
 
 These cameras are sold under many brand names (CloudEdge, CloudPlus, Meari,
-ieGeek, etc.) and all use the Meari cloud platform with the VVP / PPStrong P2P
-video protocol. This integration talks to those servers and to the cameras
-directly using a fully reverse-engineered pipeline — no third-party bridge,
-no Frigate plugin, no extra container needed.
+ieGeek, Arenti, etc.) and all use the Meari cloud platform with the VVP /
+PPStrong P2P video protocol. This integration talks to those servers and to
+the cameras directly using a fully reverse-engineered pipeline — no
+third-party bridge, no Frigate plugin, no extra container needed.
 
 > ⚠️ **Unofficial.** Not affiliated with CloudEdge, Meari, or any reseller.
 > Use at your own risk; cloud APIs can change without notice.
@@ -50,8 +50,8 @@ no Frigate plugin, no extra container needed.
 ## Requirements
 
 - Home Assistant **2024.1+**
-- A CloudEdge / CloudPlus / Meari / ieGeek account with at least one camera
-  already paired in the official app
+- A CloudEdge / CloudPlus / Meari / ieGeek / Arenti account with at least one
+  camera already paired in the official app
 - `ffmpeg` (bundled in HAOS, HA Container, and HA Supervised)
 - Outbound internet access to the Meari cloud (HTTPS + MQTT/TLS) and UDP/TCP
   to the camera (LAN or TURN-relayed)
@@ -89,7 +89,7 @@ no Frigate plugin, no extra container needed.
    | Password      | Account password. |
    | Country code  | e.g. `FR`, `US`, `DE` — matches your app region. |
    | Phone code    | International dial code (e.g. `33` for France). |
-   | App profile   | `cloudedge`, `cloudplus`, or `iegeek` — pick the brand of the app you registered with. |
+   | App profile   | CloudEdge, CloudPlus / CloudHome, ieGeek, or Arenti — pick the app you registered with. |
 
 4. All cameras on the account are discovered and added as individual devices.
 
@@ -360,6 +360,6 @@ Before opening a PR, please:
 
 ## License
 
-[MIT](LICENSE) — see file for details. CloudEdge™, CloudPlus™, Meari™ and
-ieGeek™ are trademarks of their respective owners; this project is not
-endorsed by any of them.
+[MIT](LICENSE) — see file for details. CloudEdge™, CloudPlus™, Meari™,
+ieGeek™, and Arenti™ are trademarks of their respective owners; this project
+is not endorsed by any of them.
