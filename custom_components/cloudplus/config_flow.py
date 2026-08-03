@@ -16,6 +16,7 @@ from homeassistant.config_entries import (
 from homeassistant.helpers import selector
 
 from .const import (
+    APP_PROFILE_NAMES,
     APP_PROFILES,
     CONF_APP_PROFILE,
     CONF_COUNTRY_CODE,
@@ -46,7 +47,7 @@ def _app_profile_selector() -> selector.SelectSelector:
     return selector.SelectSelector(
         selector.SelectSelectorConfig(
             options=[
-                selector.SelectOptionDict(value=p, label=p.capitalize())
+                selector.SelectOptionDict(value=p, label=APP_PROFILE_NAMES[p])
                 for p in APP_PROFILES
             ],
             mode=selector.SelectSelectorMode.DROPDOWN,
