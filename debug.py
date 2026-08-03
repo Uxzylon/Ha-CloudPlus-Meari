@@ -11,6 +11,7 @@ import sys
 from typing import IO
 
 from debug_tools.auth import _prepare_auth_args
+from debug_tools.common import AUTH_PROFILES
 from debug_tools.list_cmd import cmd_list
 from debug_tools.stream_cmd import cmd_stream
 
@@ -41,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phone-code", help="Phone code; defaults to .env or 33")
     parser.add_argument(
         "--profile",
-        choices=["cloudedge", "cloudplus", "iegeek"],
+        choices=AUTH_PROFILES,
         help="App profile; defaults to .env or cloudedge",
     )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logs")

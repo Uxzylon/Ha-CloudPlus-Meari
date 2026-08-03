@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+AUTH_PROFILES = ("cloudedge", "cloudplus", "iegeek", "arenti")
 AUTH_DEFAULTS = {
     "country_code": "FR",
     "phone_code": "33",
