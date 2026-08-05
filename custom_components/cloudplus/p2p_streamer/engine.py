@@ -397,78 +397,93 @@ class P2PStreamer(LiveSessionMixin):
         openapi_hint = getattr(self._api, "openapi_server", None)
         api_hint = getattr(self._api, "api_server", None)
         client_id_hint = self._client_uuid
-        candidates = _resolve_signaling_server_candidates(
-            platform_domain_hint=platform_hint,
-            openapi_server_hint=openapi_hint,
-            api_server_hint=api_hint,
-            client_id_hint=client_id_hint,
-        )
         last_error: Exception | None = None
-        for sig_ip, sig_port in candidates:
-            sig = None
-            self._last_signaling_endpoint = (sig_ip, sig_port)
-            try:
+        attempted: set[tuple[str, int]] = set()
+        for discovery_index, discovery_client_id in enumerate(
+            (client_id_hint, None)
+        ):
+            candidates = _resolve_signaling_server_candidates(
+                platform_domain_hint=platform_hint,
+                openapi_server_hint=openapi_hint,
+                api_server_hint=api_hint,
+                client_id_hint=discovery_client_id,
+            )
+            candidates = [
+                candidate for candidate in candidates if candidate not in attempted
+            ]
+            if discovery_index and candidates:
                 _LOGGER.info(
-                    "Connecting to signaling %s:%d (profile=%s, stream_id=%s)",
-                    sig_ip,
-                    sig_port,
-                    getattr(self._api, "app_profile", "unknown"),
-                    self._vvp_stream_id,
+                    "Retrying signaling discovery without client UUID after %s",
+                    last_error or "no UUID-aware endpoints were discovered",
                 )
-                sig = MsgSvrClient(
-                    sig_ip,
-                    sig_port,
-                    session_index=self._webrtc_session_index,
-                )
-                self._active_sig = sig
-                sig.connect(timeout_s=SIGNALING_CONNECT_TIMEOUT_S)
-                return self._do_stream(
-                    sig,
-                    host_key,
-                    allow_auth_fallback=allow_auth_fallback,
-                )
-            except SignalingClusterMiss as err:
-                last_error = err
-                _forget_signaling_endpoint(
-                    self._last_signaling_endpoint,
-                    platform_domain_hint=platform_hint,
-                    openapi_server_hint=openapi_hint,
-                    api_server_hint=api_hint,
-                    client_id_hint=client_id_hint,
-                )
-                if not self._running:
-                    break
-                _LOGGER.info("%s; trying next signaling candidate", err)
-            except (OSError, RuntimeError, ValueError, KeyError) as err:
-                last_error = err
-                if not self._running:
-                    _LOGGER.debug("P2P session interrupted during stop: %s", err)
-                    break
-                _forget_signaling_endpoint(
-                    self._last_signaling_endpoint,
-                    platform_domain_hint=platform_hint,
-                    openapi_server_hint=openapi_hint,
-                    api_server_hint=api_hint,
-                    client_id_hint=client_id_hint,
-                )
-                _LOGGER.debug(
-                    "Signaling candidate %s:%d failed: %s",
-                    sig_ip,
-                    sig_port,
-                    err,
-                )
-            finally:
-                self._log_session_done()
-                self.awaiting_wake = False
-                self._active_sig = None
-                self._active_sock = None
-                self._active_stop_live = None
-                if sig is not None:
-                    try:
-                        sig.send_logout(self._device_uuid)
-                    except OSError:
-                        pass
-                    sig.close()
+            for sig_ip, sig_port in candidates:
+                attempted.add((sig_ip, sig_port))
+                sig = None
+                self._last_signaling_endpoint = (sig_ip, sig_port)
+                try:
+                    _LOGGER.info(
+                        "Connecting to signaling %s:%d (profile=%s, stream_id=%s)",
+                        sig_ip,
+                        sig_port,
+                        getattr(self._api, "app_profile", "unknown"),
+                        self._vvp_stream_id,
+                    )
+                    sig = MsgSvrClient(
+                        sig_ip,
+                        sig_port,
+                        session_index=self._webrtc_session_index,
+                    )
+                    self._active_sig = sig
+                    sig.connect(timeout_s=SIGNALING_CONNECT_TIMEOUT_S)
+                    return self._do_stream(
+                        sig,
+                        host_key,
+                        allow_auth_fallback=allow_auth_fallback,
+                    )
+                except SignalingClusterMiss as err:
+                    last_error = err
+                    _forget_signaling_endpoint(
+                        self._last_signaling_endpoint,
+                        platform_domain_hint=platform_hint,
+                        openapi_server_hint=openapi_hint,
+                        api_server_hint=api_hint,
+                        client_id_hint=discovery_client_id,
+                    )
+                    if not self._running:
+                        break
+                    _LOGGER.info("%s; trying next signaling candidate", err)
+                except (OSError, RuntimeError, ValueError, KeyError) as err:
+                    last_error = err
+                    if not self._running:
+                        _LOGGER.debug("P2P session interrupted during stop: %s", err)
+                        break
+                    _forget_signaling_endpoint(
+                        self._last_signaling_endpoint,
+                        platform_domain_hint=platform_hint,
+                        openapi_server_hint=openapi_hint,
+                        api_server_hint=api_hint,
+                        client_id_hint=discovery_client_id,
+                    )
+                    _LOGGER.debug(
+                        "Signaling candidate %s:%d failed: %s",
+                        sig_ip,
+                        sig_port,
+                        err,
+                    )
+                finally:
+                    self._log_session_done()
+                    self.awaiting_wake = False
+                    self._active_sig = None
+                    self._active_sock = None
+                    self._active_stop_live = None
+                    if sig is not None:
+                        try:
+                            sig.send_logout(self._device_uuid)
+                        except OSError:
+                            pass
+                        sig.close()
+            if not self._running:
+                break
 
         if last_error is not None and self._running:
             _LOGGER.warning("All signaling candidates failed: %s", last_error)
