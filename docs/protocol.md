@@ -33,9 +33,16 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - The official apps discover MsgSvr roots through the **native UDP root
   protocol on port 9253**, instead of hardcoding signaling servers.
 - The request is an encrypted native message with action/config data
-  including the user/client identity and target platform region.
+  and may include a stable client UUID or target platform region. Official
+  captures also use the generic form with neither field; in that form the
+  destination root domain selects the region.
 - The response contains one or more MsgSvr endpoints. Those endpoints become
   the TCP signaling candidates.
+- The integration tries UUID-aware discovery first for newer shared cameras.
+  If those candidates reject the device or cannot connect, it repeats the
+  native discovery without the synthesized UUID. This avoids a UUID-selected
+  shard masking the account/device cluster while preserving compatibility
+  with cameras that require stable app-like identity.
 - Prefer root discovery over static IP fallbacks so new regions and server
   rotations keep working without code changes.
 
@@ -60,8 +67,9 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   rather than abandoning the session.
 - **Cross-region shared devices**: a device may live on a different cluster
   than its account region (e.g. an AU account holding a device whose home
-  cluster is elsewhere). When every account-region candidate reports the
-  device offline/unknown, probe `{cn,as,eu,us}ce.mearicloud.com` lazily.
+  cluster is elsewhere). When UUID-aware candidates report the device
+  offline/unknown, repeat generic discovery against
+  `{cn,as,eu,us}ce.mearicloud.com` and try the distinct regional endpoints.
 
 ## Direct-LAN punch
 
