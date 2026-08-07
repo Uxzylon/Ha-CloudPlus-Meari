@@ -81,7 +81,9 @@ class P2PStreamer(LiveSessionMixin):
         self._api = api
         self._device = device
         self._sn_num = device["snNum"]
-        self._device_uuid = format_sn(str(self._sn_num))
+        self._device_uuid = str(device.get("deviceUUID") or "").strip()
+        if not self._device_uuid:
+            self._device_uuid = format_sn(str(self._sn_num))
         self._is_snap = str(device.get("_category", "")).lower() == "snap"
         self._host_key = device.get("hostKey", "")
         self._video_password = (video_password or "").strip()
@@ -398,18 +400,19 @@ class P2PStreamer(LiveSessionMixin):
         api_hint = getattr(self._api, "api_server", None)
         client_id_hint = self._client_uuid
         last_error: Exception | None = None
-        attempted: set[tuple[str, int]] = set()
-        for discovery_index, discovery_client_id in enumerate(
-            (client_id_hint, None)
-        ):
+        attempted: set[tuple[str, int, bool]] = set()
+        for discovery_index, discovery_client_id in enumerate((client_id_hint, None)):
             candidates = _resolve_signaling_server_candidates(
                 platform_domain_hint=platform_hint,
                 openapi_server_hint=openapi_hint,
                 api_server_hint=api_hint,
                 client_id_hint=discovery_client_id,
             )
+            registration_key = bool(discovery_client_id)
             candidates = [
-                candidate for candidate in candidates if candidate not in attempted
+                candidate
+                for candidate in candidates
+                if (*candidate, registration_key) not in attempted
             ]
             if discovery_index and candidates:
                 _LOGGER.info(
@@ -417,16 +420,18 @@ class P2PStreamer(LiveSessionMixin):
                     last_error or "no UUID-aware endpoints were discovered",
                 )
             for sig_ip, sig_port in candidates:
-                attempted.add((sig_ip, sig_port))
+                attempted.add((sig_ip, sig_port, registration_key))
                 sig = None
                 self._last_signaling_endpoint = (sig_ip, sig_port)
                 try:
                     _LOGGER.info(
-                        "Connecting to signaling %s:%d (profile=%s, stream_id=%s)",
+                        "Connecting to signaling %s:%d "
+                        "(profile=%s, stream_id=%s, client_uuid=%s)",
                         sig_ip,
                         sig_port,
                         getattr(self._api, "app_profile", "unknown"),
                         self._vvp_stream_id,
+                        "stable" if discovery_client_id else "server-assigned",
                     )
                     sig = MsgSvrClient(
                         sig_ip,
@@ -439,6 +444,7 @@ class P2PStreamer(LiveSessionMixin):
                         sig,
                         host_key,
                         allow_auth_fallback=allow_auth_fallback,
+                        client_uuid=discovery_client_id,
                     )
                 except SignalingClusterMiss as err:
                     last_error = err
@@ -512,17 +518,19 @@ class P2PStreamer(LiveSessionMixin):
         host_key: str,
         *,
         allow_auth_fallback: bool = False,
+        client_uuid: str | None = None,
     ) -> tuple[int, int]:
         api = self._api
         device_uuid = self._device_uuid
 
-        app_ver = str(getattr(api, "_app_ver", "5.9.2") or "5.9.2")
+        base_app_ver = str(getattr(api, "_app_ver", "") or "5.9.2")
+        app_ver = str(getattr(api, "_signaling_app_ver", "") or f"{base_app_ver}a16")
         sig.register(
             client_id=self._client_id,
             brand=str(getattr(api, "_source_app", "77") or "77"),
-            app_ver=f"{app_ver}a16" if "a" not in app_ver else app_ver,
+            app_ver=app_ver,
             country=api.country_code,
-            client_uuid=self._client_uuid,
+            client_uuid=client_uuid,
         )
         sig.webrtc_hello_full()
 
@@ -577,7 +585,7 @@ class P2PStreamer(LiveSessionMixin):
             platform_domain_hint=getattr(api, "platform_domain", None),
             openapi_server_hint=getattr(api, "openapi_server", None),
             api_server_hint=getattr(api, "api_server", None),
-            client_id_hint=self._client_uuid,
+            client_id_hint=client_uuid,
         )
 
         def _coturn_ok(value: Any) -> bool:

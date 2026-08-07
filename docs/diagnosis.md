@@ -61,7 +61,7 @@ python debug.py --debug stream … 2>&1 | grep -E \
 | `P2P session done: video_frames=N source_frames=M` | `source_frames` is what actually arrived from the camera. If it's tiny, the camera stopped sending — not our parser/mux. |
 | `Video stalled Xs without KCP gap: udp_idle=…` | When `udp_idle` grows in lockstep, the camera is silent (re-prompt territory) rather than us losing packets. |
 | `Confirmed media peer … via direct\|turn` | Tells you whether media is flowing on the LAN directly or through the TURN relay. On the camera's LAN, expect `direct` — signaling/TURN servers are then not in the media path. |
-| `Retrying signaling discovery without client UUID` | UUID-aware roots either selected a cluster that does not know the camera or could not connect. The engine is retrying the official generic root-query shape and distinct regional clusters. |
+| `Retrying signaling discovery without client UUID` | UUID-aware roots either selected a cluster that does not know the camera or could not connect. The engine is retrying the official generic root-query and MsgSvr-registration shape; the same endpoint may be retried because its registration identity is now different. |
 | `Restarting stale` | HA coordinator watchdog — the engine didn't deliver frames in time. If you see this without retries, dormancy-wake is broken (see [streaming.md](streaming.md)). |
 | `skipped gaps` | KCP-level recovery skipped over a missing range to resume at a clean IVA/VVP boundary. A handful is fine; a flood means persistent loss. |
 | `source-idle` | The reactive `START_LIVE` retry fired because video stopped flowing. Repeated retries mean the camera is silent at the source. |
