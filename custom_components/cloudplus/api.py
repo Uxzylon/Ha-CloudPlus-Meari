@@ -58,6 +58,7 @@ class AppProfileConfig:
     redirect_url: str
     partner_id: str
     ttid: str = TTID
+    signaling_app_ver: str = ""
     encrypted_login: bool = False
     vvp_stream_flag: int = 1
 
@@ -65,12 +66,22 @@ class AppProfileConfig:
 APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
     "cloudplus": AppProfileConfig("77", "6.0.1", "1029", REDIRECT_URL, "77"),
     "cloudedge": AppProfileConfig(
-        "8", "6.1.4", "616", REDIRECT_URL, "8", encrypted_login=True,
+        "8",
+        "6.1.4",
+        "616",
+        REDIRECT_URL,
+        "8",
+        signaling_app_ver="6.1.4a11",
+        encrypted_login=True,
         vvp_stream_flag=0,
     ),
     "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
     "arenti": AppProfileConfig(
-        "39", "5.0.3", "168", "https://apis.arenti.net", "39",
+        "39",
+        "5.0.3",
+        "168",
+        "https://apis.arenti.net",
+        "39",
         encrypted_login=True,
     ),
 }
@@ -269,6 +280,7 @@ class MeariApiClient:
         self._redirect_url = cfg.redirect_url
         self._partner_id = cfg.partner_id
         self._ttid = cfg.ttid
+        self._signaling_app_ver = cfg.signaling_app_ver or f"{cfg.app_ver}a16"
         self._encrypted_login = cfg.encrypted_login
         self.vvp_stream_flag = cfg.vvp_stream_flag
 
