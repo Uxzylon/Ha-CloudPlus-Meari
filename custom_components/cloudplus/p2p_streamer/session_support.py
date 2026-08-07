@@ -96,11 +96,11 @@ def _next_session_index(api: Any) -> int:
 
 def _client_id_for(api: Any, device: dict[str, Any], override: Any = None) -> str:
     for value in (
+        getattr(api, "user_id", None),
         override,
         device.get("_iot_client_id"),
         device.get("iotClientId"),
         device.get("clientId"),
-        getattr(api, "user_id", None),
     ):
         text = str(value or "").strip()
         if text:
