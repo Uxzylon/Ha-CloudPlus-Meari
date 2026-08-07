@@ -40,17 +40,23 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   the TCP signaling candidates.
 - The integration tries UUID-aware discovery first for newer shared cameras.
   If those candidates reject the device or cannot connect, it repeats the
-  native discovery without the synthesized UUID. This avoids a UUID-selected
-  shard masking the account/device cluster while preserving compatibility
-  with cameras that require stable app-like identity.
+  native discovery and MsgSvr registration without the synthesized UUID.
+  MsgSvr then assigns the session UUID, matching official CloudEdge captures.
+  This avoids a UUID-selected shard masking the account/device cluster while
+  preserving compatibility with cameras that require stable identity.
 - Prefer root discovery over static IP fallbacks so new regions and server
   rotations keep working without code changes.
 
 ## MsgSvr signaling (TCP)
 
 - Signaling is **TCP** to a root-discovered MsgSvr endpoint.
-- The client registers with: camera/user identity, app profile, source app,
-  app version, country, client UUID, session index.
+- The client registers with the authenticated account's numeric `userID`, app
+  profile/source/version and country. Camera-owner metadata from a shared
+  device must not replace that account identity. The UUID-aware compatibility
+  pass supplies a stable UUID; the native fallback omits it and uses the UUID
+  assigned by MsgSvr. CloudEdge 6.1.4 identifies as `6.1.4a11` on this wire.
+- Device status targets the API's explicit `deviceUUID` when available, with
+  the normalized serial number as the fallback used by official app data.
 - The WebRTC-like flow is: register / hello → device status → coturn
   credentials → SDP offer with local *host*, *mapped* and *relay* candidates
   → SDP answer + trickle → candidate-complete.
@@ -68,7 +74,7 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - **Cross-region shared devices**: a device may live on a different cluster
   than its account region (e.g. an AU account holding a device whose home
   cluster is elsewhere). When UUID-aware candidates report the device
-  offline/unknown, repeat generic discovery against
+  offline/unknown, repeat generic discovery and registration against
   `{cn,as,eu,us}ce.mearicloud.com` and try the distinct regional endpoints.
 
 ## Direct-LAN punch
