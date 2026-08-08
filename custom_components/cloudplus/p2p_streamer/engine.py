@@ -554,7 +554,7 @@ class P2PStreamer(LiveSessionMixin):
                 try:
                     sig.send_wake_connect(
                         device_uuid,
-                        contact.get("keepalive", contact),
+                        contact,
                         local_ips,
                         16685,
                     )

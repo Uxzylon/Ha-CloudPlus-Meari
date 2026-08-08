@@ -134,7 +134,7 @@ discovered from the camera's IoT model values.
 | Wake on Motion      | `switch`        | Toggle auto-wake when a motion event fires. |
 | Motion Timeout      | `number`        | How long the camera stays awake after motion (10–600 s). |
 | Stream Host Mode    | `select`        | `IP Address` (default) or `Docker Hostname` for the stream URL — see [Streaming notes](#streaming-notes). |
-| Stream Quality      | `select`        | `AUTO`, `SD`, `HD`, `QHD`, … — whichever the camera advertises. |
+| Stream Quality      | `select`        | `AUTO`, `SD`, `HD`, `QHD`, … — advertised profiles, or the native HD/SD fallback for legacy cameras. |
 
 ### IoT entities (model-dependent)
 

@@ -284,12 +284,20 @@ class MsgSvrClient:
         resp = self._recv()
         return resp["json"]
 
-    def send_wake_connect(self, _device_uuid, device_contact, local_ips, local_port):
+    def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
-        outer_sid = uuid_mod.uuid4().hex[:16]
+        route = device_contact.get("keepalive", device_contact)
+        contact = {
+            "node": "dev",
+            "domain": str(device_uuid),
+            "transport": route.get("transport", "tcp"),
+            "type": route.get("type", "binary"),
+            "ip": route.get("ip"),
+            "port": route.get("port"),
+        }
         msg = json.dumps(
             {
-                "sid": outer_sid,
+                "sid": uuid_mod.uuid4().hex[:16],
                 "uuid": self.uuid,
                 "params": {
                     "sid": uuid_mod.uuid4().hex[:8] + "00000001",
@@ -298,7 +306,7 @@ class MsgSvrClient:
                         "port": local_port,
                     },
                 },
-                "contact": device_contact,
+                "contact": contact,
             },
             separators=(",", ":"),
         )
@@ -308,10 +316,10 @@ class MsgSvrClient:
 
         msg = json.dumps(
             {
-                "sid": outer_sid,
+                "sid": uuid_mod.uuid4().hex[:16],
                 "uuid": self.uuid,
                 "params": {"attach": {"awaken_type": 1}},
-                "contact": device_contact,
+                "contact": contact,
             },
             separators=(",", ":"),
         )
