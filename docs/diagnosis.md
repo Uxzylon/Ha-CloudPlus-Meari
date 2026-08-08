@@ -58,10 +58,12 @@ python debug.py --debug stream … 2>&1 | grep -E \
 
 | Log line | What it tells you |
 |----------|-------------------|
-| `P2P session done: video_frames=N source_frames=M` | `source_frames` is what actually arrived from the camera. If it's tiny, the camera stopped sending — not our parser/mux. |
+| `P2P session done: video_frames=N source_frames=M` | Once `turn` and `candidates` are populated, `source_frames` is what actually arrived from the camera. If both path fields are empty, the attempt ended before the media leg and zero frames say nothing about the parser or camera source. |
 | `Video stalled Xs without KCP gap: udp_idle=…` | When `udp_idle` grows in lockstep, the camera is silent (re-prompt territory) rather than us losing packets. |
 | `Confirmed media peer … via direct\|turn` | Tells you whether media is flowing on the LAN directly or through the TURN relay. On the camera's LAN, expect `direct` — signaling/TURN servers are then not in the media path. |
 | `Retrying signaling discovery without client UUID` | UUID-aware roots either selected a cluster that does not know the camera or could not connect. The engine is retrying the official generic root-query and MsgSvr-registration shape; the same endpoint may be retried because its registration identity is now different. |
+| `Dormant coturn unavailable; waking before relay negotiation` | This camera withholds TURN credentials while dormant. The engine is waking on the current MsgSvr session, waiting briefly for its `online` push, and retrying coturn without changing clusters. |
+| `Coturn ready after pre-relay wake` | The older dormant-wake fallback succeeded; TURN allocation and SDP/ICE follow next. |
 | `Restarting stale` | HA coordinator watchdog — the engine didn't deliver frames in time. If you see this without retries, dormancy-wake is broken (see [streaming.md](streaming.md)). |
 | `skipped gaps` | KCP-level recovery skipped over a missing range to resume at a clean IVA/VVP boundary. A handful is fine; a flood means persistent loss. |
 | `source-idle` | The reactive `START_LIVE` retry fired because video stopped flowing. Repeated retries mean the camera is silent at the source. |
@@ -90,6 +92,10 @@ Rule of thumb: if QHD shows `source_frames` ≈ a handful per minute, drop to
 SD and confirm — if SD works, the limit is the camera/uplink, not the
 integration. If SD also drops out, look for KCP gaps, peer-confirmation
 issues, or a misrouted TURN relay (see [protocol.md](protocol.md)).
+
+The Stream Quality entity exists only when the cloud device payload advertises
+`capability.caps.bps2`; it is not learned from the P2P media channel. A missing
+selector therefore indicates sparse capability metadata, not failed ICE.
 
 ## When to capture packets
 
