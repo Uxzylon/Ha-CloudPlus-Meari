@@ -66,6 +66,10 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   coturn until the client sends signaling + HTTP wake and receives an `online`
   push. Retry coturn on that same MsgSvr session rather than cycling clusters.
   See [streaming.md](streaming.md).
+- The two MsgSvr wake-connect frames target the camera, not the NATS route
+  identity returned by status: copy the keepalive IP/port/transport into a
+  `node=dev`, `domain=<device UUID>` contact. The local-endpoint and
+  `awaken_type=1` frames use distinct outer SIDs, matching official captures.
 - Some newer shared snap cameras require **stable app-like client
   UUID/session values**. Randomising those can make the camera appear
   offline even when wake commands work.
@@ -158,6 +162,9 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - Quality stream ids:
   - explicit profiles → `100 + profile_id`
   - app `AUTO` → stream id `105`
+  - legacy cameras without `bps2` → raw capability stream ids; if neither
+    `bps2` nor a legacy bitmask is advertised, expose `0=HD` / `1=SD` and
+    default to `1`, matching the official app
 - **AUTO is not our own adaptive switch.** It's the camera/app adaptive
   stream id; request it exactly as the official app does.
 

@@ -55,6 +55,10 @@ The engine supports both without model-specific guesses:
   and waits in short intervals for that camera's pushed `online` status. It
   retries coturn throughout the same wake budget and continues with the fresh
   online NAT/contact data once credentials become available.
+- Signaling wake uses the status keepalive endpoint as a route only. Its two
+  connect frames address `node=dev`, `domain=<device UUID>` and carry separate
+  outer SIDs; forwarding the status response's `natsvr` identity verbatim is
+  tolerated by some cameras but ignored by others.
 - `DORMANCY_WAKE_TIMEOUT_S` (≈75 s) bounds each dormant wake phase before
   giving up to the next signaling candidate / a fresh session.
 - If neither dormant-offer nor pre-relay wake produces coturn credentials
