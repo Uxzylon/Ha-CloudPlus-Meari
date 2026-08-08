@@ -18,7 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 from .coordinator import CloudEdgeMeariCoordinator
 from .entity import CloudEdgeMeariEntity, CloudEdgeMeariIotNumericEntity
-from .meari_commands import HUMIDITY, TEMPERATURE
+from .meari_commands import HUMIDITY, TEMPERATURE, WIFI_STRENGTH
 
 # (min percent, icon) ladders, highest threshold first.
 _CHARGING_BATTERY_ICONS = (
@@ -68,6 +68,14 @@ IOT_SENSORS: tuple[IotSensorSpec, ...] = (
         "Humidity",
         SensorDeviceClass.HUMIDITY,
         PERCENTAGE,
+    ),
+    IotSensorSpec(
+        "wifi_signal",
+        WIFI_STRENGTH,
+        "WiFi Signal",
+        None,
+        PERCENTAGE,
+        icon="mdi:wifi",
     ),
 )
 
