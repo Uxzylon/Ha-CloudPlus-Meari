@@ -60,11 +60,12 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - The WebRTC-like flow is: register / hello → device status → coturn
   credentials → SDP offer with local *host*, *mapped* and *relay* candidates
   → SDP answer + trickle → candidate-complete.
-- **A dormant camera answers the offer, not a status poll.** When device
-  status is `dormancy`, the offer/live request itself wakes the camera: it
-  answers in ~10–15 s, whereas its `status=online` push lags by 40–60 s. Send
-  coturn + offer while dormant (don't block on `online`) and treat the SDP
-  answer as the wake confirmation. See [streaming.md](streaming.md).
+- Dormant cameras expose two native wake sequences. Prefer coturn + offer while
+  dormant when the server supplies credentials; the SDP answer then confirms
+  the wake without waiting 40–60 s for `online`. Older cameras may withhold
+  coturn until the client sends signaling + HTTP wake and receives an `online`
+  push. Retry coturn on that same MsgSvr session rather than cycling clusters.
+  See [streaming.md](streaming.md).
 - Some newer shared snap cameras require **stable app-like client
   UUID/session values**. Randomising those can make the camera appear
   offline even when wake commands work.
