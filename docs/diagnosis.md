@@ -93,9 +93,11 @@ SD and confirm — if SD works, the limit is the camera/uplink, not the
 integration. If SD also drops out, look for KCP gaps, peer-confirmation
 issues, or a misrouted TURN relay (see [protocol.md](protocol.md)).
 
-The Stream Quality entity exists only when the cloud device payload advertises
-`capability.caps.bps2`; it is not learned from the P2P media channel. A missing
-selector therefore indicates sparse capability metadata, not failed ICE.
+Stream Quality comes from the HTTP capability payload, not from ICE or the P2P
+media channel. Modern cameras use `capability.caps.bps2`; the official legacy
+fallback exposes raw `HD=0` / `SD=1` when that metadata is absent. The selector
+therefore remains available for sparse shared-device payloads and defaults to
+legacy SD rather than silently requesting HD.
 
 ## When to capture packets
 
