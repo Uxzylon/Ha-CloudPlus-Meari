@@ -588,36 +588,16 @@ class P2PStreamer(LiveSessionMixin):
             client_id_hint=client_uuid,
         )
 
-        def _coturn_ok(value: Any) -> bool:
-            return isinstance(value, dict) and bool(value.get("coturn_ip"))
-
-        coturn = sig.request_coturn(device_uuid)
-        if not _coturn_ok(coturn) and was_dormant:
-            # A dormant camera's first coturn read races buffered signaling
-            # frames and can come back empty for a second or two. Retry on the
-            # same cluster rather than thrashing through every signaling
-            # candidate (and re-running discovery) before one finally answers.
-            coturn_deadline = time.time() + 8.0
-            old_timeout = sig.sock.gettimeout() if sig.sock else None
-            if sig.sock:
-                sig.sock.settimeout(1.5)
-            try:
-                while (
-                    not _coturn_ok(coturn)
-                    and time.time() < coturn_deadline
-                    and self._running
-                ):
-                    try:
-                        coturn = sig.request_coturn(device_uuid)
-                    except (socket.timeout, OSError):
-                        coturn = {}
-            finally:
-                if sig.sock is not None and old_timeout is not None:
-                    try:
-                        sig.sock.settimeout(old_timeout)
-                    except OSError:
-                        pass
-        if not _coturn_ok(coturn):
+        online_status: dict[str, Any] | None = None
+        if was_dormant:
+            coturn, online_status = self._request_dormant_coturn(
+                sig,
+                device_uuid,
+                fire_wake,
+            )
+        else:
+            coturn = sig.request_coturn(device_uuid)
+        if not self._coturn_ok(coturn):
             # No relay creds on this cluster — fail fast to the next signaling
             # candidate instead of spending the allocate retries on an empty
             # server address.
@@ -625,6 +605,10 @@ class P2PStreamer(LiveSessionMixin):
             raise SignalingClusterMiss(
                 f"No coturn from {format_endpoint(self._last_signaling_endpoint)}"
             )
+        if online_status is not None:
+            status = online_status
+            was_dormant = False
+            fire_wake = None
         turn = TurnClient(
             coturn.get("coturn_ip", ""),
             int(coturn.get("coturn_port", 9100)),
@@ -657,6 +641,70 @@ class P2PStreamer(LiveSessionMixin):
         finally:
             self._active_sock = None
             turn.close()
+
+    @staticmethod
+    def _coturn_ok(value: Any) -> bool:
+        return isinstance(value, dict) and bool(value.get("coturn_ip"))
+
+    def _request_dormant_coturn(
+        self,
+        sig: MsgSvrClient,
+        device_uuid: str,
+        fire_wake: Callable[[], None] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Get relay credentials across both native dormant-wake sequences."""
+        online_status: dict[str, Any] | None = None
+        old_timeout = sig.sock.gettimeout() if sig.sock else None
+        if sig.sock:
+            sig.sock.settimeout(1.5)
+
+        def _request() -> dict[str, Any]:
+            nonlocal online_status
+            try:
+                response = sig.request_coturn(device_uuid)
+            except socket.timeout:
+                return {}
+            if (
+                isinstance(response, dict)
+                and response.get("action") == "status"
+                and response.get("uuid") == device_uuid
+                and response.get("status") == "online"
+            ):
+                online_status = response
+            return response
+
+        try:
+            coturn = _request()
+            if self._coturn_ok(coturn):
+                return coturn, None
+
+            _LOGGER.info("Dormant coturn unavailable; waking before relay negotiation")
+            deadline = time.time() + DORMANCY_WAKE_TIMEOUT_S
+            while self._running and time.time() < deadline:
+                if online_status is None:
+                    if fire_wake is not None:
+                        fire_wake()
+                    remaining = max(0.1, deadline - time.time())
+                    online_status = sig.wait_for_status(
+                        device_uuid,
+                        timeout=min(WAKE_RETRY_S, remaining),
+                    )
+                coturn = _request()
+                if self._coturn_ok(coturn):
+                    _LOGGER.info(
+                        "Coturn ready after pre-relay wake (camera_online=%s)",
+                        online_status is not None,
+                    )
+                    return coturn, online_status
+                if online_status is not None:
+                    time.sleep(min(1.5, max(0.0, deadline - time.time())))
+            return {}, online_status
+        finally:
+            if sig.sock is not None and old_timeout is not None:
+                try:
+                    sig.sock.settimeout(old_timeout)
+                except OSError:
+                    pass
 
     def _negotiate_dormant_offer(
         self,

@@ -33,30 +33,33 @@ The engine therefore sends `kcp.send_handshake()` and a `START_LIVE` (reason
 `live_started = True` is set immediately so the keepalive and idle-retry
 paths take over from there.
 
-## Dormancy wake is offer-driven, not status-driven
+## Dormancy wake supports both native sequences
 
-A dormant snap (battery / solar) camera's `status=online` push is **slow** —
-measured 40–57 s, sometimes more. **Do not gate the stream on it.** Direct
-capture of the official app on a cold (30–60 min dormant) camera shows it
-streaming in ~5 s of tap / ~14 s of signaling: the app requests coturn and
-then sends the **SDP offer / live request while the camera is still dormant**.
-The camera wakes *in response to the offer* and answers in ~10–15 s — long
-before its `online` status would arrive. The app never polls `online`.
+A dormant snap (battery / solar) camera can follow either of two sequences in
+official-app captures. Newer cameras provide coturn while dormant and wake from
+the **SDP offer / live request**; their `status=online` push can lag 40–57 s,
+so gating that path on status makes startup needlessly slow. Some older cameras
+withhold coturn while dormant: the app sends its signaling + HTTP wake first,
+waits for the pushed `online` status on the same MsgSvr connection, and only
+then requests coturn.
 
-**Fix**: mirror that exactly.
+The engine supports both without model-specific guesses:
 
-- On `status=dormancy` the engine does **not** wait for `online`. It requests
-  coturn first (works while dormant — same order as the app; firing the wake
-  first leaves stray signaling frames that desync the coturn read), allocates
-  the relay, then enters `_negotiate_dormant_offer`: re-issue the SDP offer and
-  re-fire `send_wake_connect` + HTTP `wake_device` every few seconds while
-  continuously polling the signaling socket for the camera's delayed, pushed
-  SDP answer + trickle candidates. The camera's **answer is the wake
-  confirmation**; once candidates arrive the normal ICE/START_LIVE path runs.
-- `DORMANCY_WAKE_TIMEOUT_S` (≈75 s) bounds how long we keep offering before
+- On `status=dormancy` it first requests coturn. If credentials arrive, it
+  allocates the relay and enters `_negotiate_dormant_offer`: re-issue the SDP
+  offer and re-fire `send_wake_connect` + HTTP `wake_device` every few seconds
+  while polling for the camera's delayed SDP answer and trickle candidates.
+  The answer is the wake confirmation for this fast path.
+- If the dormant coturn request times out or returns no credentials, the engine
+  keeps the same MsgSvr session, sends the signaling + HTTP wake immediately,
+  and waits in short intervals for that camera's pushed `online` status. It
+  retries coturn throughout the same wake budget and continues with the fresh
+  online NAT/contact data once credentials become available.
+- `DORMANCY_WAKE_TIMEOUT_S` (≈75 s) bounds each dormant wake phase before
   giving up to the next signaling candidate / a fresh session.
-- If a signaling cluster returns no coturn creds, fail fast to the next
-  candidate instead of spending the allocate retries on an empty address.
+- If neither dormant-offer nor pre-relay wake produces coturn credentials
+  within that budget, move to the next signaling candidate instead of spending
+  TURN allocation retries on an empty address.
 
 This brought cold-start latency from ~70 s (status-polling) down to ~14 s,
 matching the app.
