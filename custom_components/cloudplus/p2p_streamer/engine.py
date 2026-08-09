@@ -33,24 +33,39 @@ from .codecs import (
     identify_codec,
     is_recovery_keyframe,
     nal_types,
+    runtime_policy_for,
 )
 from .protocol import (
     STREAM_TYPE_AUDIO,
     STREAM_TYPE_IFRAME,
     STREAM_TYPE_PFRAME,
+    VVP_CMD_HEARTBEAT,
+    VVP_CMD_START_LIVE,
+    VVP_CMD_STOP,
+    build_vvp_packet,
 )
 from .codec import (
     FrameSequenceTracker,
+    StreamFrame,
     decrypt_stream_frame,
     parse_stream_frame,
     split_stream_frames,
+)
+from .ppcs import (
+    PPCS_MEDIA_AUDIO,
+    PPCS_MEDIA_IFRAME,
+    PPCS_MEDIA_PFRAME,
+    PpcsMediaFrameBuffer,
+    PpcsTransport,
 )
 from .quality import stream_id_for_quality
 from .live_session import LiveSessionMixin
 from .session_support import (
     AUTH_FALLBACK_RESULT,
     DORMANCY_WAKE_TIMEOUT_S,
+    DIRECT_SOURCE_IDLE_RECONNECT_S,
     SIGNALING_CONNECT_TIMEOUT_S,
+    VVP_HEARTBEAT_S,
     WAKE_RETRY_S,
     SignalingClusterMiss,
     _client_id_for,
@@ -59,10 +74,15 @@ from .session_support import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_PPCS_FRAME_TYPES = {
+    PPCS_MEDIA_IFRAME: STREAM_TYPE_IFRAME,
+    PPCS_MEDIA_PFRAME: STREAM_TYPE_PFRAME,
+    PPCS_MEDIA_AUDIO: STREAM_TYPE_AUDIO,
+}
 
 
 class P2PStreamer(LiveSessionMixin):
-    """Runs a CloudPlus/Meari camera P2P stream using TURN + KCP + VVP."""
+    """Run a Meari stream over its advertised WebRTC or legacy PPCS path."""
 
     def __init__(
         self,
@@ -85,6 +105,7 @@ class P2PStreamer(LiveSessionMixin):
         if not self._device_uuid:
             self._device_uuid = format_sn(str(self._sn_num))
         self._is_snap = str(device.get("_category", "")).lower() == "snap"
+        self._uses_ppcs = str(device.get("deviceP2P") or "").lower() == "ppcs"
         self._host_key = device.get("hostKey", "")
         self._video_password = (video_password or "").strip()
         self._remote = remote
@@ -120,6 +141,7 @@ class P2PStreamer(LiveSessionMixin):
         self._active_stop_live: Callable[[], None] | None = None
         self._last_signaling_endpoint: tuple[str, int] | None = None
         self._last_turn_endpoint: tuple[str, int] | None = None
+        self._last_peer_endpoint: tuple[str, int] | None = None
         self._last_candidate_count = 0
         self._keyframe_request = threading.Event()
         # True while a dormant camera is actively being woken — watchdogs must
@@ -182,7 +204,9 @@ class P2PStreamer(LiveSessionMixin):
             "audio_decrypted": self._audio_decrypt,
             "signaling_endpoint": format_endpoint(self._last_signaling_endpoint),
             "turn_endpoint": format_endpoint(self._last_turn_endpoint),
+            "peer_endpoint": format_endpoint(self._last_peer_endpoint),
             "candidate_count": self._last_candidate_count,
+            "transport": "ppcs" if self._uses_ppcs else "webrtc",
         }
 
     def _note_video_timestamp(self, timestamp_ms: int | None) -> None:
@@ -306,52 +330,64 @@ class P2PStreamer(LiveSessionMixin):
             parsed = self._parse_stream_chunk(chunk)
             if not parsed:
                 continue
-            frame_type = parsed.frame_type
-            media_data = parsed.payload
-            if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
-                is_keyframe = frame_type == STREAM_TYPE_IFRAME
-                is_recovery = is_keyframe and is_recovery_keyframe(
-                    media_data,
-                    require_param_sets=False,
+            saw_keyframe = (
+                self._handle_parsed_frame(
+                    parsed,
+                    wait_for_keyframe=wait_for_keyframe,
                 )
-                self._source_video_count += 1
-                self._note_video_timestamp(parsed.timestamp_ms)
-                if wait_for_keyframe and not is_recovery:
-                    self._video_sequence.require_keyframe()
-                    continue
-                if self._video_sequence.should_drop(
-                    parsed.sequence,
-                    recovery=is_recovery,
-                ):
-                    continue
-                self._video_codec = detect_codec(media_data, default=self._video_codec)
-                if (
-                    _LOGGER.isEnabledFor(logging.DEBUG)
-                    and self._source_video_count <= 5
-                ):
-                    _LOGGER.debug(
-                        "Video frame #%d type=0x%02x bytes=%d ts=%s seq=%s "
-                        "codec=%s nals=%s recovery=%s",
-                        self._source_video_count,
-                        frame_type,
-                        len(media_data),
-                        parsed.timestamp_ms,
-                        parsed.sequence,
-                        self._video_codec.value,
-                        sorted(nal_types(self._video_codec, media_data)),
-                        is_recovery,
-                    )
-                saw_keyframe = saw_keyframe or is_recovery
-                self._video_count += 1
-                self._total_bytes += len(media_data)
-                if self.on_video:
-                    self.on_video(media_data, parsed.timestamp_ms)
-            elif frame_type == STREAM_TYPE_AUDIO:
-                self._audio_count += 1
-                self._audio_bytes += len(media_data)
-                if self.on_audio:
-                    self.on_audio(media_data)
+                or saw_keyframe
+            )
         return saw_keyframe
+
+    def _handle_parsed_frame(
+        self,
+        parsed: StreamFrame,
+        *,
+        wait_for_keyframe: bool = False,
+    ) -> bool:
+        frame_type = parsed.frame_type
+        media_data = parsed.payload
+        if frame_type in (STREAM_TYPE_IFRAME, STREAM_TYPE_PFRAME):
+            is_keyframe = frame_type == STREAM_TYPE_IFRAME
+            is_recovery = is_keyframe and is_recovery_keyframe(
+                media_data,
+                require_param_sets=False,
+            )
+            self._source_video_count += 1
+            self._note_video_timestamp(parsed.timestamp_ms)
+            if wait_for_keyframe and not is_recovery:
+                self._video_sequence.require_keyframe()
+                return False
+            if self._video_sequence.should_drop(
+                parsed.sequence,
+                recovery=is_recovery,
+            ):
+                return False
+            self._video_codec = detect_codec(media_data, default=self._video_codec)
+            if _LOGGER.isEnabledFor(logging.DEBUG) and self._source_video_count <= 5:
+                _LOGGER.debug(
+                    "Video frame #%d type=0x%02x bytes=%d ts=%s seq=%s "
+                    "codec=%s nals=%s recovery=%s",
+                    self._source_video_count,
+                    frame_type,
+                    len(media_data),
+                    parsed.timestamp_ms,
+                    parsed.sequence,
+                    self._video_codec.value,
+                    sorted(nal_types(self._video_codec, media_data)),
+                    is_recovery,
+                )
+            self._video_count += 1
+            self._total_bytes += len(media_data)
+            if self.on_video:
+                self.on_video(media_data, parsed.timestamp_ms)
+            return is_recovery
+        if frame_type == STREAM_TYPE_AUDIO:
+            self._audio_count += 1
+            self._audio_bytes += len(media_data)
+            if self.on_audio:
+                self.on_audio(media_data)
+        return False
 
     def run_session(self) -> tuple[int, int]:
         self._running = True
@@ -369,6 +405,7 @@ class P2PStreamer(LiveSessionMixin):
                 self._first_video_timestamp_ms = None
                 self._last_video_timestamp_ms = None
                 self._last_turn_endpoint = None
+                self._last_peer_endpoint = None
                 self._last_candidate_count = 0
                 self.direct_confirmed = False
                 result = self._run_session_once(
@@ -395,6 +432,12 @@ class P2PStreamer(LiveSessionMixin):
         *,
         allow_auth_fallback: bool = False,
     ) -> tuple[int, int]:
+        if self._uses_ppcs:
+            return self._run_ppcs_session(
+                host_key,
+                allow_auth_fallback=allow_auth_fallback,
+            )
+
         platform_hint = getattr(self._api, "platform_domain", None)
         openapi_hint = getattr(self._api, "openapi_server", None)
         api_hint = getattr(self._api, "api_server", None)
@@ -499,7 +542,8 @@ class P2PStreamer(LiveSessionMixin):
         _LOGGER.info(
             "P2P session done: video_frames=%d source_frames=%d "
             "video_bytes=%d audio_frames=%d audio_bytes=%d codec=%s "
-            "stream_id=%s candidates=%d signaling=%s turn=%s",
+            "stream_id=%s candidates=%d signaling=%s turn=%s "
+            "transport=%s peer=%s",
             self._video_count,
             self._source_video_count,
             self._total_bytes,
@@ -510,7 +554,183 @@ class P2PStreamer(LiveSessionMixin):
             self._last_candidate_count,
             format_endpoint(self._last_signaling_endpoint),
             format_endpoint(self._last_turn_endpoint),
+            "ppcs" if self._uses_ppcs else "webrtc",
+            format_endpoint(self._last_peer_endpoint),
         )
+
+    def _run_ppcs_session(
+        self,
+        host_key: str,
+        *,
+        allow_auth_fallback: bool,
+    ) -> tuple[int, int]:
+        """Run the factory-9 PPCS transport used by older cameras."""
+        init_string = str(
+            self._device.get("p2pInitApp") or self._device.get("p2pInit") or ""
+        )
+        transport: PpcsTransport | None = None
+        frame_buffer = PpcsMediaFrameBuffer()
+        vvp_sequence = 0
+        live_started = False
+        last_start_live = 0.0
+        last_video_time = 0.0
+        first_start_time = 0.0
+        next_heartbeat = 0.0
+        last_idle_start_live = 0.0
+
+        def _next_vvp(
+            cmd: int,
+            *,
+            stream_id: int | None = None,
+            stream_flag: int | None = None,
+        ) -> bytes:
+            nonlocal vvp_sequence
+            packet = build_vvp_packet(
+                cmd=cmd,
+                seq=vvp_sequence,
+                host_key=host_key,
+                param=8,
+                licence_id=None,
+                stream_id=self._vvp_stream_id if stream_id is None else stream_id,
+                stream_flag=(
+                    self._vvp_stream_flag if stream_flag is None else stream_flag
+                ),
+            )
+            vvp_sequence += 1
+            return packet
+
+        def _send_start_live(reason: str) -> None:
+            nonlocal live_started, last_start_live, next_heartbeat
+            if transport is None:
+                return
+            transport.send_channel(0, _next_vvp(VVP_CMD_START_LIVE))
+            live_started = True
+            last_start_live = time.monotonic()
+            next_heartbeat = last_start_live + VVP_HEARTBEAT_S
+            _LOGGER.debug("Sent VVP START_LIVE (%s)", reason)
+
+        def _send_stop_live() -> None:
+            nonlocal live_started
+            if transport is None or not live_started:
+                return
+            try:
+                transport.send_channel(
+                    0,
+                    _next_vvp(VVP_CMD_STOP, stream_id=0, stream_flag=0),
+                )
+            except (OSError, RuntimeError):
+                pass
+            live_started = False
+
+        self._video_codec = CodecName.H264
+        self.awaiting_wake = True
+        try:
+            transport = PpcsTransport(init_string, self._device_uuid)
+            self._active_sock = transport.socket
+            _LOGGER.info(
+                "Connecting with legacy PPCS transport (stream_id=%s)",
+                self._vvp_stream_id,
+            )
+            peer = transport.connect(DORMANCY_WAKE_TIMEOUT_S)
+            self._last_peer_endpoint = peer
+            self._last_candidate_count = transport.candidate_count
+            self.direct_confirmed = True
+            self._active_stop_live = _send_stop_live
+            if self.on_login:
+                self.on_login()
+
+            _send_start_live("startup")
+            first_start_time = time.monotonic()
+            while self._running:
+                for channel, payload in transport.poll(0.1):
+                    if channel != 1:
+                        continue
+                    for frame in frame_buffer.feed(payload):
+                        frame_type = _PPCS_FRAME_TYPES.get(frame.frame_type)
+                        if frame_type is None:
+                            continue
+                        before = self._source_video_count
+                        self._handle_parsed_frame(
+                            StreamFrame(
+                                frame_type=frame_type,
+                                header_size=32,
+                                payload=frame.payload,
+                                timestamp_ms=frame.timestamp_ms,
+                                sequence=frame.sequence,
+                            )
+                        )
+                        if self._source_video_count > before:
+                            last_video_time = time.monotonic()
+                            self.awaiting_wake = False
+
+                now = time.monotonic()
+                if self._keyframe_request.is_set():
+                    self._keyframe_request.clear()
+                    policy = runtime_policy_for(self._video_codec)
+                    if (
+                        last_video_time <= 0.0
+                        or policy.idle_start_live_retry_s <= now - last_video_time
+                    ):
+                        _send_start_live("client-join")
+
+                if live_started and now >= next_heartbeat:
+                    transport.send_channel(
+                        0,
+                        _next_vvp(VVP_CMD_HEARTBEAT, stream_id=0, stream_flag=0),
+                    )
+                    next_heartbeat = now + VVP_HEARTBEAT_S
+
+                if last_video_time <= 0.0:
+                    if allow_auth_fallback and now - first_start_time >= 10.0:
+                        return AUTH_FALLBACK_RESULT
+                    if now - last_start_live >= WAKE_RETRY_S:
+                        _send_start_live("wake-retry")
+                    if now - first_start_time >= DORMANCY_WAKE_TIMEOUT_S:
+                        _LOGGER.warning("PPCS camera sent no video before wake timeout")
+                        break
+                    continue
+
+                stall_time = now - last_video_time
+                runtime_policy = runtime_policy_for(self._video_codec)
+                retry_s = runtime_policy.idle_start_live_retry_s
+                if (
+                    0.0 < retry_s <= stall_time
+                    and now - last_idle_start_live >= retry_s
+                ):
+                    _send_start_live("idle")
+                    last_idle_start_live = now
+                    self._video_sequence.require_keyframe()
+                reconnect_s = max(
+                    runtime_policy.source_idle_reconnect_s,
+                    DIRECT_SOURCE_IDLE_RECONNECT_S,
+                )
+                if stall_time >= reconnect_s:
+                    _LOGGER.warning(
+                        "P2P source idle %.1fs; reconnecting session",
+                        stall_time,
+                    )
+                    break
+
+                keepalive_s = runtime_policy.start_live_keepalive_s
+                if 0.0 < keepalive_s <= now - last_start_live:
+                    _send_start_live("keepalive")
+                    self._video_sequence.require_keyframe()
+        except (OSError, RuntimeError, ValueError) as err:
+            if self._running:
+                _LOGGER.warning("PPCS session error: %s", err)
+            else:
+                _LOGGER.debug("PPCS session interrupted during stop: %s", err)
+        finally:
+            _send_stop_live()
+            if transport is not None:
+                self._last_candidate_count = transport.candidate_count
+            self._log_session_done()
+            self.awaiting_wake = False
+            self._active_sock = None
+            self._active_stop_live = None
+            if transport is not None:
+                transport.close()
+        return self._video_count, self._total_bytes
 
     def _do_stream(
         self,

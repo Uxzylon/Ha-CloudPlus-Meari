@@ -51,16 +51,17 @@ grep for the engine-level signals:
 
 ```bash
 python debug.py --debug stream … 2>&1 | grep -E \
-  'Video stalled|skipped gaps|source-idle|session done|Confirmed media peer'
+  'Video stalled|skipped gaps|source-idle|session done|Confirmed media peer|PPCS direct'
 ```
 
 ## Reading engine signals
 
 | Log line | What it tells you |
 |----------|-------------------|
-| `P2P session done: video_frames=N source_frames=M` | Once `turn` and `candidates` are populated, `source_frames` is what actually arrived from the camera. If both path fields are empty, the attempt ended before the media leg and zero frames say nothing about the parser or camera source. |
+| `P2P session done: video_frames=N source_frames=M ... transport=T peer=P` | `source_frames` is what actually arrived from the camera. Modern sessions normally populate signaling/TURN/candidates. PPCS sessions intentionally leave signaling/TURN empty and identify their direct media endpoint in `peer`. If every applicable path field is empty, zero frames say nothing about the parser or camera source. |
 | `Video stalled Xs without KCP gap: udp_idle=…` | When `udp_idle` grows in lockstep, the camera is silent (re-prompt territory) rather than us losing packets. |
 | `Confirmed media peer … via direct\|turn` | Tells you whether media is flowing on the LAN directly or through the TURN relay. On the camera's LAN, expect `direct` — signaling/TURN servers are then not in the media path. |
+| `PPCS direct peer confirmed: IP:PORT` | A `deviceP2P=ppcs` camera completed legacy root rendezvous and UDP punching. Its media uses PPCS reliable channels, so KCP/TURN diagnostics do not apply. |
 | `Retrying signaling discovery without client UUID` | UUID-aware roots either selected a cluster that does not know the camera or could not connect. The engine is retrying the official generic root-query and MsgSvr-registration shape; the same endpoint may be retried because its registration identity is now different. |
 | `Dormant coturn unavailable; waking before relay negotiation` | This camera withholds TURN credentials while dormant. The engine is waking on the current MsgSvr session, waiting briefly for its `online` push, and retrying coturn without changing clusters. |
 | `Coturn ready after pre-relay wake` | The older dormant-wake fallback succeeded; TURN allocation and SDP/ICE follow next. |
@@ -82,16 +83,18 @@ HTTP recovery are responsible for keeping entity updates alive.
 
 Battery cameras stream different codecs depending on the chosen profile:
 
-- **SD → H.264.** Smaller frames, lower bitrate. Tends to stream reliably
+- **SD usually → H.264.** Smaller frames, lower bitrate. Tends to stream reliably
   even on weak Wi-Fi / low battery. Useful diagnostic and practical
   fallback.
-- **HD / QHD / AUTO → HEVC.** High bitrate, much more sensitive to RF or
-  power constraints. Often the first profile to stall on a fragile camera.
+- **Modern HD / QHD / AUTO commonly → HEVC.** High bitrate, much more
+  sensitive to RF or power constraints. Older PPCS cameras may use H.264 for
+  both SD and HD, so trust the session's detected `codec` value.
 
 Rule of thumb: if QHD shows `source_frames` ≈ a handful per minute, drop to
 SD and confirm — if SD works, the limit is the camera/uplink, not the
 integration. If SD also drops out, look for KCP gaps, peer-confirmation
-issues, or a misrouted TURN relay (see [protocol.md](protocol.md)).
+issues, a misrouted TURN relay, or PPCS reliable-channel loss (see
+[protocol.md](protocol.md)).
 
 Stream Quality comes from the HTTP capability payload, not from ICE or the P2P
 media channel. Modern cameras use `capability.caps.bps2`; the official legacy

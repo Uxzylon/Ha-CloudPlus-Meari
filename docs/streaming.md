@@ -33,6 +33,12 @@ The engine therefore sends `kcp.send_handshake()` and a `START_LIVE` (reason
 `live_started = True` is set immediately so the keepalive and idle-retry
 paths take over from there.
 
+Legacy `deviceP2P=ppcs` cameras have no KCP/IVA handshake. Once PPCS confirms
+the direct peer, the engine sends the same VVP `START_LIVE` immediately on
+reliable channel 0. Its authentication omits the modern licence component;
+waiting for a control echo or adding one makes older cameras ignore the live
+request.
+
 ## Dormancy wake supports both native sequences
 
 A dormant snap (battery / solar) camera can follow either of two sequences in
@@ -134,6 +140,13 @@ engine mirrors that: it gives startup a short direct-ICE grace before KCP, keeps
 rapid ICE checks going while seeking a direct peer, stops candidate fanout once
 direct KCP is confirmed, and gives confirmed direct sessions a longer
 source-idle window before reconnecting.
+
+Legacy PPCS is direct by design. The engine obtains the camera's LAN/public
+endpoints from its device-provided PPCS roots, punches both, and keeps the
+confirmed endpoint for the session. Peer discovery gets the full dormancy-wake
+budget because an older battery camera may register late. After connection,
+heartbeats sustain the session; `START_LIVE` is reissued for wake retries,
+stale client joins, and source-idle recovery, but not while video is current.
 
 ## Timing rules
 
