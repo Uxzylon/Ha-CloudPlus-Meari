@@ -46,10 +46,17 @@ async def cmd_list(args) -> int:
     return 0
 
 
-def _parse_quality_arg(value: str) -> int | None:
+def _parse_quality_arg(
+    value: str,
+    profiles: dict[int, str] | None = None,
+) -> int | None:
     text = str(value).strip().lower()
     if text in {"auto", "adaptive"}:
         return None
+    for profile_id, label in (profiles or {}).items():
+        normalized = str(label).strip().lower()
+        if text == normalized or normalized.startswith(f"{text} "):
+            return profile_id
     names = {"sd": 0, "hd": 1, "qhd": 2, "fhd": 2}
     if text in names:
         return names[text]
