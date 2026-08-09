@@ -80,8 +80,9 @@ Pure-asyncio; can be driven from HA or from `debug.py` without changes.
 
 | File | Layer |
 |------|-------|
-| `engine.py` | `P2PStreamer` — lifecycle + session orchestration (discovery → signaling → wake → coturn). |
+| `engine.py` | `P2PStreamer` — lifecycle and transport selection (`deviceP2P=ppcs` or modern WebRTC-like signaling). |
 | `live_session.py` | `LiveSessionMixin._stream_with_turn` — the per-session ICE → KCP → VVP → media loop (split out to keep files <1000 lines). |
+| `ppcs.py` | Legacy PPStrong root rendezvous, direct UDP punching, reliable channels and media reassembly. |
 | `session_support.py` | Shared session constants, identity helpers, `SignalingClusterMiss`. |
 | `root_discovery.py` | Native UDP root protocol on port 9253. |
 | `network.py` | Socket plumbing, packet routing, NAT timers. |
@@ -91,7 +92,7 @@ Pure-asyncio; can be driven from HA or from `debug.py` without changes.
 | `kcp_tunnel.py` (sibling under `cloudplus/`) | KCP reliable transport over UDP. |
 | `protocol.py` | IVA framing (`0x7010` / `0x7012`). |
 | `codec.py` | VVP packet codec (magic `0x56565099`). |
-| `quality.py` | Quality-profile → stream-id mapping (AUTO=105, profile=100+id). |
+| `quality.py` | Quality-profile → stream-id mapping (modern AUTO/profile ids and raw legacy ids). |
 | `keepalive.py` | `0x888E` heartbeat + proactive `START_LIVE` re-issue. |
 
 ## Sibling protocol modules

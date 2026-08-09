@@ -8,7 +8,7 @@ For control-flow patterns built on top of these primitives (live-start
 ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 
 > 🛠 **Agents: keep this file in sync with the code.** Any change to
-> discovery, signaling, ICE/TURN handling, KCP/IVA framing, VVP commands
+> discovery, signaling, PPCS/ICE/TURN handling, reliable framing, VVP commands
 > or media-frame parsing must be reflected here in the same change. See
 > [AGENTS.md](../AGENTS.md) for the full doc-maintenance policy.
 
@@ -27,6 +27,32 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 - Battery / "snap" cameras need wake commands before P2P video. The official
   app commonly sends both OpenAPI awaken *and* app remote wake — we do the
   same.
+
+## Transport selection
+
+- The device-list payload is authoritative. Cameras advertising
+  `deviceP2P=ppcs` use the legacy PPStrong/PPCS transport below. Other cameras
+  use the MsgSvr → ICE/TURN → KCP path.
+- Do not fall through from PPCS to MsgSvr based on model, age or region. The
+  PPCS rendezvous roots and packet key come from that device's `p2pInitApp` or
+  `p2pInit` field, so there are no static server or key guesses.
+
+## Legacy PPCS transport
+
+- Factory-9 PPCS cameras wrap their textual DID in `deviceUUID`; decode that
+  value and use the first DID token as the rendezvous identity.
+- `p2pInitApp` / `p2pInit` decodes to a root hostname list and a packet-cipher
+  key. Resolve those roots and query their native UDP service on port `32100`.
+  Root replies provide the camera's current LAN/public endpoint candidates.
+- Punch each offered endpoint and the nearby port range, matching the official
+  client. The confirmed peer is the media path; PPCS does not allocate TURN or
+  establish a MsgSvr session first.
+- PPCS packets use the protocol's chained substitution cipher. Reliable
+  channel packets use `0xD0` data and grouped `0xD1` acknowledgements with
+  16-bit per-channel sequence numbers. Retransmit unacknowledged client data,
+  reorder received data, and service the native `0xE0` / `0xE1` keepalive.
+- Channel `0` carries VVP control. Channel `1` is a continuous legacy media
+  byte stream. There is no KCP or IVA layer on this transport.
 
 ## Root discovery (MsgSvr endpoints)
 
@@ -155,10 +181,12 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   - `0x11ff` — start live
   - `0x12ff` — stop live
   - `0x888e` — heartbeat
-- `START_LIVE` uses parameter `8`, the camera host key, a formatted licence
-  ID, a stream id, and the app-profile stream flag (`0` cloudedge / `1`
-  cloudplus, ieGeek and Arenti; see
-  [Discovery](#discovery-and-http-api)).
+- Modern `START_LIVE` uses parameter `8`, the camera host key, a formatted
+  licence ID, a stream id, and the app-profile stream flag (`0` cloudedge /
+  `1` cloudplus, ieGeek and Arenti; see
+  [Discovery](#discovery-and-http-api)). Legacy PPCS authenticates with the
+  first 16 host-key bytes and omits the licence component, matching the native
+  packet exactly.
 - Quality stream ids:
   - explicit profiles → `100 + profile_id`
   - app `AUTO` → stream id `105`
@@ -174,6 +202,10 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   - `0xfc` — video I-frame
   - `0xfd` — video P-frame
   - `0xfa` — audio
+- PPCS channel 1 instead carries repeated `32-byte little-endian header +
+  payload` records. Sequence is at offset `0`, type at `16`, timestamp at
+  `20`, and payload length at `28`; types `0xf0`, `0xf1`, and `0xfa` map to
+  video I-frame, video P-frame, and audio respectively.
 - Video may be H.264 or HEVC. **Detection comes from Annex-B payloads**, not
   from profile names alone.
 - Some streams mix encrypted and plain frames. Parse validation must choose
