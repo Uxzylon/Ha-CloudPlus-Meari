@@ -187,7 +187,9 @@ async def cmd_stream(args) -> int:
         # Apply quality override from CLI
         quality_arg = getattr(args, "quality", None)
         if quality_arg is not None:
-            coord.set_vvp_quality(_parse_quality_arg(quality_arg))
+            coord.set_vvp_quality(
+                _parse_quality_arg(quality_arg, coord.quality_profiles)
+            )
         adaptive_recovery_for_player = bool(args.wake and args.play)
         setattr(coord, "_p2p_allow_lossy_gap_skip", False)
         setattr(coord, "_p2p_adaptive_lossy_gap_skip", adaptive_recovery_for_player)
