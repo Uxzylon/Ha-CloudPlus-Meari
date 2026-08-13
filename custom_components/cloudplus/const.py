@@ -21,6 +21,7 @@ DEFAULT_PHONE_CODE = "33"
 DEFAULT_APP_PROFILE = "cloudedge"
 APP_PROFILE_NAMES = {
     "cloudedge": "CloudEdge",
+    "anran": "ANRAN",
     "cloudplus": "CloudPlus / CloudHome",
     "iegeek": "ieGeek",
     "arenti": "Arenti",

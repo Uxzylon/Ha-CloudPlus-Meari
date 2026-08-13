@@ -1,7 +1,7 @@
 # Protocol Reference
 
 Wire-level notes for the Meari / VVP / PPStrong stack used by CloudEdge,
-CloudPlus, Meari, ieGeek and Arenti battery cameras. These are the load-bearing
+CloudPlus, Meari, ANRAN, ieGeek and Arenti battery cameras. These are the load-bearing
 facts the integration relies on — change them at your peril.
 
 For control-flow patterns built on top of these primitives (live-start
@@ -16,9 +16,13 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
 
 - App profile selects both the HTTP host family and the VVP stream flag:
   - `cloudedge` → CloudEdge app/API, VVP stream flag `0`
+  - `anran` → ANRAN app identity on the CloudEdge API, VVP stream flag `1`
   - `cloudplus` → CloudPlus / CloudHome app/API, VVP stream flag `1`
   - `iegeek` → ieGeek app identity, VVP stream flag `1`
   - `arenti` → Arenti app/API host family, VVP stream flag `1`
+- Each profile supplies the official app's `sourceApp`, `partnerId`, version
+  and version code. These values are part of login account encryption and are
+  not interchangeable between branded apps.
 - Login starts with the app redirect endpoint, then normal signed Meari API
   requests fetch device lists, IoT config, model values, wake controls and
   OpenAPI credentials.
@@ -182,8 +186,8 @@ ordering, source-idle recovery, wake retries) see [streaming.md](streaming.md).
   - `0x12ff` — stop live
   - `0x888e` — heartbeat
 - Modern `START_LIVE` uses parameter `8`, the camera host key, a formatted
-  licence ID, a stream id, and the app-profile stream flag (`0` cloudedge /
-  `1` cloudplus, ieGeek and Arenti; see
+  licence ID, a stream id, and the app-profile stream flag (`0` CloudEdge /
+  `1` ANRAN, CloudPlus, ieGeek and Arenti; see
   [Discovery](#discovery-and-http-api)). Legacy PPCS authenticates with the
   first 16 host-key bytes and omits the licence component, matching the native
   packet exactly.
