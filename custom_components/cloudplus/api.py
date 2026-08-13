@@ -75,6 +75,14 @@ APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
         encrypted_login=True,
         vvp_stream_flag=0,
     ),
+    "anran": AppProfileConfig(
+        "84",
+        "6.2.0",
+        "1069",
+        REDIRECT_URL,
+        "84",
+        encrypted_login=True,
+    ),
     "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
     "arenti": AppProfileConfig(
         "39",
