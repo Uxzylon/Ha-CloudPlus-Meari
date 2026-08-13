@@ -1,19 +1,33 @@
-# CloudEdge / CloudPlus / Meari — Home Assistant Integration
+# CloudEdge / Meari — Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Home Assistant custom integration for **CloudEdge / CloudPlus / Meari / Arenti**
-battery-powered Wi-Fi cameras.
+A Home Assistant custom integration for battery-powered Wi-Fi cameras built on
+the Meari cloud platform.
 
-These cameras are sold under many brand names (CloudEdge, CloudPlus, Meari,
-ieGeek, Arenti, etc.) and all use the Meari cloud platform with the VVP /
-PPStrong P2P video protocol. This integration talks to those servers and to
-the cameras directly using a fully reverse-engineered pipeline — no
-third-party bridge, no Frigate plugin, no extra container needed.
+Meari is the underlying cloud and device platform; CloudEdge is one of its
+main consumer-facing apps and services. The integration communicates directly
+with the platform and cameras using the VVP / PPStrong P2P video protocol — no
+third-party bridge, no Frigate plugin, and no extra container are required.
 
 > ⚠️ **Unofficial.** Not affiliated with CloudEdge, Meari, or any reseller.
 > Use at your own risk; cloud APIs can change without notice.
+
+---
+
+## Supported apps
+
+The account profile must match the app used to register the account:
+
+- CloudEdge
+- CloudPlus / CloudHome
+- ANRAN
+- Arenti
+- ieGeek
+
+These apps use the same underlying Meari platform, but the server requires
+each app's own identity during login.
 
 ---
 
@@ -50,8 +64,8 @@ third-party bridge, no Frigate plugin, no extra container needed.
 ## Requirements
 
 - Home Assistant **2024.1+**
-- A CloudEdge / CloudPlus / Meari / ieGeek / Arenti account with at least one
-  camera already paired in the official app
+- A Meari-compatible app account with at least one camera already paired in
+  the official app
 - `ffmpeg` (bundled in HAOS, HA Container, and HA Supervised)
 - Outbound internet access to the Meari cloud (HTTPS + MQTT/TLS) and UDP/TCP
   to the camera (LAN or TURN-relayed)
@@ -89,7 +103,7 @@ third-party bridge, no Frigate plugin, no extra container needed.
    | Password      | Account password. |
    | Country code  | e.g. `FR`, `US`, `DE` — matches your app region. |
    | Phone code    | International dial code (e.g. `33` for France). |
-   | App profile   | CloudEdge, CloudPlus / CloudHome, ieGeek, or Arenti — pick the app you registered with. |
+   | App profile   | Choose the matching profile from [Supported apps](#supported-apps). |
 
 4. All cameras on the account are discovered and added as individual devices.
 
@@ -360,6 +374,6 @@ Before opening a PR, please:
 
 ## License
 
-[MIT](LICENSE) — see file for details. CloudEdge™, CloudPlus™, Meari™,
-ieGeek™, and Arenti™ are trademarks of their respective owners; this project
-is not endorsed by any of them.
+[MIT](LICENSE) — see file for details. The product names used in this README
+are trademarks of their respective owners; this project is not endorsed by any
+of them.
