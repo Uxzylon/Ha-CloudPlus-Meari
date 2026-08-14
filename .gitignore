@@ -4,6 +4,7 @@ reverse_engineering/
 *.apk
 *.xapk
 /.*
+!/.*/
 *.md
 !README.md
 !AGENTS.md

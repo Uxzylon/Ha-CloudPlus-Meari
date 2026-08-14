@@ -120,8 +120,6 @@ jobs:
           notes_file="$(mktemp)"
           trap 'rm -f "${notes_file}"' EXIT
           {
-            echo "Manual ${RELEASE_TYPE} release for main."
-            echo
             echo "Commits:"
             echo "${commit_lines}"
           } > "${notes_file}"
