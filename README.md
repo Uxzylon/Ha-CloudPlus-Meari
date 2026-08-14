@@ -372,6 +372,20 @@ Before opening a PR, please:
 
 ---
 
+## Releases
+
+Normal pushes to `main` do not create releases. Maintainers create releases
+manually from **Actions → Release Tags → Run workflow** and choose one of:
+
+- `prerelease` — creates the next `vX.Y.Z-dev.N` release.
+- `release` — creates the stable `vX.Y.Z` release.
+
+The version in `custom_components/cloudplus/manifest.json` is the source of
+truth. After publishing a stable release, bump that version before starting
+the next prerelease cycle.
+
+---
+
 ## License
 
 [MIT](LICENSE) — see file for details. The product names used in this README
