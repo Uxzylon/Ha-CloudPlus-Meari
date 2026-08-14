@@ -1,6 +1,6 @@
 {
   "domain": "cloudplus",
-  "name": "CloudEdge / CloudPlus / Meari",
+  "name": "CloudEdge / Meari",
   "codeowners": [],
   "config_flow": true,
   "dependencies": [],

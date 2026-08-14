@@ -1,16 +1,21 @@
 name: Release Tags
 
 on:
-  push:
-    branches:
-      - dev
-      - main
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Release type
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - release
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
@@ -18,20 +23,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout current main
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
 
       - name: Create tag and release from manifest version
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH_NAME: ${{ github.ref_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
         run: |
           set -euo pipefail
+
+          case "${RELEASE_TYPE}" in
+            prerelease|release) ;;
+            *)
+              echo "Unsupported release type: ${RELEASE_TYPE}"
+              exit 1
+              ;;
+          esac
 
           manifest_path="custom_components/cloudplus/manifest.json"
           if [[ ! -f "${manifest_path}" ]]; then
@@ -52,10 +64,18 @@ jobs:
           fi
 
           git fetch --force --tags origin
+          head_sha="$(git rev-parse HEAD)"
+          stable_tag="v${base_version}"
+          tag_name="${stable_tag}"
+          previous_tag=""
 
-          is_prerelease="false"
-          previous_dev_tag=""
-          if [[ "${BRANCH_NAME}" == "dev" ]]; then
+          if [[ "${RELEASE_TYPE}" == "prerelease" ]]; then
+            if git rev-parse -q --verify "refs/tags/${stable_tag}" >/dev/null; then
+              echo "Stable tag already exists: ${stable_tag}"
+              echo "Bump the manifest version before creating more prereleases."
+              exit 1
+            fi
+
             latest_num=0
             while IFS= read -r existing_tag; do
               [[ -z "${existing_tag}" ]] && continue
@@ -66,17 +86,18 @@ jobs:
             done < <(git tag -l "v${base_version}-dev.*")
 
             if (( latest_num > 0 )); then
-              previous_dev_tag="v${base_version}-dev.${latest_num}"
+              previous_tag="v${base_version}-dev.${latest_num}"
             fi
 
             next_num=$((latest_num + 1))
             tag_name="v${base_version}-dev.${next_num}"
-            is_prerelease="true"
-          elif [[ "${BRANCH_NAME}" == "main" ]]; then
-            tag_name="v${base_version}"
           else
-            echo "Unsupported branch: ${BRANCH_NAME}"
-            exit 1
+            while IFS= read -r existing_tag; do
+              if [[ "${existing_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                previous_tag="${existing_tag}"
+                break
+              fi
+            done < <(git tag -l 'v*' --sort=-version:refname)
           fi
 
           if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null; then
@@ -84,45 +105,42 @@ jobs:
             exit 1
           fi
 
-          if [[ "${BRANCH_NAME}" == "dev" && -n "${previous_dev_tag}" ]] \
-            && git rev-parse -q --verify "refs/tags/${previous_dev_tag}" >/dev/null; then
-            commit_range="${previous_dev_tag}..${HEAD_SHA}"
-          elif [[ "${BEFORE_SHA}" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            root_commit="$(git rev-list --max-parents=0 "${HEAD_SHA}" | tail -n 1)"
-            commit_range="${root_commit}..${HEAD_SHA}"
+          if [[ -n "${previous_tag}" ]]; then
+            commit_range="${previous_tag}..${head_sha}"
           else
-            commit_range="${BEFORE_SHA}..${HEAD_SHA}"
+            root_commit="$(git rev-list --max-parents=0 "${head_sha}" | tail -n 1)"
+            commit_range="${root_commit}..${head_sha}"
           fi
 
           commit_lines="$(git log --no-merges --pretty=format:'- %h %s (%an)' "${commit_range}" || true)"
           if [[ -z "${commit_lines}" ]]; then
-            commit_lines="- $(git rev-parse --short "${HEAD_SHA}")"
+            commit_lines="- $(git rev-parse --short "${head_sha}")"
           fi
 
           notes_file="$(mktemp)"
+          trap 'rm -f "${notes_file}"' EXIT
           {
-            echo "Automated release for branch ${BRANCH_NAME}."
+            echo "Manual ${RELEASE_TYPE} release for main."
             echo
             echo "Commits:"
             echo "${commit_lines}"
           } > "${notes_file}"
 
-          git tag "${tag_name}" "${HEAD_SHA}"
+          git tag "${tag_name}" "${head_sha}"
           git push origin "refs/tags/${tag_name}"
 
           release_args=(
             release
             create
             "${tag_name}"
-            --target "${HEAD_SHA}"
+            --target "${head_sha}"
             --title "${tag_name}"
             --notes-file "${notes_file}"
           )
 
-          if [[ "${is_prerelease}" == "true" ]]; then
+          if [[ "${RELEASE_TYPE}" == "prerelease" ]]; then
             release_args+=(--prerelease)
           fi
 
           gh "${release_args[@]}"
-
-          echo "Created tag and release: ${tag_name}"
+          echo "Created ${RELEASE_TYPE}: ${tag_name}"
