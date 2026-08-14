@@ -12,12 +12,21 @@ CONF_SN_NUM = "sn_num"
 CONF_DEVICE_NAME = "device_name"
 CONF_HOST_KEY = "host_key"
 CONF_MOTION_TIMEOUT = "motion_timeout"
+CONF_VIDEO_PASSWORD = "video_password"
+CONF_STREAM_QUALITY = "stream_quality"
 
 DEFAULT_MOTION_TIMEOUT = 120
 DEFAULT_COUNTRY_CODE = "FR"
 DEFAULT_PHONE_CODE = "33"
 DEFAULT_APP_PROFILE = "cloudedge"
-APP_PROFILES = ["cloudedge", "cloudplus"]
+APP_PROFILE_NAMES = {
+    "cloudedge": "CloudEdge",
+    "anran": "ANRAN",
+    "cloudplus": "CloudPlus / CloudHome",
+    "iegeek": "ieGeek",
+    "arenti": "Arenti",
+}
+APP_PROFILES = list(APP_PROFILE_NAMES)
 
 # CloudEdge / Meari API
 PARTNER_ID = "77"
@@ -45,6 +54,7 @@ BATTERY_CODES = "153,154,155,156,1007"
 
 # IoT Model codes for device features
 IOT_CODE_LAMP = "167"
+IOT_CODE_VIDEO_ENCRYPTION = "216"
 
 # PTZ IoT codes
 IOT_CODE_PTZ_START = "807"

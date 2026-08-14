@@ -15,7 +15,7 @@ Wire frame format:
   [6]    len_lo       payload length low byte
   [7]    len_hi|enc   payload length high 7 bits + bit7=encrypted
   [8..N] payload      3DES-ECB encrypted JSON (PKCS5 padded)
-  [N+1]  checksum     XOR of all payload bytes
+  [N+1]  checksum     additive sum of all payload bytes
   [N+2]  0x9D         tail marker
 
 Encryption: 3DES ECB with key "__#!HIRCloud5.0!#__" (padded to 24 bytes with zeros).
@@ -24,128 +24,23 @@ Encryption: 3DES ECB with key "__#!HIRCloud5.0!#__" (padded to 24 bytes with zer
 import base64
 import json
 import socket
+import threading
 import time
 import uuid as uuid_mod
 
-from Crypto.Cipher import DES3
-
-# 3DES ECB key for msgsvr protocol
-MSGSVR_KEY = b"__#!HIRCloud5.0!#__\x00\x00\x00\x00\x00"  # 24 bytes
-
-# Frame constants
-MAGIC = 0xE6
-TAIL = 0x9D
-
-# Node values (byte1)
-NODE_CLIENT = 0xA1
-
-# Method values (byte2)
-METHOD_DIRECT = 0xB1
-METHOD_ROUTED = 0xB2
-
-# Cmd values (byte3)
-CMD_REGISTER = 0xC1
-CMD_WEBRTC = 0xC6
-CMD_STATUS = 0xC7
-CMD_HEARTBEAT = 0xC9
-CMD_CONNECT = 0xD1
-
-# Type (byte4) - always 0xD3 in all captured sessions
-TYPE_DEFAULT = 0xD3
-
-
-def _des3_encrypt(data: bytes) -> bytes:
-    """3DES ECB encrypt with PKCS5 padding."""
-    pad_len = 8 - (len(data) % 8)
-    padded = data + bytes([pad_len] * pad_len)
-    cipher = DES3.new(MSGSVR_KEY, DES3.MODE_ECB)
-    return cipher.encrypt(padded)
-
-
-def _des3_decrypt(data: bytes) -> bytes:
-    """3DES ECB decrypt and remove PKCS5 padding."""
-    if len(data) == 0:
-        return b""
-    # Truncate to block boundary
-    data = data[:len(data) - (len(data) % 8)]
-    if len(data) == 0:
-        return b""
-    cipher = DES3.new(MSGSVR_KEY, DES3.MODE_ECB)
-    decrypted = cipher.decrypt(data)
-    pad_len = decrypted[-1]
-    if 1 <= pad_len <= 8 and all(b == pad_len for b in decrypted[-pad_len:]):
-        return decrypted[:-pad_len]
-    return decrypted.rstrip(b'\x00')
-
-
-def _build_frame(node, method, cmd, payload_json, encrypt=True):
-    """Build a complete msgsvr wire frame."""
-    payload = payload_json.encode('utf-8')
-
-    if encrypt:
-        payload = _des3_encrypt(payload)
-
-    payload_len = len(payload)
-    header = bytearray(8)
-    header[0] = MAGIC
-    header[1] = node
-    header[2] = method
-    header[3] = cmd
-    header[4] = TYPE_DEFAULT
-    header[5] = MAGIC
-    header[6] = payload_len & 0xFF
-    header[7] = ((payload_len >> 8) & 0x7F) | (0x80 if encrypt else 0x00)
-
-    checksum = 0
-    for b in payload:
-        checksum ^= b
-
-    return bytes(header) + payload + bytes([checksum & 0xFF, TAIL])
-
-
-def _recv_exact(sock, n):
-    """Receive exactly n bytes."""
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            raise ConnectionError(f"Connection closed (got {len(data)}/{n})")
-        data += chunk
-    return data
-
-
-def _recv_frame(sock):
-    """Receive and parse one msgsvr frame."""
-    header = _recv_exact(sock, 8)
-    if header[0] != MAGIC or header[5] != MAGIC:
-        raise ValueError(f"Invalid header magic: {header.hex()}")
-
-    node = header[1]
-    method = header[2]
-    cmd = header[3]
-
-    payload_len = header[6] | ((header[7] & 0x7F) << 8)
-    is_encrypted = bool(header[7] & 0x80)
-
-    # Read payload + checksum byte + tail byte
-    rest = _recv_exact(sock, payload_len + 2)
-    payload = rest[:payload_len]
-
-    if is_encrypted and payload_len > 0:
-        payload = _des3_decrypt(payload)
-
-    try:
-        json_data = json.loads(payload.decode('utf-8'))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        json_data = {"_raw": payload.hex()[:200]}
-
-    return {
-        'node': node,
-        'method': method,
-        'cmd': cmd,
-        'encrypted': is_encrypted,
-        'json': json_data,
-    }
+from .msgsvr_codec import (
+    CMD_CONNECT,
+    CMD_HEARTBEAT,
+    CMD_REGISTER,
+    CMD_STATUS,
+    CMD_WEBRTC,
+    METHOD_DIRECT,
+    METHOD_ROUTED,
+    NODE_CLIENT,
+    build_frame as _build_frame,
+    recv_frame as _recv_frame,
+)
+from .turn_client import close_socket
 
 
 class MsgSvrClient:
@@ -155,29 +50,51 @@ class MsgSvrClient:
     negotiation, and SDP offer/answer exchange via webrtcsvr.
     """
 
-    def __init__(self, server_host, server_port=28974):
+    def __init__(self, server_host, server_port=28974, *, session_index: int = 1):
         self.server_host = server_host
         self.server_port = server_port
+        self.session_index = max(1, min(99, int(session_index or 1)))
         self.sock = None
         self.uuid = None
         self.token = None
         self.webrtcsvr = None  # {ip, port, domain, tag}
+        self.heartbeat_interval_s = 30.0
+        self._registered_at = time.monotonic()
+        self._register_extra: dict[str, str | int] = {}
+        self._io_lock = threading.Lock()
 
-    def connect(self):
+    def _session_suffix(self) -> str:
+        return f"{self.session_index:02d}"
+
+    def _session_id(self) -> str:
+        return f"{self.uuid}:{self._session_suffix()}"
+
+    def connect(self, timeout_s=10.0):
         """TCP connect to signaling server."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10.0)
+        self.sock.settimeout(float(timeout_s))
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.sock.connect((self.server_host, self.server_port))
 
-    def _send(self, method, cmd, payload_json):
+    def _send_unlocked(self, method, cmd, payload_json):
         """Build and send a frame."""
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("Signaling socket is closed")
         frame = _build_frame(NODE_CLIENT, method, cmd, payload_json)
-        self.sock.sendall(frame)
+        sock.sendall(frame)
+
+    def _send(self, method, cmd, payload_json):
+        with self._io_lock:
+            self._send_unlocked(method, cmd, payload_json)
 
     def _recv(self):
         """Receive one frame."""
-        return _recv_frame(self.sock)
+        with self._io_lock:
+            sock = self.sock
+            if sock is None:
+                raise ConnectionError("Signaling socket is closed")
+            return _recv_frame(sock)
 
     def _send_webrtc(self, inner_json, to_webrtcsvr=True):
         """Send a webrtcsvr-routed message with base64-encoded content."""
@@ -207,10 +124,9 @@ class MsgSvrClient:
 
         msg["content"] = content
         method = METHOD_ROUTED if to_webrtcsvr and self.webrtcsvr else METHOD_DIRECT
-        self._send(method, CMD_WEBRTC,
-                   json.dumps(msg, separators=(",", ":")))
+        self._send(method, CMD_WEBRTC, json.dumps(msg, separators=(",", ":")))
 
-    def _recv_webrtc_content(self):
+    def recv_webrtc_content(self):
         """Receive a webrtcsvr response and decode the inner content."""
         resp = self._recv()
         if resp["json"] and "content" in resp["json"]:
@@ -220,13 +136,25 @@ class MsgSvrClient:
 
     # ---- High-level protocol steps ----
 
-    def register(self, client_id, brand="77", app_ver="5.9.2a16", country="FR"):
+    def register(
+        self,
+        client_id,
+        brand="77",
+        app_ver="5.9.2a16",
+        country="FR",
+        sdk_ver: int = 15259,
+        client_uuid: str | None = None,
+    ):
         """Step 1: Register with signaling server. Returns uuid and token."""
-        msg = json.dumps({
+        body = {
             "action": "register",
             "transport": "tcp",
             "type": "binary",
-            "ver": 15340,
+            "nat": {
+                "local_port": self.sock.getsockname()[1] if self.sock else 0,
+                "medium": [{"mode": "xts", "transport": "udp", "type": "binary"}],
+            },
+            "ver": int(sdk_ver),
             "runtime": 0,
             "extra_params": {
                 "brand": brand,
@@ -234,7 +162,10 @@ class MsgSvrClient:
                 "v": app_ver,
                 "c": country,
             },
-        }, separators=(",", ":"))
+        }
+        if client_uuid:
+            body["uuid"] = str(client_uuid)
+        msg = json.dumps(body, separators=(",", ":"))
 
         self._send(METHOD_DIRECT, CMD_REGISTER, msg)
         resp = self._recv()
@@ -245,42 +176,66 @@ class MsgSvrClient:
 
         self.uuid = data["uuid"]
         self.token = data["token"]
+        self.heartbeat_interval_s = float(data.get("hb") or 30.0)
+        self._registered_at = time.monotonic()
+        self._register_extra = {
+            "brand": str(brand),
+            "clientid": str(client_id),
+            "v": str(app_ver),
+            "c": str(country),
+            "sdk_ver": int(sdk_ver),
+        }
         return data
+
+    def send_heartbeat(self, *, read_response: bool = False):
+        """Keep the msgsvr session alive during long-running P2P streams."""
+        if not self.uuid or not self.token:
+            return
+        msg = json.dumps(
+            {
+                "uuid": self.uuid,
+                "token": self.token,
+                "ver": int(self._register_extra.get("sdk_ver", 15259)),
+                "runtime": int(max(0.0, time.monotonic() - self._registered_at)),
+                "extra_params": {
+                    key: value
+                    for key, value in self._register_extra.items()
+                    if key != "sdk_ver"
+                },
+            },
+            separators=(",", ":"),
+        )
+        with self._io_lock:
+            self._send_unlocked(METHOD_DIRECT, CMD_HEARTBEAT, msg)
+            if not read_response or self.sock is None:
+                return
+            old_timeout = self.sock.gettimeout()
+            try:
+                self.sock.settimeout(1.0)
+                _recv_frame(self.sock)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    self.sock.settimeout(old_timeout)
+                except OSError:
+                    pass
 
     def webrtc_hello(self):
         """Step 2: Hello to webrtcsvr, get tag for later SDP exchange."""
         self._send_webrtc({"cmd": "hello"}, to_webrtcsvr=False)
-        inner = self._recv_webrtc_content()
+        inner = self.recv_webrtc_content()
 
         # The response's outer "from" has the webrtcsvr address
         # We need to re-read from the raw frame to get the outer envelope
-        # Actually, _recv_webrtc_content already decoded the inner content
+        # Actually, recv_webrtc_content already decoded the inner content
         # We need to capture the outer frame too.
         # Let's redo this properly.
         return inner
 
     def webrtc_hello_full(self):
         """Step 2: Hello to webrtcsvr, capturing full response."""
-        content = base64.b64encode(b'{"cmd":"hello"}').decode()
-        msg = json.dumps({
-            "from": {
-                "node": "client",
-                "domain": self.uuid,
-                "transport": "tcp",
-                "type": "binary",
-            },
-            "node": "webrtcsvr",
-            "content": content,
-        }, separators=(",", ":"))
-
-        self._send(METHOD_DIRECT, CMD_WEBRTC, msg)
-        resp = self._recv()
-        data = resp["json"]
-
-        # Extract webrtcsvr info from outer "from" field
-        from_info = data.get("from", {})
-        inner = json.loads(base64.b64decode(data.get("content", "")))
-
+        inner, from_info = self._send_webrtc_hello()
         self.webrtcsvr = {
             "ip": from_info.get("ip"),
             "port": from_info.get("port"),
@@ -289,14 +244,41 @@ class MsgSvrClient:
         }
         return inner
 
+    def _send_webrtc_hello(self):
+        content = base64.b64encode(b'{"cmd":"hello"}').decode()
+        msg = json.dumps(
+            {
+                "from": {
+                    "node": "client",
+                    "domain": self.uuid,
+                    "transport": "tcp",
+                    "type": "binary",
+                },
+                "node": "webrtcsvr",
+                "content": content,
+            },
+            separators=(",", ":"),
+        )
+
+        self._send(METHOD_DIRECT, CMD_WEBRTC, msg)
+        resp = self._recv()
+        data = resp["json"]
+
+        from_info = data.get("from", {})
+        inner = json.loads(base64.b64decode(data.get("content", "")))
+        return inner, from_info
+
     def query_device_status(self, device_uuid):
         """Step 3: Query device status. Returns status dict."""
         sid = uuid_mod.uuid4().hex[:16]
-        msg = json.dumps({
-            "action": "status",
-            "uuid": device_uuid,
-            "sid": sid,
-        }, separators=(",", ":"))
+        msg = json.dumps(
+            {
+                "action": "status",
+                "uuid": device_uuid,
+                "sid": sid,
+            },
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_STATUS, msg)
         resp = self._recv()
@@ -304,81 +286,108 @@ class MsgSvrClient:
 
     def send_wake_connect(self, device_uuid, device_contact, local_ips, local_port):
         """Step 4: Send connection/wake request to device."""
-        sid = uuid_mod.uuid4().hex[:16]
-        msg = json.dumps({
-            "sid": sid,
-            "uuid": self.uuid,
-            "params": {
-                "sid": uuid_mod.uuid4().hex[:8] + "00000001",
-                "local": {
-                    "ip": local_ips,
-                    "port": local_port,
+        route = device_contact.get("keepalive", device_contact)
+        contact = {
+            "node": "dev",
+            "domain": str(device_uuid),
+            "transport": route.get("transport", "tcp"),
+            "type": route.get("type", "binary"),
+            "ip": route.get("ip"),
+            "port": route.get("port"),
+        }
+        msg = json.dumps(
+            {
+                "sid": uuid_mod.uuid4().hex[:16],
+                "uuid": self.uuid,
+                "params": {
+                    "sid": uuid_mod.uuid4().hex[:8] + "00000001",
+                    "local": {
+                        "ip": local_ips,
+                        "port": local_port,
+                    },
                 },
-                "attach": {
-                    "awaken_type": 1,
-                },
+                "contact": contact,
             },
-            "contact": device_contact,
-        }, separators=(",", ":"))
+            separators=(",", ":"),
+        )
 
         self._send(METHOD_DIRECT, CMD_CONNECT, msg)
-        resp = self._recv()
-        return resp["json"]
+        first = self._recv()["json"]
+
+        msg = json.dumps(
+            {
+                "sid": uuid_mod.uuid4().hex[:16],
+                "uuid": self.uuid,
+                "params": {"attach": {"awaken_type": 1}},
+                "contact": contact,
+            },
+            separators=(",", ":"),
+        )
+        self._send(METHOD_DIRECT, CMD_CONNECT, msg)
+        return self._recv()["json"] or first
 
     def request_coturn(self, device_uuid):
         """Step 5: Request TURN credentials via webrtcsvr."""
-        sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "option",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "method": "coturn",
-        })
-        return self._recv_webrtc_content()
+        sid = self._session_id()
+        self._send_webrtc(
+            {
+                "cmd": "option",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "method": "coturn",
+            }
+        )
+        return self.recv_webrtc_content()
 
     def send_offer(self, device_uuid, sdp):
         """Step 6: Send SDP offer with ICE candidates."""
-        sid = f"{self.uuid}:01"
-        tag = self.webrtcsvr["tag"] + "01"
+        sid = self._session_id()
+        tag = self.webrtcsvr["tag"] + self._session_suffix()
 
-        self._send_webrtc({
-            "cmd": "offer",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "channel": 0,
-            "stream_type": 1,
-            "sdp": sdp,
-            "tag": tag,
-        })
-        return self._recv_webrtc_content()
+        self._send_webrtc(
+            {
+                "cmd": "offer",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "channel": 0,
+                "stream_type": 1,
+                "sdp": sdp,
+                "tag": tag,
+            }
+        )
+        return self.recv_webrtc_content()
 
     def send_candidate_complete(self, device_uuid):
         """Step 7: Signal ICE candidate negotiation complete."""
-        sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "candidate",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-            "candidate": {
-                "cmd": "nego",
-                "state": "completed",
-                "mode": 1,
-            },
-        })
-        return self._recv_webrtc_content()
+        sid = self._session_id()
+        self._send_webrtc(
+            {
+                "cmd": "candidate",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+                "candidate": {
+                    "cmd": "nego",
+                    "state": "completed",
+                    "mode": 1,
+                },
+            }
+        )
+        return self.recv_webrtc_content()
 
     def send_logout(self, device_uuid):
         """Disconnect session."""
-        sid = f"{self.uuid}:01"
-        self._send_webrtc({
-            "cmd": "logout",
-            "sid": sid,
-            "caller": self.uuid,
-            "callee": device_uuid,
-        })
+        sid = self._session_id()
+        self._send_webrtc(
+            {
+                "cmd": "logout",
+                "sid": sid,
+                "caller": self.uuid,
+                "callee": device_uuid,
+            }
+        )
 
     def wait_for_status(self, device_uuid, target="online", timeout=30):
         """Wait for device status to change (e.g., dormancy -> online)."""
@@ -388,8 +397,7 @@ class MsgSvrClient:
             try:
                 resp = self._recv()
                 data = resp["json"]
-                if (data.get("action") == "status" and
-                        data.get("uuid") == device_uuid):
+                if data.get("action") == "status" and data.get("uuid") == device_uuid:
                     status = data.get("status", "")
                     if status == target:
                         return data
@@ -398,9 +406,6 @@ class MsgSvrClient:
         return None
 
     def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        sock = self.sock
+        self.sock = None
+        close_socket(sock)

@@ -12,7 +12,9 @@ import hmac
 import json
 import logging
 import random
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -26,10 +28,16 @@ from .const import (
     DEFAULT_CA_SECRET,
     DES_IV,
     DES_KEY,
+    IOT_CODE_PTZ_START,
+    IOT_CODE_PTZ_STOP,
+    IOT_CODE_PTZ2_START,
+    IOT_CODE_PTZ2_STOP,
     PHONE_TYPE,
+    PTZ_DIRECTIONS,
     REDIRECT_URL,
     TTID,
 )
+from .url_util import parse_host as _host
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,30 +45,86 @@ USER_AGENT = (
     "Mozilla/5.0 (Linux; U; Android 14; en-us; Pixel Build/UP1A.231105.001) "
     "AppleWebKit/533.1 (KHTML, like Gecko) Version/5.0 Mobile Safari/533.1"
 )
+HTTP_TIMEOUT = (10.0, 30.0)
 
-APP_PROFILE_CONFIG: dict[str, dict[str, str]] = {
-    "cloudplus": {
-        "source_app": "77",
-        "app_ver": "5.9.2",
-        "app_ver_code": "1024",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "77",
-        "ttid": TTID,
-    },
-    "cloudedge": {
-        "source_app": "8",
-        "app_ver": "6.1.4",
-        "app_ver_code": "616",
-        "redirect_url": REDIRECT_URL,
-        "partner_id": "8",
-        "ttid": TTID,
-    },
+
+@dataclass(frozen=True, slots=True)
+class AppProfileConfig:
+    """Wire identity and behavior of one official Meari-family app."""
+
+    source_app: str
+    app_ver: str
+    app_ver_code: str
+    redirect_url: str
+    partner_id: str
+    ttid: str = TTID
+    signaling_app_ver: str = ""
+    encrypted_login: bool = False
+    vvp_stream_flag: int = 1
+
+
+APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
+    "cloudplus": AppProfileConfig("77", "6.0.1", "1029", REDIRECT_URL, "77"),
+    "cloudedge": AppProfileConfig(
+        "8",
+        "6.1.4",
+        "616",
+        REDIRECT_URL,
+        "8",
+        signaling_app_ver="6.1.4a11",
+        encrypted_login=True,
+        vvp_stream_flag=0,
+    ),
+    "anran": AppProfileConfig(
+        "84",
+        "6.2.0",
+        "1069",
+        REDIRECT_URL,
+        "84",
+        encrypted_login=True,
+    ),
+    "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
+    "arenti": AppProfileConfig(
+        "39",
+        "5.0.3",
+        "168",
+        "https://apis.arenti.net",
+        "39",
+        encrypted_login=True,
+    ),
+}
+
+PLATFORM_REGIONS = {"eu", "us", "as", "cn"}
+DEVICE_CATEGORIES = (
+    "ipc",
+    "snap",
+    "doorbell",
+    "voiceBell",
+    "fourthGeneration",
+    "cellular",
+    "light",
+    "pictureDoorBell",
+    "nvr",
+    "nvr-neutral",
+    "base",
+    "chime",
+)
+CAMERA_CATEGORIES = {
+    "ipc",
+    "snap",
+    "doorbell",
+    "voicebell",
+    "fourthgeneration",
+    "cellular",
+    "light",
+    "picturedoorbell",
 }
 
 
 # ---------------------------------------------------------------------------
 # Crypto helpers
 # ---------------------------------------------------------------------------
+
 
 def _hmac_sha1_b64(message: str, key: str) -> str:
     sig = hmac.new(key.encode(), message.encode(), hashlib.sha1).digest()
@@ -140,6 +204,17 @@ def format_sn(sn: str) -> str:
     return sn[4:]
 
 
+def _region_code(*hints: str | None) -> str:
+    for hint in hints:
+        host = _host(hint).replace("-", ".")
+        for part in host.split("."):
+            if part in PLATFORM_REGIONS:
+                return part
+            if len(part) >= 4 and part[:2] in PLATFORM_REGIONS and part[2:] == "ce":
+                return part[:2]
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # API Client
 # ---------------------------------------------------------------------------
@@ -167,13 +242,16 @@ class MeariApiClient:
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        self._request_lock = threading.RLock()
 
         self.api_server: str = ""
         self.user_id: Optional[int] = None
+        self.client_id: str = ""
         self.user_token: Optional[str] = None
 
         # OpenAPI / MQTT
         self.openapi_server: str = ""
+        self.platform_domain: str = ""
         self.access_id: str = ""
         self.access_key: str = ""
         self.mqtt_host: str = ""
@@ -185,23 +263,69 @@ class MeariApiClient:
 
         # Active app profile settings (selected during login)
         default_profile = APP_PROFILE_CONFIG["cloudplus"]
-        self._source_app = default_profile["source_app"]
-        self._app_ver = default_profile["app_ver"]
-        self._app_ver_code = default_profile["app_ver_code"]
-        self._redirect_url = default_profile["redirect_url"]
-        self._partner_id = default_profile["partner_id"]
-        self._ttid = default_profile["ttid"]
+        self._apply_profile(default_profile)
+
+    def _http_get(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.get(url, **kwargs)
+
+    def _http_post(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        with self._request_lock:
+            return self.session.post(url, **kwargs)
 
     def _select_profile(self, profile: str) -> None:
         cfg = APP_PROFILE_CONFIG.get(profile)
         if not cfg:
             raise ValueError(f"Unknown app profile: {profile}")
-        self._source_app = cfg["source_app"]
-        self._app_ver = cfg["app_ver"]
-        self._app_ver_code = cfg["app_ver_code"]
-        self._redirect_url = cfg["redirect_url"]
-        self._partner_id = cfg["partner_id"]
-        self._ttid = cfg["ttid"]
+        self._apply_profile(cfg)
+
+    def _apply_profile(self, cfg: AppProfileConfig) -> None:
+        self._source_app = cfg.source_app
+        self._app_ver = cfg.app_ver
+        self._app_ver_code = cfg.app_ver_code
+        self._redirect_url = cfg.redirect_url
+        self._partner_id = cfg.partner_id
+        self._ttid = cfg.ttid
+        self._signaling_app_ver = cfg.signaling_app_ver or f"{cfg.app_ver}a16"
+        self._encrypted_login = cfg.encrypted_login
+        self.vvp_stream_flag = cfg.vvp_stream_flag
+
+    def _apply_platform_defaults(self) -> None:
+        code = _region_code(self.api_server, self.openapi_server, self.platform_domain)
+        if not code:
+            return
+        suffix = f"{code}ce"
+        if not self.openapi_server:
+            self.openapi_server = f"https://openapi-{suffix}.mearicloud.com"
+        if not self.platform_domain:
+            self.platform_domain = f"{suffix}.mearicloud.com"
+        if not self.mqtt_host:
+            self.mqtt_host = f"events-{suffix}.mearicloud.com"
+
+    def _apply_login_iot_config(self, result: dict[str, Any]) -> None:
+        iot = result.get("iot")
+        if not isinstance(iot, dict):
+            self._apply_platform_defaults()
+            return
+
+        pf_key = iot.get("pfKey")
+        if isinstance(pf_key, dict):
+            self.access_id = pf_key.get("accessid") or self.access_id
+            self.access_key = pf_key.get("accesskey") or self.access_key
+            self.openapi_server = pf_key.get("openapiDomain") or self.openapi_server
+            self.platform_domain = pf_key.get("platformDomain") or self.platform_domain
+
+        mqtt_cfg = iot.get("mqtt")
+        if isinstance(mqtt_cfg, dict):
+            self.mqtt_host = mqtt_cfg.get("host") or self.mqtt_host
+            try:
+                self.mqtt_port = int(mqtt_cfg.get("port") or self.mqtt_port)
+            except (TypeError, ValueError):
+                pass
+
+        self._apply_platform_defaults()
 
     # ------------------------------------------------------------------
     # X-Ca-* header auth
@@ -268,7 +392,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -279,7 +403,7 @@ class MeariApiClient:
         params = self._sign_params(params)
         url = self.api_server + path
         headers = self._ca_headers(path)
-        r = self.session.post(url, data=params, headers=headers)
+        r = self._http_post(url, data=params, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -293,13 +417,16 @@ class MeariApiClient:
         return _hmac_sha1_b64(msg, self.access_key), timeout
 
     def _openapi_get(self, path: str, params: dict) -> dict:
+        self._apply_platform_defaults()
+        if not self.openapi_server or not self.access_id or not self.access_key:
+            raise RuntimeError("OpenAPI credentials unavailable")
         action = params.get("action", "get")
         sig, timeout = self._openapi_signature(path, action)
         params["accessid"] = self.access_id
         params["expires"] = timeout
         params["signature"] = sig
         url = self.openapi_server + path
-        r = self.session.get(url, params=params)
+        r = self._http_get(url, params=params)
         r.raise_for_status()
         return r.json()
 
@@ -309,11 +436,12 @@ class MeariApiClient:
 
     def login(self) -> None:
         """Full login: redirect → login → IoT config → device list."""
-        self._select_profile(self.app_profile)
-        self._redirect()
-        self._do_login()
-        self._get_iot_config()
-        self._get_devices()
+        with self._request_lock:
+            self._select_profile(self.app_profile)
+            self._redirect()
+            self._do_login()
+            self._get_iot_config()
+            self._get_devices()
 
     def _redirect(self) -> None:
         ts = int(time.time() * 1000)
@@ -343,7 +471,7 @@ class MeariApiClient:
         path = "/ppstrongs/redirect"
         headers = self._ca_headers(path)
         url = self._redirect_url + path
-        r = self.session.get(url, params=params, headers=headers)
+        r = self._http_get(url, params=params, headers=headers)
         r.raise_for_status()
         data = r.json()
         if data.get("resultCode") != "1001":
@@ -351,6 +479,7 @@ class MeariApiClient:
         result = data["result"]
         self.api_server = result["apiServer"]
         self.country_code = result.get("countryCode", self.country_code)
+        self._apply_platform_defaults()
 
     def _do_login(self) -> None:
         path = "/meari/app/login"
@@ -359,7 +488,9 @@ class MeariApiClient:
         last_code: str = ""
         last_msg: str = ""
 
-        for idx, password_candidate in enumerate(_password_variants(self.password), start=1):
+        for idx, password_candidate in enumerate(
+            _password_variants(self.password), start=1
+        ):
             ts = int(time.time() * 1000)
             params = {
                 "phoneType": PHONE_TYPE,
@@ -382,25 +513,26 @@ class MeariApiClient:
                 "iotType": "4",
                 "equipmentNo": " ",
             }
-            if self._source_app == "8":
-                # CloudEdge app sends this flag explicitly.
+            if self._encrypted_login:
                 params["encryStatus"] = "1"
 
             headers = self._ca_headers(path)
-            r = self.session.post(url, data=params, headers=headers)
+            r = self._http_post(url, data=params, headers=headers)
             r.raise_for_status()
             data = r.json()
 
             result_code = str(data.get("resultCode", ""))
             if result_code == "1001":
                 if idx > 1:
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "Login succeeded after password apostrophe normalization for account %s",
                         self.email,
                     )
                 result = data["result"]
                 self.user_id = result["userID"]
+                self.client_id = str(result.get("clientId") or "").strip()
                 self.user_token = result["userToken"]
+                self._apply_login_iot_config(result)
                 return
 
             last_code = result_code
@@ -412,7 +544,17 @@ class MeariApiClient:
 
     def _get_iot_config(self) -> None:
         data = self._get("/v2/app/config/pf/init", {"iotType": "4"})
-        if data.get("resultCode") != "1001":
+        result_code = str(data.get("resultCode", ""))
+        if result_code != "1001":
+            # Some accounts/devices intermittently return 1023 for this endpoint
+            # even when auth is valid. Keep defaults and continue.
+            if result_code == "1023":
+                self._apply_platform_defaults()
+                _LOGGER.info(
+                    "IoT config returned 1023 for %s; continuing with default endpoints",
+                    self.email,
+                )
+                return
             raise RuntimeError(f"IoT config failed: {data}")
         result = data["result"]
         pf = result.get("pfApi", {})
@@ -420,12 +562,17 @@ class MeariApiClient:
         if openapi.get("domain"):
             self.openapi_server = openapi["domain"]
         mqtt_cfg = pf.get("mqtt", {})
-        self.mqtt_host = mqtt_cfg.get("host", "events-euce.mearicloud.com")
-        self.mqtt_port = int(mqtt_cfg.get("port", 1883))
+        self.mqtt_host = mqtt_cfg.get("host") or self.mqtt_host
+        try:
+            self.mqtt_port = int(mqtt_cfg.get("port") or self.mqtt_port)
+        except (TypeError, ValueError):
+            pass
         self.mqtt_signature = pf.get("mqttSignature", "")
 
         # Decrypt platform signature for OpenAPI credentials
         platform = pf.get("platform", {})
+        if platform.get("domain"):
+            self.platform_domain = platform["domain"]
         plat_signature = platform.get("signature", "")
         expire_time = str(platform.get("expireTime", ""))
         if plat_signature and expire_time:
@@ -440,6 +587,7 @@ class MeariApiClient:
             info = json.loads(info_json)
             self.access_id = info["accessid"]
             self.access_key = info["accesskey"]
+        self._apply_platform_defaults()
 
     @staticmethod
     def _collect_devices_from_payload(
@@ -447,42 +595,50 @@ class MeariApiClient:
         target: dict[Any, dict],
         home_id: Optional[str] = None,
     ) -> None:
-        categories = ["ipc", "snap", "chime", "nvr", "doorbell"]
+        category_by_key = {category.lower(): category for category in DEVICE_CATEGORIES}
 
-        containers: list[dict[str, Any]] = []
-        result = payload.get("result")
-        if isinstance(result, dict):
-            containers.append(result)
-        containers.append(payload)
+        def infer_category(dev: dict[str, Any], current: str | None) -> str:
+            if current:
+                return current
+            try:
+                dev_type = int(dev.get("devTypeID", 0) or 0)
+            except (TypeError, ValueError):
+                dev_type = 0
+            return "snap" if dev_type == 5 else "ipc"
 
-        for container in containers:
-            for category in categories:
-                devs = container.get(category)
-                if not isinstance(devs, list):
+        def add_device(dev: Any, category: str | None) -> None:
+            if not isinstance(dev, dict):
+                return
+            dev_id = dev.get("deviceID")
+            if dev_id is None or not dev.get("snNum"):
+                return
+            normalized = dict(dev)
+            normalized["_category"] = infer_category(normalized, category)
+            if home_id:
+                normalized["_home_id"] = home_id
+            target[dev_id] = normalized
+
+        def walk(node: Any, category: str | None = None) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    add_device(item, category)
+                    walk(item, category)
+                return
+            if not isinstance(node, dict):
+                return
+            for key, value in node.items():
+                child_category = category_by_key.get(str(key).lower())
+                if child_category and isinstance(value, list):
+                    for item in value:
+                        add_device(item, child_category)
                     continue
-                for dev in devs:
-                    dev_id = dev.get("deviceID")
-                    if dev_id is None:
-                        continue
-                    normalized = dict(dev)
-                    normalized["_category"] = category
-                    if home_id:
-                        normalized["_home_id"] = home_id
-                    target[dev_id] = normalized
-
-            # Older payload shape fallback.
-            fallback = container.get("deviceList")
-            if not isinstance(fallback, list):
-                continue
-            for dev in fallback:
-                dev_id = dev.get("deviceID")
-                if dev_id is None:
+                if key == "deviceList" and isinstance(value, list):
+                    for item in value:
+                        add_device(item, category)
                     continue
-                normalized = dict(dev)
-                normalized.setdefault("_category", "ipc")
-                if home_id:
-                    normalized["_home_id"] = home_id
-                target[dev_id] = normalized
+                walk(value, child_category or category)
+
+        walk(payload)
 
     def _get_homes(self) -> list[dict[str, Any]]:
         data = self._get("/v1/app/home/list")
@@ -492,7 +648,10 @@ class MeariApiClient:
         return homes if isinstance(homes, list) else []
 
     def _get_home_devices(self, home_id: str) -> dict[Any, dict]:
-        data = self._get("/v1/app/home/join/device/list", {"homeID": home_id})
+        data = self._get(
+            "/v1/app/home/join/device/list",
+            {"homeID": home_id, "funSwitch": "1"},
+        )
         result_code = str(data.get("resultCode", ""))
         if result_code not in {"1001", "1107"}:
             raise RuntimeError(f"Home device list failed for home {home_id}: {data}")
@@ -502,25 +661,28 @@ class MeariApiClient:
 
     def _get_devices(self) -> None:
         devices: dict[Any, dict] = {}
+        default_result_code = ""
+        home_error = ""
 
         # Default/home API (works for owner accounts and some shared setups).
         default_payload: Optional[dict[str, Any]] = None
         try:
             default_payload = self._post("/v1/app/device/info/get", {"funSwitch": "1"})
-        except Exception as err:
+        except (OSError, ValueError, KeyError, RuntimeError) as err:
             _LOGGER.debug("Default device list failed: %s", err)
 
         if isinstance(default_payload, dict):
-            result_code = str(default_payload.get("resultCode", ""))
-            if result_code == "1001":
+            default_result_code = str(default_payload.get("resultCode", ""))
+            if default_result_code == "1001":
                 self._collect_devices_from_payload(default_payload, devices)
             else:
-                _LOGGER.debug("Default device list returned %s", result_code)
+                _LOGGER.debug("Default device list returned %s", default_result_code)
 
         # Multi-home fallback/augmentation for invited/family homes.
         try:
             homes = self._get_homes()
-        except Exception as err:
+        except (OSError, ValueError, KeyError, RuntimeError) as err:
+            home_error = str(err)
             _LOGGER.debug("Home list discovery failed: %s", err)
             homes = []
 
@@ -531,8 +693,20 @@ class MeariApiClient:
             try:
                 home_devices = self._get_home_devices(str(home_id))
                 devices.update(home_devices)
-            except Exception as err:
+            except (OSError, ValueError, KeyError, RuntimeError) as err:
                 _LOGGER.debug("Home device list failed for home %s: %s", home_id, err)
+
+        if not devices:
+            _LOGGER.debug(
+                "Device discovery returned no cameras for %s "
+                "(profile=%s, api_server=%s, openapi=%s, default_code=%s, home_error=%s)",
+                self.email,
+                self.app_profile,
+                self.api_server or "unknown",
+                self.openapi_server or "unknown",
+                default_result_code or "none",
+                home_error or "none",
+            )
 
         self.devices = devices
 
@@ -546,11 +720,61 @@ class MeariApiClient:
 
     def get_camera_devices(self) -> list[dict]:
         """Return camera-capable devices (battery + wired cameras)."""
-        categories = {"snap", "ipc", "doorbell"}
         return [
-            d for d in self.devices.values()
-            if str(d.get("_category", "")).lower() in categories
+            d
+            for d in self.devices.values()
+            if str(d.get("_category", "")).lower() in CAMERA_CATEGORIES
         ]
+
+    def get_device_events(
+        self,
+        device_id: int | str,
+        day: str,
+        *,
+        index: int = 0,
+        direction: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Return the alarm-event log for one device on a given day.
+
+        Mirrors the official app's Messages tab (``/v3/app/event/list``).
+        Unlike ``/v3/app/event/new/get`` this is the real per-event log: each
+        entry carries the actual ``eventType`` and a stable ``msgID``, and it is
+        independent of notification read-state — so it stays reliable even when
+        the user's phone app has already read (and cleared) the notifications,
+        and when the live MQTT push is being evicted by a duplicate login.
+
+        *day* is ``YYYYMMDD`` in the device's local time; *direction* ``1`` is
+        newest-first, *index* ``0`` is the first (most recent) page.
+        """
+        data = self._get(
+            "/v3/app/event/list",
+            {
+                "deviceID": str(device_id),
+                "day": str(day),
+                "direction": str(direction),
+                "index": str(index),
+            },
+        )
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Device event list failed: {data}")
+        # The event log is returned at the top level (not under ``result``).
+        events = data.get("alertMsg")
+        return events if isinstance(events, list) else []
+
+    def get_new_device_events(self) -> list[dict[str, Any]]:
+        """Return all-device unread/new alarm summaries.
+
+        CloudEdge home screen calls ``/v3/app/event/new/get`` with
+        ``listAllDevice=1``. It is not as complete as the per-device event log
+        because read state can clear it.
+        """
+        data = self._get("/v3/app/event/new/get", {"listAllDevice": "1"})
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"New-device event summary failed: {data}")
+        devices = data.get("result", {}).get("device")
+        if isinstance(devices, list):
+            return [event for event in devices if isinstance(event, dict)]
+        return []
 
     def get_device_status(self, sn_num: str) -> str:
         """Query device status via OpenAPI. Returns online/offline/dormancy."""
@@ -559,22 +783,22 @@ class MeariApiClient:
         try:
             result = self._openapi_get("/openapi/device/status", params)
             return result.get("status", "unknown")
-        except Exception as e:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
             _LOGGER.debug("Status query failed: %s", e)
             return "unknown"
 
     def get_battery_info(self, sn_num: str) -> dict[str, Any]:
         """Get battery info for a device. Returns {code: value} dict."""
-        try:
-            sn_map = {sn_num: BATTERY_CODES}
-            data = self._get("/v2/app/iot/model/get/batch", {
+        sn_map = {sn_num: BATTERY_CODES}
+        data = self._get(
+            "/v2/app/iot/model/get/batch",
+            {
                 "snIdentifier": json.dumps(sn_map, separators=(",", ":")),
-            })
-            if data.get("resultCode") == "1001":
-                return data.get("result", {}).get(sn_num, {})
-        except Exception as e:
-            _LOGGER.debug("Battery info failed: %s", e)
-        return {}
+            },
+        )
+        if str(data.get("resultCode", "")) != "1001":
+            raise RuntimeError(f"Battery info failed: {data}")
+        return data.get("result", {}).get(sn_num, {})
 
     # ------------------------------------------------------------------
     # Lamp / LED control via OpenAPI device config
@@ -591,12 +815,41 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "get",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-            "target": "server",
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "get",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+                "target": "server",
+            },
+        )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT config failed: {resp}")
+        return resp.get("iot", {})
+
+    def get_device_iot_values(
+        self,
+        sn_num: str,
+        codes: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Fetch selected IoT values for a device via OpenAPI."""
+        dev_uuid = format_sn(sn_num)
+        params_payload = json.dumps(
+            {"code": 100001, "action": "get", "name": "iot", "iot": list(codes)},
+            separators=(",", ":"),
+        )
+        params_b64 = base64.b64encode(params_payload.encode()).decode()
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "get",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
+        if "errid" in resp:
+            raise RuntimeError(f"Device IoT values failed: {resp}")
         return resp.get("iot", {})
 
     def set_device_iot_value(self, sn_num: str, code: str, value: int) -> bool:
@@ -607,12 +860,15 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-            "target": "server",
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+                "target": "server",
+            },
+        )
         return resp.get("action") == "set"
 
     def ptz_start(self, sn_num: str, direction: str, *, use_ptz2: bool = True) -> bool:
@@ -622,9 +878,6 @@ class MeariApiClient:
         The command is sent WITHOUT ``target=server`` so it reaches the
         device directly (as the official app does for codes 800-899).
         """
-        from .const import (
-            IOT_CODE_PTZ_START, IOT_CODE_PTZ2_START, PTZ_DIRECTIONS,
-        )
         ps, ts = PTZ_DIRECTIONS.get(direction, (0, 0))
         code = IOT_CODE_PTZ2_START if use_ptz2 else IOT_CODE_PTZ_START
         value_str = json.dumps({"ps": ps, "ts": ts, "zs": 0}, separators=(",", ":"))
@@ -635,16 +888,18 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
         return "errid" not in resp
 
     def ptz_stop(self, sn_num: str, *, use_ptz2: bool = True) -> bool:
         """Send a PTZ stop command."""
-        from .const import IOT_CODE_PTZ_STOP, IOT_CODE_PTZ2_STOP
         code = IOT_CODE_PTZ2_STOP if use_ptz2 else IOT_CODE_PTZ_STOP
 
         dev_uuid = format_sn(sn_num)
@@ -653,41 +908,46 @@ class MeariApiClient:
             separators=(",", ":"),
         )
         params_b64 = base64.b64encode(params_payload.encode()).decode()
-        resp = self._openapi_get("/openapi/device/config", {
-            "action": "set",
-            "params": params_b64,
-            "deviceid": dev_uuid,
-        })
+        resp = self._openapi_get(
+            "/openapi/device/config",
+            {
+                "action": "set",
+                "params": params_b64,
+                "deviceid": dev_uuid,
+            },
+        )
         return "errid" not in resp
 
     def wake_device(self, sn_num: str, device_id: int) -> bool:
         """Wake a dormant camera using both OpenAPI and HTTP methods."""
         success = False
+        self._apply_platform_defaults()
         # Method 1: OpenAPI wake
-        try:
+        if self.openapi_server and self.access_id and self.access_key:
             dev_uuid = format_sn(sn_num)
             sid = (dev_uuid + str(int(time.time() * 1000)))[:30]
-            sig, timeout = self._openapi_signature("/openapi/device/awaken", "set")
-            params = {
-                "accessid": self.access_id,
-                "expires": timeout,
-                "signature": sig,
-                "action": "set",
-                "deviceid": dev_uuid,
-                "sid": sid,
-            }
-            url = self.openapi_server + "/openapi/device/awaken"
-            r = self.session.get(url, params=params)
-            if r.status_code == 200:
-                success = True
-        except Exception as e:
-            _LOGGER.debug("OpenAPI wake failed: %s", e)
+            try:
+                sig, timeout = self._openapi_signature("/openapi/device/awaken", "set")
+                params = {
+                    "accessid": self.access_id,
+                    "expires": timeout,
+                    "signature": sig,
+                    "action": "set",
+                    "deviceid": dev_uuid,
+                    "sid": sid,
+                }
+                url = self.openapi_server + "/openapi/device/awaken"
+                r = self._http_get(url, params=params)
+                if r.status_code == 200:
+                    success = True
+            except OSError as e:
+                _LOGGER.debug("OpenAPI wake failed: %s", e)
 
         # Method 2: Bell remote wake
         try:
             self._post("/v1/app/bell/remote/wake", {"deviceID": str(device_id)})
             success = True
-        except Exception as e:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
             _LOGGER.debug("Bell wake failed: %s", e)
 
         return success
@@ -702,9 +962,26 @@ class MeariApiClient:
         if not url:
             return None
         try:
-            r = self.session.get(url, timeout=10)
+            r = self._http_get(url, timeout=10)
             if r.status_code == 200 and len(r.content) > 100:
                 return r.content
-        except Exception:
+        except OSError:
             pass
         return None
+
+
+def build_api_client(
+    email: str,
+    password: str,
+    country_code: str,
+    phone_code: str,
+    app_profile: str,
+) -> MeariApiClient:
+    """Construct a MeariApiClient from resolved credential fields."""
+    return MeariApiClient(
+        email=email,
+        password=password,
+        country_code=country_code,
+        phone_code=phone_code,
+        app_profile=app_profile,
+    )

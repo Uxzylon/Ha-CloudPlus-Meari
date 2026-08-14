@@ -1,11 +1,11 @@
 {
   "domain": "cloudplus",
-  "name": "CloudEdge / CloudPlus / Meari",
+  "name": "CloudEdge / Meari",
   "codeowners": [],
   "config_flow": true,
   "dependencies": [],
   "documentation": "",
   "iot_class": "cloud_push",
   "requirements": ["pycryptodome>=3.19.0", "paho-mqtt>=1.6.0"],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

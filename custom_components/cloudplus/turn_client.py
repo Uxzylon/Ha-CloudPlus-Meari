@@ -67,7 +67,7 @@ FINGERPRINT_XOR = 0x5354554E  # "STUN" in ASCII
 def _pad4(data):
     """Pad to 4-byte boundary."""
     r = len(data) % 4
-    return data + b'\x00' * ((4 - r) % 4)
+    return data + b"\x00" * ((4 - r) % 4)
 
 
 def _encode_attr(attr_type, value):
@@ -129,6 +129,37 @@ def _add_fingerprint(msg_type, attrs_bytes, txn_id):
     return attrs_bytes
 
 
+def build_ice_binding_request(
+    *,
+    local_ufrag: str,
+    remote_ufrag: str,
+    remote_pwd: str,
+    use_candidate: bool = True,
+) -> bytes:
+    """Build an ICE STUN binding request with PRIORITY / ICE-CONTROLLING."""
+    username = f"{remote_ufrag}:{local_ufrag}"
+    attrs = _encode_attr(ATTR_USERNAME, username.encode())
+    attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
+    attrs += _encode_attr(
+        0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big"))
+    )
+    if use_candidate:
+        attrs += _encode_attr(0x0025, b"")
+    txn_id = os.urandom(12)
+    attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, remote_pwd.encode())
+    msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
+    return msg
+
+
+def close_socket(sock) -> None:
+    """Best-effort close of a socket; never raises."""
+    if sock:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _parse_stun(data):
     """Parse a STUN message into type, txn_id, and attributes dict."""
     if len(data) < 20:
@@ -142,8 +173,8 @@ def _parse_stun(data):
     attrs = {}
     pos = 20
     while pos + 4 <= len(data) and pos < 20 + msg_len:
-        attr_type, attr_len = struct.unpack(">HH", data[pos:pos + 4])
-        attr_value = data[pos + 4:pos + 4 + attr_len]
+        attr_type, attr_len = struct.unpack(">HH", data[pos : pos + 4])
+        attr_value = data[pos + 4 : pos + 4 + attr_len]
         attrs[attr_type] = attr_value
         pos += 4 + ((attr_len + 3) & ~3)
 
@@ -183,34 +214,56 @@ class TurnClient:
         self.sock.settimeout(5.0)
         self.sock.bind(("", 0))
         self.local_port = self.sock.getsockname()[1]
-        # Increase receive buffer to handle video data bursts (4MB)
+        # High-detail scenes can arrive as large UDP bursts.
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        except Exception:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        except OSError:
             pass
 
+    def _open_socket(self):
+        sock = self.sock
+        if sock is None:
+            raise OSError("TURN socket is closed")
+        return sock
+
+    def open_socket(self):
+        """Return the underlying UDP socket or raise if the TURN client is closed."""
+        return self._open_socket()
+
+    def send_direct(self, peer_ip: str, peer_port: int, data: bytes) -> None:
+        """Send raw UDP data directly to a peer using the TURN socket."""
+        self._open_socket().sendto(data, (peer_ip, peer_port))
+
     def _send(self, data):
-        self.sock.sendto(data, (self.server_ip, self.server_port))
+        self._open_socket().sendto(data, (self.server_ip, self.server_port))
 
     def _recv(self, timeout=5.0):
-        self.sock.settimeout(timeout)
-        data, addr = self.sock.recvfrom(65536)
+        sock = self._open_socket()
+        sock.settimeout(timeout)
+        data, _ = sock.recvfrom(65536)
         return data
 
     def drain_socket(self):
         """Drain any buffered packets from the socket (non-blocking)."""
+        try:
+            sock = self._open_socket()
+        except OSError:
+            return
         drained = 0
-        self.sock.setblocking(False)
+        sock.setblocking(False)
         try:
             for _ in range(200):
                 try:
-                    self.sock.recvfrom(65536)
+                    sock.recvfrom(65536)
                     drained += 1
                 except (BlockingIOError, OSError):
                     break
         finally:
-            self.sock.setblocking(True)
-            self.sock.settimeout(5.0)
+            try:
+                sock.setblocking(True)
+                sock.settimeout(5.0)
+            except OSError:
+                pass
         if drained:
             print(f"[TURN] Drained {drained} buffered packets")
 
@@ -255,7 +308,9 @@ class TurnClient:
                 continue
             # Also match binding request/response (different categories)
             if msg_type == BINDING_REQUEST and parsed["type"] in (
-                    BINDING_RESPONSE, BINDING_ERROR):
+                BINDING_RESPONSE,
+                BINDING_ERROR,
+            ):
                 if parsed["txn_id"] == txn_id:
                     return parsed
                 continue
@@ -269,7 +324,8 @@ class TurnClient:
         if resp and resp["type"] == BINDING_RESPONSE:
             if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
                 self.mapped_ip, self.mapped_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS])
+                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS]
+                )
             elif ATTR_MAPPED_ADDRESS in resp["attrs"]:
                 data = resp["attrs"][ATTR_MAPPED_ADDRESS]
                 self.mapped_port = struct.unpack(">H", data[2:4])[0]
@@ -288,28 +344,58 @@ class TurnClient:
             struct.pack(">I", UDP_TRANSPORT_VALUE << 24),
         )
 
-        # Step 1: unauthenticated request to get nonce
-        resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=False)
-        if resp and resp["type"] == ALLOCATE_ERROR:
-            if ATTR_NONCE in resp["attrs"]:
-                self.nonce = resp["attrs"][ATTR_NONCE]
-            if ATTR_REALM in resp["attrs"]:
-                self.realm = resp["attrs"][ATTR_REALM].rstrip(b'\x00').decode()
+        def apply_success(resp):
+            if ATTR_XOR_RELAYED_ADDRESS in resp["attrs"]:
+                self.relay_ip, self.relay_port = _decode_xor_address(
+                    resp["attrs"][ATTR_XOR_RELAYED_ADDRESS]
+                )
+            if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
+                self.mapped_ip, self.mapped_port = _decode_xor_address(
+                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS]
+                )
+            return bool(self.relay_ip and self.relay_port)
+
+        def error_text(resp):
+            err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
+            if len(err) < 4:
+                return ""
+            code = err[2] * 100 + err[3]
+            reason = err[4:].decode("utf-8", errors="replace")
+            return f"TURN Allocate error {code}: {reason}".rstrip()
+
+        last_error = ""
+
+        # Step 1: unauthenticated request to get nonce.
+        # A few relay deployments accept the first request directly, so treat a
+        # success here as a valid allocation instead of requiring a nonce.
+        for _attempt in range(3):
+            resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=False)
+            if resp and resp["type"] == ALLOCATE_RESPONSE:
+                return apply_success(resp)
+            if resp and resp["type"] == ALLOCATE_ERROR:
+                last_error = error_text(resp)
+                if ATTR_NONCE in resp["attrs"]:
+                    self.nonce = resp["attrs"][ATTR_NONCE]
+                if ATTR_REALM in resp["attrs"]:
+                    self.realm = (
+                        resp["attrs"][ATTR_REALM]
+                        .rstrip(b"\x00")
+                        .decode("utf-8", errors="replace")
+                    )
+                if self.nonce:
+                    break
+            else:
+                last_error = "timed out"
 
         if not self.nonce:
-            raise RuntimeError("TURN server did not provide nonce")
+            suffix = f" ({last_error})" if last_error else ""
+            raise RuntimeError(f"TURN server did not provide nonce{suffix}")
 
         # Step 2: authenticated request
         resp = self._stun_request(ALLOCATE_REQUEST, transport_attr, auth=True)
         if resp and resp["type"] == ALLOCATE_RESPONSE:
-            if ATTR_XOR_RELAYED_ADDRESS in resp["attrs"]:
-                self.relay_ip, self.relay_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_RELAYED_ADDRESS])
-            if ATTR_XOR_MAPPED_ADDRESS in resp["attrs"]:
-                self.mapped_ip, self.mapped_port = _decode_xor_address(
-                    resp["attrs"][ATTR_XOR_MAPPED_ADDRESS])
-            return True
-        elif resp:
+            return apply_success(resp)
+        if resp:
             err = resp["attrs"].get(ATTR_ERROR_CODE, b"")
             if len(err) >= 4:
                 code = err[2] * 100 + err[3]
@@ -320,8 +406,7 @@ class TurnClient:
 
     def create_permission(self, peer_ip):
         """Create permission for a peer IP."""
-        addr_attr = _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                                 _encode_xor_address(peer_ip, 0))
+        addr_attr = _encode_attr(ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, 0))
         resp = self._stun_request(CREATE_PERM_REQUEST, addr_attr)
         if resp:
             if resp["type"] == CREATE_PERM_RESPONSE:
@@ -346,7 +431,7 @@ class TurnClient:
                 code = err[2] * 100 + err[3]
                 print(f"[TURN] Refresh error: {code}")
         else:
-            print(f"[TURN] Refresh timeout")
+            print("[TURN] Refresh timeout")
         return False
 
     def channel_bind(self, peer_ip, peer_port):
@@ -359,8 +444,9 @@ class TurnClient:
         self._channel_counter += 1
 
         attrs = _encode_attr(ATTR_CHANNEL_NUMBER, struct.pack(">HH", ch, 0))
-        attrs += _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                              _encode_xor_address(peer_ip, peer_port))
+        attrs += _encode_attr(
+            ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, peer_port)
+        )
 
         for attempt in range(3):
             resp = self._stun_request(CHANNEL_BIND_REQUEST, attrs)
@@ -375,32 +461,41 @@ class TurnClient:
                 if len(err_attr) >= 4:
                     err_code = err_attr[2] * 100 + err_attr[3]
                     err_reason = err_attr[4:].decode("utf-8", errors="replace")
-                    print(f"[TURN] ChannelBind error for {peer_ip}:{peer_port}: "
-                          f"{err_code} {err_reason} (type=0x{rtype:04X})")
+                    print(
+                        f"[TURN] ChannelBind error for {peer_ip}:{peer_port}: "
+                        f"{err_code} {err_reason} (type=0x{rtype:04X})"
+                    )
                 elif rtype != CHANNEL_BIND_RESPONSE:
-                    print(f"[TURN] ChannelBind unexpected response type=0x{rtype:04X} "
-                          f"for {peer_ip}:{peer_port} (attempt {attempt+1})")
+                    print(
+                        f"[TURN] ChannelBind unexpected response type=0x{rtype:04X} "
+                        f"for {peer_ip}:{peer_port} (attempt {attempt+1})"
+                    )
                 if rtype in (CHANNEL_BIND_RESPONSE, 0x0119):
                     break  # Real response (success or error), don't retry
             else:
-                print(f"[TURN] ChannelBind timeout for {peer_ip}:{peer_port} "
-                      f"(attempt {attempt+1})")
+                print(
+                    f"[TURN] ChannelBind timeout for {peer_ip}:{peer_port} "
+                    f"(attempt {attempt+1})"
+                )
         return None
 
     def send_to_peer(self, peer_ip, peer_port, data):
         """Send data to a peer through the TURN relay."""
         key = (peer_ip, peer_port)
         if key in self.channels:
-            # ChannelData: [channel:2][length:2][data][padding]
+            # The Meari SDK includes one NUL byte in the ChannelData length.
+            # Receivers ignore it as KCP/STUN padding, and some cameras expect it.
             ch = self.channels[key]
-            frame = struct.pack(">HH", ch, len(data)) + data
+            payload = data + b"\x00"
+            frame = struct.pack(">HH", ch, len(payload)) + payload
             if len(frame) % 4:
-                frame += b'\x00' * (4 - len(frame) % 4)
+                frame += b"\x00" * (4 - len(frame) % 4)
             self._send(frame)
         else:
             # Send Indication (no auth needed for indications)
-            attrs = _encode_attr(ATTR_XOR_PEER_ADDRESS,
-                                 _encode_xor_address(peer_ip, peer_port))
+            attrs = _encode_attr(
+                ATTR_XOR_PEER_ADDRESS, _encode_xor_address(peer_ip, peer_port)
+            )
             attrs += _encode_attr(ATTR_DATA, data)
             msg, _ = _build_stun(SEND_INDICATION, attrs)
             self._send(msg)
@@ -410,9 +505,10 @@ class TurnClient:
 
         Returns (data_bytes, peer_ip, peer_port) or (None, None, None) on timeout.
         """
-        self.sock.settimeout(timeout)
+        sock = self._open_socket()
+        sock.settimeout(timeout)
         try:
-            raw, addr = self.sock.recvfrom(65536)
+            raw, _ = sock.recvfrom(65536)
         except socket.timeout:
             return None, None, None
 
@@ -425,7 +521,7 @@ class TurnClient:
             peer = self.reverse_channels.get(ch)
             peer_ip = peer[0] if peer else None
             peer_port = peer[1] if peer else None
-            return raw[4:4 + length], peer_ip, peer_port
+            return raw[4 : 4 + length], peer_ip, peer_port
 
         # STUN Data Indication
         msg = _parse_stun(raw)
@@ -434,7 +530,8 @@ class TurnClient:
             peer_ip, peer_port = None, None
             if ATTR_XOR_PEER_ADDRESS in msg["attrs"]:
                 peer_ip, peer_port = _decode_xor_address(
-                    msg["attrs"][ATTR_XOR_PEER_ADDRESS])
+                    msg["attrs"][ATTR_XOR_PEER_ADDRESS]
+                )
             return data, peer_ip, peer_port
 
         # STUN response (e.g., binding response for ICE)
@@ -443,41 +540,30 @@ class TurnClient:
 
         return raw, None, None
 
-    def send_ice_binding(self, peer_ip, peer_port, local_ufrag, remote_ufrag,
-                         remote_pwd, use_candidate=True):
+    def send_ice_binding(
+        self,
+        peer_ip,
+        peer_port,
+        local_ufrag,
+        remote_ufrag,
+        remote_pwd,
+        use_candidate=True,
+    ):
         """Send ICE STUN Binding request through TURN relay.
 
         This is used for ICE connectivity checks. The binding request is
         sent as TURN data to the peer's address.
         """
-        username = f"{remote_ufrag}:{local_ufrag}"
-        # Build STUN Binding Request with ICE attributes
-        attrs = _encode_attr(ATTR_USERNAME, username.encode())
-
-        # PRIORITY attribute (0x0024)
-        attrs += _encode_attr(0x0024, struct.pack(">I", 1862270975))
-
-        # ICE-CONTROLLING (0x802A)
-        attrs += _encode_attr(0x802A, struct.pack(">Q", int.from_bytes(os.urandom(8), "big")))
-
-        # USE-CANDIDATE (0x0025) - empty attribute
-        if use_candidate:
-            attrs += _encode_attr(0x0025, b"")
-
-        # Add MESSAGE-INTEGRITY with ICE password as key
-        txn_id = os.urandom(12)
-        ice_key = remote_pwd.encode()
-        attrs = _add_integrity(BINDING_REQUEST, attrs, txn_id, ice_key)
-
-        msg, _ = _build_stun(BINDING_REQUEST, attrs, txn_id)
-
+        msg = build_ice_binding_request(
+            local_ufrag=local_ufrag,
+            remote_ufrag=remote_ufrag,
+            remote_pwd=remote_pwd,
+            use_candidate=use_candidate,
+        )
         # Send through TURN relay
         self.send_to_peer(peer_ip, peer_port, msg)
 
     def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        sock = self.sock
+        self.sock = None
+        close_socket(sock)
