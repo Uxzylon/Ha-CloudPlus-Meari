@@ -104,8 +104,12 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._sn_num = str(device.get("snNum", ""))
         self._device_name = str(device.get("deviceName", self._sn_num) or self._sn_num)
         self._device_category = str(device.get("_category", "")).lower()
-        self._is_snap = self._device_category == "snap"
         self._capabilities = parse_capabilities(device)
+        battery_capable_doorbell = (
+            self._device_category in {"doorbell", "picturedoorbell", "voicebell"}
+            and (self._as_int(self._capabilities.get("bat")) or 0) > 0
+        )
+        self._is_snap = self._device_category == "snap" or battery_capable_doorbell
         self._iot_data: dict[int | str, Any] = {}
 
         self._available = False

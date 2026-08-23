@@ -24,6 +24,7 @@ The account profile must match the app used to register the account:
 - CloudPlus / CloudHome
 - ANRAN
 - Arenti
+- BoifunCam
 - ieGeek
 
 These apps use the same underlying Meari platform, but the server requires
@@ -215,6 +216,11 @@ while the camera is asleep:
 
 This is the difference between Frigate "just working" with these cameras
 and Frigate being effectively unusable with them.
+
+Some Meari doorbells are reported by the API as `doorbell` / `pictureDoorBell`
+rather than `snap`, even though their capability map advertises `bat`. The
+coordinator treats those battery-capable doorbell categories as battery
+cameras so they use the same wake/idle-stream lifecycle.
 
 ### Stream Host Mode
 
