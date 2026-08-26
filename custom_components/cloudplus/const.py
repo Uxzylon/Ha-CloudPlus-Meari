@@ -22,6 +22,7 @@ DEFAULT_APP_PROFILE = "cloudedge"
 APP_PROFILE_NAMES = {
     "cloudedge": "CloudEdge",
     "anran": "ANRAN",
+    "boifun": "BoifunCam",
     "cloudplus": "CloudPlus / CloudHome",
     "iegeek": "ieGeek",
     "arenti": "Arenti",

@@ -83,6 +83,14 @@ APP_PROFILE_CONFIG: dict[str, AppProfileConfig] = {
         "84",
         encrypted_login=True,
     ),
+    "boifun": AppProfileConfig(
+        "104",
+        "6.2.0",
+        "1039",
+        REDIRECT_URL,
+        "104",
+        encrypted_login=True,
+    ),
     "iegeek": AppProfileConfig("81", "5.5.2", "552", REDIRECT_URL, "81"),
     "arenti": AppProfileConfig(
         "39",
