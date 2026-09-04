@@ -1,11 +1,12 @@
 {
   "domain": "cloudplus",
   "name": "CloudEdge / Meari",
-  "codeowners": [],
+  "version": "0.3.1",
+  "documentation": "https://github.com/ajeanney/Ha-CloudEdge-Meari",
+  "issue_tracker": "https://github.com/ajeanney/Ha-CloudEdge-Meari/issues",
+  "codeowners": ["@ajeanney"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "",
   "iot_class": "cloud_push",
-  "requirements": ["pycryptodome>=3.19.0", "paho-mqtt>=1.6.0"],
-  "version": "0.3.1"
+  "requirements": ["pycryptodome>=3.19.0", "paho-mqtt>=1.6.0"]
 }
