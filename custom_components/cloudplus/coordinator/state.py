@@ -27,6 +27,10 @@ _LOGGER = logging.getLogger(__name__)
 class CoordinatorStateMixin:
     """Mixin exposing availability and IoT-derived state to HA entities."""
 
+    _latest_image_source: str
+    _latest_image_generation: int = 0
+    _latest_image_updated_at: float
+
     @property
     def available(self) -> bool:
         return self._available
@@ -34,6 +38,18 @@ class CoordinatorStateMixin:
     @property
     def latest_image(self) -> bytes | None:
         return self._latest_image
+
+    @property
+    def latest_image_source(self) -> str:
+        return self._latest_image_source
+
+    @property
+    def latest_image_generation(self) -> int:
+        return self._latest_image_generation
+
+    @property
+    def latest_image_updated_at(self) -> float:
+        return self._latest_image_updated_at
 
     @property
     def motion_type(self) -> str:
@@ -284,7 +300,16 @@ class CoordinatorStateMixin:
         duration = float(seconds if seconds is not None else self._motion_timeout)
         self._live_deadline = max(self._live_deadline, time.monotonic() + duration)
 
-    def _note_motion(self, motion_type: str) -> None:
+    def _note_motion(self, motion_type: str, event_image: bytes | None = None) -> None:
+        if event_image:
+            self._latest_image = event_image
+            self._latest_image_source = "event"
+            self._latest_image_generation += 1
+            self._latest_image_updated_at = time.time()
+            # Keep the exact alarm image authoritative while motion is active.
+            # A wake-up may first replay an old keyframe from the previous session.
+            self._last_snapshot_convert_time = time.monotonic()
+            self._fire_update()
         self._last_motion_time = time.monotonic()
         self._set_motion(True, motion_type)
         if self._is_snap and self._motion_wake_enabled:

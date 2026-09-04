@@ -139,3 +139,53 @@ motion delivery permanently stopped until Home Assistant restarts.
 - Alarm types observed in the wild but not currently in `MOTION_ALARM_TYPES`
   are intentionally non-motion (e.g. `21 SD card removed`, `10 Tamper`).
   Adding them to motion would create false positives.
+
+## Event snapshots
+
+When a motion payload (MQTT or the existing event-log poller) includes an
+HTTP(S) image URL, the listener downloads it using the existing bounded
+`download_snapshot` helper. It accepts ordinary JPEG data and the ieGeek/Meari
+`.jpgx3` obfuscation observed on battery cameras: XOR the first 1,024 bytes
+with the ASCII MD5 hex digest of `<serial>|<serial-length>|meari.stream`.
+The serial is taken from the matched camera registration. This is format
+decoding, not user-configured E2EE decryption; unknown formats are rejected
+by their JPEG signature. No serials, image URLs or image bytes are logged.
+
+The decoded image is installed in the camera cache before publishing motion.
+While motion is active, video still conversion does not replace an event
+image; this is checked both before starting conversion and when a conversion
+finishes. Live still conversion resumes after motion clears. This changes
+the cached still only, not the MPEG-TS live stream.
+
+Camera attributes expose:
+
+- `image_source`: `event`, `live`, or an empty string when no image is cached.
+- `image_generation`: an incrementing counter for image replacement or clearing.
+- `image_updated_at`: Unix time when the local cache received an image, or
+  zero when empty. This is **not the camera's capture timestamp** and does
+  not establish the age of a delayed cloud event.
+
+A missing URL, failed download or unsupported image still delivers the
+motion callback without a new image. This change adds no event-history
+queries, retry loop, authentication session, notifications or AI processing.
+It deliberately does not pair an image-less MQTT event with an arbitrary
+latest historical event; the regular poller can deliver an image-bearing
+event later. A download can delay motion delivery by the helper's timeout
+(currently ten seconds); offloading downloads would require a separate
+decision about motion/image ordering.
+
+### Offline regression checks
+
+Run from the repository root with Python 3.12+ and the standalone harness
+dependencies (`pycryptodome`, `paho-mqtt`, `requests`, `aiohttp`, `voluptuous`):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+These tests reuse `debug_tools.bootstrap`, load the actual parser, listener
+and coordinator methods, and mock only external services. They require no
+HA server, network calls, camera photos or account credentials. Synthetic
+protocol bytes exercise decoding and rejection, routing, startup seeding,
+event de-duplication, unavailable images and an in-flight still conversion.
+Live hardware and phone rendering still require an end-to-end test.
