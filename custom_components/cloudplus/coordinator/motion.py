@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import ssl
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 
@@ -19,6 +20,55 @@ ALARM_POLL_INTERVAL = 15.0
 ALARM_POLL_ERROR_INTERVAL = 60.0
 # Cap on remembered event ids so the dedup set can't grow without bound.
 _SEEN_ALARM_CAP = 4000
+_IMAGE_URL_KEYS = (
+    "imageUrl",
+    "imageURL",
+    "picUrl",
+    "picURL",
+    "thumbUrl",
+    "snapshotUrl",
+)
+
+
+def _find_image_url(raw_event: dict[str, Any]) -> str:
+    """Return the first event snapshot URL found in a nested payload."""
+    queue: list[Any] = [raw_event]
+    seen: set[int] = set()
+    while queue:
+        item = queue.pop(0)
+        if isinstance(item, dict):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            for key in _IMAGE_URL_KEYS:
+                value = item.get(key)
+                if isinstance(value, str) and value.startswith(
+                    ("http://", "https://")
+                ):
+                    return value
+            queue.extend(item.values())
+        elif isinstance(item, list):
+            queue.extend(item)
+    return ""
+
+
+def _decode_event_snapshot(data: bytes, sn_num: str) -> bytes | None:
+    """Decode Meari event JPEG obfuscation for the owning camera."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return data
+    if not data or not sn_num:
+        return None
+
+    key_material = f"{sn_num}|{len(sn_num)}|meari.stream".encode()
+    key = hashlib.md5(key_material, usedforsecurity=False).hexdigest().encode()  # noqa: S324
+    encrypted_size = min(1024, len(data))
+    decoded = bytes(
+        value ^ key[index % len(key)]
+        for index, value in enumerate(data[:encrypted_size])
+    ) + data[encrypted_size:]
+    if not decoded.startswith(b"\xff\xd8\xff"):
+        return None
+    return decoded
 
 
 def _mqtt_callback_code(args: tuple) -> object:
@@ -64,7 +114,9 @@ class MotionEventListener:
     def __init__(self, api: MeariApiClient) -> None:
         self._api = api
         self._client = None
-        self._callbacks: list[tuple[str, str, Callable[[str], None]]] = []
+        self._callbacks: list[
+            tuple[str, str, Callable[[str, bytes | None], None]]
+        ] = []
         self._lock = threading.Lock()
         self._stop_poll = threading.Event()
         self._poll_thread: threading.Thread | None = None
@@ -81,7 +133,7 @@ class MotionEventListener:
         self,
         device_id: int,
         sn_num: str,
-        on_motion: Callable[[str], None],
+        on_motion: Callable[[str, bytes | None], None],
     ) -> Callable[[], None]:
         item = (str(device_id), str(sn_num), on_motion)
         with self._lock:
@@ -333,15 +385,15 @@ class MotionEventListener:
 
     def _matching_callbacks(
         self, device_id: str, license_id: str
-    ) -> list[Callable[[str], None]]:
+    ) -> list[tuple[str, Callable[[str, bytes | None], None]]]:
         with self._lock:
             callbacks = list(self._callbacks)
-        out: list[Callable[[str], None]] = []
+        out: list[tuple[str, Callable[[str, bytes | None], None]]] = []
         for registered_device_id, registered_sn, callback in callbacks:
             if device_id and device_id == registered_device_id:
-                out.append(callback)
+                out.append((registered_sn, callback))
             elif not device_id and license_id and license_id == registered_sn:
-                out.append(callback)
+                out.append((registered_sn, callback))
         return out
 
     def _handle_payload(self, payload: bytes) -> None:
@@ -359,5 +411,15 @@ class MotionEventListener:
             return
 
         motion_type = str(event["evt_name"])
-        for callback in self._matching_callbacks(device_id, license_id):
-            callback(motion_type)
+        raw_event = event["raw"]
+        image_url = _find_image_url(raw_event)
+        encrypted_image = (
+            self._api.download_snapshot(image_url) if image_url else None
+        )
+        for sn_num, callback in self._matching_callbacks(device_id, license_id):
+            event_image = (
+                _decode_event_snapshot(encrypted_image, sn_num)
+                if encrypted_image
+                else None
+            )
+            callback(motion_type, event_image)

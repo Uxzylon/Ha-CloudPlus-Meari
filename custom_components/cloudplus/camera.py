@@ -82,4 +82,7 @@ class CloudEdgeMeariCamera(CloudEdgeMeariEntity, Camera):
         if self._coordinator.device_id:
             attrs["device_id"] = self._coordinator.device_id
         attrs["sn_num"] = self._coordinator.device_uuid
+        attrs["image_source"] = self._coordinator.latest_image_source
+        attrs["image_generation"] = self._coordinator.latest_image_generation
+        attrs["image_updated_at"] = self._coordinator.latest_image_updated_at
         return attrs

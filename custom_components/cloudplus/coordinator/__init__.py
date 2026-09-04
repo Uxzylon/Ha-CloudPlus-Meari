@@ -115,6 +115,9 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
         self._available = False
         self._camera_awake = False
         self._latest_image: bytes | None = None
+        self._latest_image_source = ""
+        self._latest_image_generation = 0
+        self._latest_image_updated_at = 0.0
         self._latest_video_kf: bytes | None = None
         self._snapshot_conversion_enabled = bool(snapshot_conversion_enabled)
         self._snapshot_convert_interval = max(1.0, float(snapshot_min_interval))
@@ -531,6 +534,9 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
                 self._idle_video_frame = None
                 self._latest_video_kf = None
             self._latest_image = None
+            self._latest_image_source = ""
+            self._latest_image_generation += 1
+            self._latest_image_updated_at = 0.0
         self._fire_update()
 
     def _idle_loop(self) -> None:
@@ -689,6 +695,8 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
     def _maybe_convert_snapshot(self, codec: str, payload: bytes) -> None:
         if not self._snapshot_conversion_enabled or not payload:
             return
+        if self._motion_detected and self._latest_image_source == "event":
+            return
         now = time.monotonic()
         interval = self._snapshot_convert_interval
         if now <= self._snapshot_requested_until:
@@ -713,8 +721,14 @@ class CloudEdgeMeariCoordinator(CoordinatorStateMixin):
     def _convert_snapshot(self, codec: str, payload: bytes) -> None:
         try:
             jpeg = self._video_to_jpeg(codec, payload)
-            if jpeg:
+            # An event may arrive while ffmpeg is converting an older frame.
+            if jpeg and not (
+                self._motion_detected and self._latest_image_source == "event"
+            ):
                 self._latest_image = jpeg
+                self._latest_image_source = "live"
+                self._latest_image_generation += 1
+                self._latest_image_updated_at = time.time()
                 self._fire_update()
         finally:
             self._snapshot_convert_lock.release()
